@@ -1,0 +1,205 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: transparent;
+  color: #fff;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
+    sans-serif;
+  -webkit-app-region: drag;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+  overflow: hidden;
+}
+
+.overlay-card {
+  position: relative;
+  margin: 20px;
+  padding: 20px;
+  border-radius: 16px;
+  background: rgba(0, 0, 0, 0.7);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.overlay-card__close {
+  -webkit-app-region: no-drag;
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.45);
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.overlay-card__close:hover {
+  color: rgba(255, 255, 255, 0.95);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.overlay-card__close:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 2px;
+}
+
+.overlay-card__title {
+  margin: 0 0 6px 0;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+/* The status toggle is the clickable subtitle. Interactive elements inside
+   the draggable body need `no-drag` or clicks get swallowed by the drag region. */
+.overlay-card__status {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 400;
+  color: rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transition: color 120ms ease;
+}
+
+.overlay-card__status:hover {
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.overlay-card__status:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+
+.overlay-card__status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.35);
+  transition: background 120ms ease, box-shadow 120ms ease;
+}
+
+.overlay-card__status[data-state='listening'] {
+  color: #4ade80;
+}
+
+.overlay-card__status[data-state='listening'] .overlay-card__status-dot {
+  background: #4ade80;
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.7);
+}
+
+.overlay-card__status[data-state='error'] {
+  color: #f87171;
+}
+
+.overlay-card__status[data-state='error'] .overlay-card__status-dot {
+  background: #f87171;
+}
+
+.overlay-card__meter {
+  margin-top: 12px;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.overlay-card__meter-fill {
+  height: 100%;
+  width: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #4ade80, #22c55e);
+  transform-origin: left center;
+  /* Driven by JS via `transform: scaleX(level)`. Short transition smooths
+     between RAF frames without lagging behind real speech. */
+  transform: scaleX(0);
+  transition: transform 60ms linear;
+  opacity: 0;
+}
+
+.overlay-card__status[data-state='listening'] ~ .overlay-card__meter
+  .overlay-card__meter-fill {
+  opacity: 1;
+}
+
+/* Transcript ---------------------------------------------------------- */
+
+.overlay-card__transcript {
+  margin-top: 14px;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  /* Text needs to be selectable, and the scroll region needs pointer events,
+     so opt out of the body-wide drag region for this whole block. */
+  -webkit-app-region: no-drag;
+  -webkit-user-select: text;
+  user-select: text;
+  font-size: 13px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.92);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.overlay-card__transcript::-webkit-scrollbar {
+  width: 6px;
+}
+
+.overlay-card__transcript::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+}
+
+.transcript__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.transcript__line {
+  margin: 0;
+}
+
+.transcript__pending {
+  margin: 8px 0 0 0;
+  color: rgba(255, 255, 255, 0.6);
+  font-style: italic;
+}
+
+.transcript__list:not([hidden]) + .transcript__pending:not([hidden]) {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 8px;
+}
+
+.transcript__error {
+  margin: 0;
+  color: #f87171;
+  font-weight: 500;
+  text-align: center;
+}
+

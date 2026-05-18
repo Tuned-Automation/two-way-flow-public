@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>2-Way Flow</title>
+  </head>
+  <body>
+    <main class="overlay-card">
+      <button
+        id="closeButton"
+        type="button"
+        class="overlay-card__close"
+        aria-label="Close window"
+        title="Close (⌘W)"
+      >
+        ×
+      </button>
+      <h1 class="overlay-card__title">2-Way Flow</h1>
+      <button
+        id="statusToggle"
+        type="button"
+        class="overlay-card__status"
+        data-state="idle"
+        aria-pressed="false"
+      >
+        <span class="overlay-card__status-dot" aria-hidden="true"></span>
+        <span class="overlay-card__status-text" id="statusText">Ready</span>
+      </button>
+      <div class="overlay-card__meter" aria-hidden="true">
+        <div class="overlay-card__meter-fill" id="meterFill"></div>
+      </div>
+      <section
+        id="transcript"
+        class="overlay-card__transcript"
+        aria-live="polite"
+        aria-label="Live transcript"
+        hidden
+      >
+        <div id="transcriptList" class="transcript__list" hidden></div>
+        <p id="transcriptPending" class="transcript__pending" hidden></p>
+        <p id="transcriptError" class="transcript__error" hidden></p>
+      </section>
+    </main>
+    <script type="module" src="/src/renderer.js"></script>
+  </body>
+</html>
