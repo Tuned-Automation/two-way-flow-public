@@ -5,40 +5,125 @@
     <title>2-Way Flow</title>
   </head>
   <body>
-    <main class="overlay-card">
-      <button
-        id="closeButton"
-        type="button"
-        class="overlay-card__close"
-        aria-label="Close window"
-        title="Close (⌘W)"
-      >
-        ×
-      </button>
-      <h1 class="overlay-card__title">2-Way Flow</h1>
-      <button
-        id="statusToggle"
-        type="button"
-        class="overlay-card__status"
-        data-state="idle"
-        aria-pressed="false"
-      >
-        <span class="overlay-card__status-dot" aria-hidden="true"></span>
-        <span class="overlay-card__status-text" id="statusText">Ready</span>
-      </button>
-      <div class="overlay-card__meter" aria-hidden="true">
-        <div class="overlay-card__meter-fill" id="meterFill"></div>
+    <main class="coach" id="coach" data-status="idle">
+      <header class="coach__header">
+        <div class="rec" id="recIndicator" aria-live="polite">
+          <span class="rec__dot" aria-hidden="true"></span>
+          <span class="rec__timer" id="recTimer">00:00</span>
+        </div>
+
+        <div class="speakers" role="group" aria-label="Speakers">
+          <div class="speaker" data-id="you" data-active="true">
+            <span class="speaker__mic" aria-hidden="true">🎙</span>
+            <span class="speaker__name">You</span>
+          </div>
+          <div class="speaker" data-id="other" data-active="false">
+            <span class="speaker__mic" aria-hidden="true">🎙</span>
+            <span class="speaker__name">Other</span>
+          </div>
+        </div>
+
+        <div class="coach__controls">
+          <button
+            id="recToggle"
+            type="button"
+            class="coach__rec-toggle"
+            aria-label="Start recording"
+            title="Start / stop (Enter)"
+          >
+            Start
+          </button>
+          <button
+            id="minButton"
+            type="button"
+            class="coach__icon-btn"
+            aria-label="Minimise"
+            title="Minimise"
+          >
+            —
+          </button>
+          <button
+            id="closeButton"
+            type="button"
+            class="coach__icon-btn"
+            aria-label="Close"
+            title="Close (⌘W)"
+          >
+            ×
+          </button>
+        </div>
+      </header>
+
+      <div class="coach__body">
+        <nav
+          id="pillarRail"
+          class="rail"
+          aria-label="Rubric pillars"
+        ></nav>
+
+        <section
+          id="activePillar"
+          class="active-pillar"
+          aria-label="Active pillar checklist"
+        >
+          <div id="activePillarHeader" class="active-pillar__header-slot"></div>
+          <div id="activePillarBody" class="active-pillar__body" aria-live="polite"></div>
+          <div id="activePillarFooter" class="active-pillar__footer">
+            <p
+              id="transcriptTicker"
+              class="ticker"
+              aria-live="polite"
+              hidden
+            ></p>
+            <div
+              id="coachSuggestion"
+              class="suggestion"
+              role="region"
+              aria-label="Suggested next question"
+              hidden
+            ></div>
+          </div>
+        </section>
+
+        <aside
+          id="capturedPane"
+          class="captured"
+          aria-label="Captured information"
+        ></aside>
       </div>
+
+      <footer class="coach__footer">
+        <button
+          id="transcriptToggle"
+          type="button"
+          class="link"
+          aria-expanded="false"
+          aria-controls="transcriptDrawer"
+        >
+          <span class="link__icon" aria-hidden="true">▤</span>
+          <span>Show transcript</span>
+        </button>
+
+        <button
+          id="rubricSwitcher"
+          type="button"
+          class="link"
+          title="Switch rubric (coming soon)"
+        >
+          <span class="link__icon" aria-hidden="true">▦</span>
+          <span>Tuned Automation rubric ▾</span>
+        </button>
+      </footer>
+
       <section
-        id="transcript"
-        class="overlay-card__transcript"
-        aria-live="polite"
+        id="transcriptDrawer"
+        class="drawer"
         aria-label="Live transcript"
         hidden
       >
-        <div id="transcriptList" class="transcript__list" hidden></div>
-        <p id="transcriptPending" class="transcript__pending" hidden></p>
-        <p id="transcriptError" class="transcript__error" hidden></p>
+        <div id="transcriptList" class="drawer__list" hidden></div>
+        <p id="transcriptPending" class="drawer__pending" hidden></p>
+        <p id="transcriptError" class="drawer__error" hidden></p>
       </section>
     </main>
     <script type="module" src="/src/renderer.js"></script>

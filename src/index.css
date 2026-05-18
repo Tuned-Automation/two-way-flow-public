@@ -1,13 +1,54 @@
+/* ─────────────────────────────────────────────────────────────────────
+ *  2-Way Flow — three-column rubric coach overlay.
+ *
+ *  Layout
+ *  ─────────────────────────────────────────────────────────────────────
+ *    .coach (root, 720x440 minus drag margin)
+ *      ├── .coach__header           recording dot + speakers + controls
+ *      ├── .coach__body             3 cols: rail / active pillar / captured
+ *      ├── .coach__footer           transcript toggle + rubric switcher
+ *      └── .drawer  (sibling)       transcript drawer overlay (hidden default)
+ *
+ *  Drag-region discipline
+ *  ─────────────────────────────────────────────────────────────────────
+ *  The body is draggable (`-webkit-app-region: drag`). Every interactive
+ *  element MUST opt out with `-webkit-app-region: no-drag` or its clicks
+ *  get swallowed. Centralised via the `.no-drag` utility + per-component
+ *  rules where simpler.
+ * ───────────────────────────────────────────────────────────────────── */
+
+/* Palette is intentionally monotone: white at varying opacities for everything
+ * except the single semantic accent (--accent-red), which is reserved for the
+ * recording dot, the "listening" state of the Start/Stop button, real errors,
+ * and the bar on red coaching flags. Adding a new colour should be a
+ * deliberate decision — prefer opacity changes first. */
+:root {
+  --bg-card: rgba(18, 20, 24, 0.9);
+  --bg-pane: rgba(255, 255, 255, 0.03);
+  --bg-pane-strong: rgba(255, 255, 255, 0.07);
+  --border-soft: rgba(255, 255, 255, 0.08);
+  --text-strong: rgba(255, 255, 255, 0.94);
+  --text-med: rgba(255, 255, 255, 0.66);
+  --text-dim: rgba(255, 255, 255, 0.4);
+  --text-faint: rgba(255, 255, 255, 0.22);
+  --accent-red: #f87171;
+  --radius-card: 14px;
+  --radius-pane: 10px;
+  --radius-pill: 999px;
+}
+
 html,
 body {
   margin: 0;
   padding: 0;
   height: 100%;
   background: transparent;
-  color: #fff;
+  color: var(--text-strong);
   font-family:
     -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
     sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
   -webkit-app-region: drag;
   -webkit-user-select: none;
   user-select: none;
@@ -15,150 +56,687 @@ body {
   overflow: hidden;
 }
 
-.overlay-card {
-  position: relative;
-  margin: 20px;
-  padding: 20px;
-  border-radius: 16px;
-  background: rgba(0, 0, 0, 0.7);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+/* Utility: opt an interactive region out of the drag layer. */
+.no-drag,
+button,
+input,
+a,
+[data-no-drag] {
+  -webkit-app-region: no-drag;
 }
 
-.overlay-card__close {
+/* ─── Root container ────────────────────────────────────────────────── */
+
+.coach {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 16px);
+  margin: 8px;
+  border-radius: var(--radius-card);
+  background: var(--bg-card);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+
+/* ─── Header ────────────────────────────────────────────────────────── */
+
+.coach__header {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+/* Recording indicator: red dot + timer. No 'RECORDING' label by design. */
+.rec {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-med);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+}
+
+.rec__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.22);
+  transition: background 200ms ease, box-shadow 200ms ease;
+}
+
+.coach[data-status='listening'] .rec__dot {
+  background: var(--accent-red);
+  box-shadow: 0 0 8px rgba(248, 113, 113, 0.7);
+  animation: rec-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+/* Speaker pills: two pills, active one fills, inactive is dim. */
+.speakers {
+  display: inline-flex;
+  gap: 6px;
+  justify-self: center;
+}
+
+.speaker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-soft);
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 500;
+  transition: background 160ms ease, color 160ms ease, border-color 160ms ease;
+}
+
+.speaker[data-active='true'] {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: var(--text-strong);
+}
+
+.speaker__mic {
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+/* Header right side: controls. */
+.coach__controls {
+  display: inline-flex;
+  gap: 6px;
+  justify-self: end;
+  align-items: center;
+}
+
+.coach__rec-toggle {
   -webkit-app-region: no-drag;
-  position: absolute;
-  top: 10px;
-  right: 10px;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: var(--radius-pill);
+  padding: 3px 12px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+
+.coach__rec-toggle:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.coach[data-status='listening'] .coach__rec-toggle {
+  background: rgba(248, 113, 113, 0.15);
+  border-color: rgba(248, 113, 113, 0.55);
+  color: var(--accent-red);
+}
+
+.coach[data-status='listening'] .coach__rec-toggle:hover {
+  background: rgba(248, 113, 113, 0.25);
+}
+
+.coach[data-status='starting'] .coach__rec-toggle {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.coach__icon-btn {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  background: transparent;
+  color: var(--text-dim);
+  border: 0;
+  border-radius: 50%;
   width: 22px;
   height: 22px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  appearance: none;
-  background: transparent;
-  border: 0;
-  border-radius: 50%;
-  padding: 0;
-  font-size: 16px;
-  line-height: 1;
-  color: rgba(255, 255, 255, 0.45);
   cursor: pointer;
-  transition: color 120ms ease, background 120ms ease;
+  font-size: 14px;
+  line-height: 1;
+  transition: background 120ms ease, color 120ms ease;
 }
 
-.overlay-card__close:hover {
-  color: rgba(255, 255, 255, 0.95);
+.coach__icon-btn:hover {
   background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong);
 }
 
-.overlay-card__close:focus-visible {
-  outline: 2px solid rgba(255, 255, 255, 0.4);
+.coach__icon-btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
   outline-offset: 2px;
 }
 
-.overlay-card__title {
-  margin: 0 0 6px 0;
-  font-size: 20px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+/* ─── Body: three-column layout ────────────────────────────────────── */
+
+.coach__body {
+  display: grid;
+  grid-template-columns: 48px 1fr 220px;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
-/* The status toggle is the clickable subtitle. Interactive elements inside
-   the draggable body need `no-drag` or clicks get swallowed by the drag region. */
-.overlay-card__status {
+/* ─── Pillar rail (left column) ─────────────────────────────────────── */
+
+.rail {
   -webkit-app-region: no-drag;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 6px;
+  border-right: 1px solid var(--border-soft);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+}
+
+.rail::-webkit-scrollbar {
+  width: 4px;
+}
+.rail::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+}
+
+.pillar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   appearance: none;
-  background: none;
+  background: transparent;
   border: 0;
   padding: 0;
-  margin: 0;
-  font: inherit;
-  font-size: 14px;
-  font-weight: 400;
-  color: rgba(255, 255, 255, 0.7);
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  color: var(--text-med);
   cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.pillar:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-strong);
+}
+
+.pillar[data-selected='true'] {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong);
+}
+
+.pillar:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
+}
+
+/* Pillar glyphs are intentionally uniform: a translucent disc with the
+ * monogram in dim white. Status is communicated by the corner dot and the
+ * selected/hover ring, not by per-pillar tints. The PILLAR.tint values in
+ * src/rubric.js are deliberately ignored here for a monotone palette. */
+.pillar__glyph {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  transition: color 120ms ease;
-}
-
-.overlay-card__status:hover {
-  color: rgba(255, 255, 255, 0.95);
-}
-
-.overlay-card__status:focus-visible {
-  outline: 2px solid rgba(255, 255, 255, 0.4);
-  outline-offset: 4px;
-  border-radius: 4px;
-}
-
-.overlay-card__status-dot {
-  width: 8px;
-  height: 8px;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.35);
-  transition: background 120ms ease, box-shadow 120ms ease;
-}
-
-.overlay-card__status[data-state='listening'] {
-  color: #4ade80;
-}
-
-.overlay-card__status[data-state='listening'] .overlay-card__status-dot {
-  background: #4ade80;
-  box-shadow: 0 0 8px rgba(74, 222, 128, 0.7);
-}
-
-.overlay-card__status[data-state='error'] {
-  color: #f87171;
-}
-
-.overlay-card__status[data-state='error'] .overlay-card__status-dot {
-  background: #f87171;
-}
-
-.overlay-card__meter {
-  margin-top: 12px;
-  height: 3px;
-  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
   background: rgba(255, 255, 255, 0.08);
-  overflow: hidden;
+  color: var(--text-med);
+  transition: background 120ms ease, color 120ms ease;
 }
 
-.overlay-card__meter-fill {
-  height: 100%;
-  width: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #4ade80, #22c55e);
-  transform-origin: left center;
-  /* Driven by JS via `transform: scaleX(level)`. Short transition smooths
-     between RAF frames without lagging behind real speech. */
-  transform: scaleX(0);
-  transition: transform 60ms linear;
-  opacity: 0;
+.pillar:hover .pillar__glyph,
+.pillar[data-selected='true'] .pillar__glyph {
+  background: rgba(255, 255, 255, 0.15);
+  color: var(--text-strong);
 }
 
-.overlay-card__status[data-state='listening'] ~ .overlay-card__meter
-  .overlay-card__meter-fill {
-  opacity: 1;
+/* Corner status dot. Hidden when status is `idle` (no dot rendered). */
+.pillar__dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--bg-card);
+  background: transparent;
 }
 
-/* Transcript ---------------------------------------------------------- */
+.pillar[data-status='in_progress'] .pillar__dot {
+  background: rgba(255, 255, 255, 0.4);
+}
 
-.overlay-card__transcript {
-  margin-top: 14px;
-  max-height: 300px;
+.pillar[data-status='complete'] .pillar__dot {
+  background: var(--text-strong);
+}
+
+/* ─── Active pillar (middle column) ────────────────────────────────── */
+
+/* Three-row flex: pinned header, scrolling body (checklist or live-signals
+ * list), pinned footer (transcript ticker + coach suggestion). Only the
+ * body scrolls — the footer never gets cropped no matter how long the
+ * checklist is.
+ *
+ * `min-width: 0` is load-bearing: the active-pillar is a grid child of
+ * .coach__body (track template `48px 1fr 220px`). Without it, no-wrap
+ * content inside the ticker forces the 1fr track to auto-size to fit
+ * the content, which pushes the captured pane on the right off-screen. */
+.active-pillar {
+  -webkit-app-region: no-drag;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.active-pillar__header-slot {
+  padding: 12px 16px 4px;
+}
+
+.active-pillar__body {
+  -webkit-user-select: text;
+  user-select: text;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
-  padding: 10px 12px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  /* Text needs to be selectable, and the scroll region needs pointer events,
-     so opt out of the body-wide drag region for this whole block. */
+  padding: 4px 16px 10px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+}
+
+.active-pillar__body::-webkit-scrollbar {
+  width: 5px;
+}
+.active-pillar__body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+}
+
+.active-pillar__footer {
+  -webkit-user-select: text;
+  user-select: text;
+  padding: 8px 16px 10px;
+  border-top: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* If every child of the footer is hidden, drop the chrome so the empty
+ * footer doesn't leave a dead band at the bottom of the column. */
+.active-pillar__footer:not(:has(> :not([hidden]))) {
+  border-top-color: transparent;
+  background: transparent;
+  padding: 0;
+}
+
+/* Single-line live transcript ticker. The renderer trims to the latest
+ * TICKER_MAX_CHARS characters and prefixes "… " when the content was
+ * clipped — keeps the active portion of speech in view without needing
+ * any CSS bidi tricks. */
+.ticker {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Coach suggestion card — the "ask this next" surface. */
+.suggestion {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.suggestion__label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.suggestion__pillar {
+  color: var(--text-med);
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.suggestion__question {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-strong);
+  line-height: 1.4;
+}
+
+.suggestion__rationale {
+  font-size: 10px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+/* Keyboard-nav affordance pinned to the bottom of the suggestion card.
+ * Communicates ←/→ availability without taking visual weight from the
+ * question itself. Disabled side fades to --text-faint. */
+.suggestion__nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+  font-size: 9px;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+}
+
+.suggestion__nav-side {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.suggestion__nav-side[data-enabled='false'] {
+  color: var(--text-faint);
+}
+
+.suggestion__nav-position {
+  font-variant-numeric: tabular-nums;
+}
+
+.active-pillar__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.active-pillar__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.active-pillar__counter {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-pane);
+}
+
+.checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.item {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-med);
+  padding: 4px 0;
+  transition: color 160ms ease;
+}
+
+.item__tick {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255, 255, 255, 0.2);
+  font-size: 9px;
+  font-weight: 800;
+  color: transparent;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+.item__label {
+  white-space: normal;
+}
+
+.item[data-covered='true'] {
+  color: var(--text-dim);
+}
+
+.item[data-covered='true'] .item__tick {
+  background: var(--text-strong);
+  border-color: var(--text-strong);
+  color: rgba(0, 0, 0, 0.85);
+}
+
+.item[data-covered='true'] .item__label {
+  text-decoration: line-through;
+  text-decoration-color: rgba(255, 255, 255, 0.3);
+  text-decoration-thickness: 1px;
+}
+
+/* Variant for the synthetic live_signals pillar: each row is a fired flag
+   with red/green left border instead of the tick column. */
+.flag-row {
+  display: grid;
+  grid-template-columns: 4px 1fr;
+  gap: 10px;
+  align-items: stretch;
+  padding: 6px 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.flag-row__bar {
+  border-radius: 2px;
+  background: var(--text-dim);
+}
+
+/* Red flags keep the only semantic colour in the palette — same red as the
+ * recording dot. Green ("bonus") flags shed their hue and ride the monotone
+ * scale; the +/− glyph in the row body carries the polarity. */
+.flag-row[data-severity='red'] .flag-row__bar {
+  background: var(--accent-red);
+}
+
+.flag-row[data-severity='green'] .flag-row__bar {
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.flag-row__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.flag-row__title {
+  color: var(--text-strong);
+  font-weight: 500;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.flag-row__kind {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.flag-row[data-severity='red'] .flag-row__kind {
+  color: var(--accent-red);
+}
+
+.flag-row__evidence {
+  color: var(--text-dim);
+  font-style: italic;
+  font-size: 11px;
+}
+
+.active-pillar__empty {
+  margin: 0;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-dim);
+}
+
+/* ─── Captured pane (right column) ──────────────────────────────────── */
+
+.captured {
   -webkit-app-region: no-drag;
   -webkit-user-select: text;
   user-select: text;
+  padding: 14px 14px;
+  border-left: 1px solid var(--border-soft);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+}
+
+.captured::-webkit-scrollbar {
+  width: 4px;
+}
+.captured::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+}
+
+.captured__heading {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+}
+
+.captured__group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.captured__pair {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.captured__label {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.captured__value {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-strong);
+  word-break: break-word;
+}
+
+.captured__value--empty {
+  color: rgba(255, 255, 255, 0.18);
+  font-weight: 400;
+  font-style: italic;
+}
+
+/* ─── Footer ────────────────────────────────────────────────────────── */
+
+.coach__footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.link {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.link:hover {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.link__icon {
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+/* ─── Transcript drawer ─────────────────────────────────────────────── */
+
+/* When visible, the drawer overlays the body (rail/active/captured) and the
+   footer. The user toggles it via the footer button; the body underneath
+   is preserved and revealed again when toggled off. */
+.drawer {
+  -webkit-app-region: no-drag;
+  -webkit-user-select: text;
+  user-select: text;
+  position: absolute;
+  top: 56px; /* below the header */
+  left: 0;
+  right: 0;
+  bottom: 36px; /* above the footer */
+  padding: 14px 16px;
+  background: rgba(15, 17, 22, 0.96);
+  overflow-y: auto;
   font-size: 13px;
   line-height: 1.45;
   color: rgba(255, 255, 255, 0.92);
@@ -166,40 +744,45 @@ body {
   scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
-.overlay-card__transcript::-webkit-scrollbar {
+.drawer::-webkit-scrollbar {
   width: 6px;
 }
-
-.overlay-card__transcript::-webkit-scrollbar-thumb {
+.drawer::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.18);
   border-radius: 3px;
 }
 
-.transcript__list {
+.drawer__list {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.transcript__line {
+.drawer__line {
   margin: 0;
 }
 
-.transcript__pending {
+.drawer__pending {
   margin: 8px 0 0 0;
   color: rgba(255, 255, 255, 0.6);
   font-style: italic;
 }
 
-.transcript__list:not([hidden]) + .transcript__pending:not([hidden]) {
+.drawer__list:not([hidden]) + .drawer__pending:not([hidden]) {
   border-top: 1px solid rgba(255, 255, 255, 0.06);
   padding-top: 8px;
 }
 
-.transcript__error {
+.drawer__error {
   margin: 0;
-  color: #f87171;
+  color: var(--accent-red);
   font-weight: 500;
   text-align: center;
 }
 
+/* Reduced motion: drop the recording-dot pulse. */
+@media (prefers-reduced-motion: reduce) {
+  .coach[data-status='listening'] .rec__dot {
+    animation: none;
+  }
+}

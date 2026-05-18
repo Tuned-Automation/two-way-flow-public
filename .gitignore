@@ -94,3 +94,6 @@ out/
 # Editor backup files
 *~
 .DS_Store
+
+# Superpowers brainstorming session files
+.superpowers/
