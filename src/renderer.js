@@ -107,6 +107,7 @@ const recTimerEl = document.getElementById('recTimer');
 const speakerEls = Array.from(document.querySelectorAll('.speaker'));
 const aecBadgeEl = document.getElementById('aecBadge');
 const connectionStatusEl = document.getElementById('connectionStatus');
+const versionBadgeEl = document.getElementById('versionBadge');
 const recToggleEl = document.getElementById('recToggle');
 const minButtonEl = document.getElementById('minButton');
 const closeButtonEl = document.getElementById('closeButton');
@@ -734,6 +735,111 @@ function updateAecBadgeFromSettings(settings) {
   if (settings?.echoCancellation === true) setAecBadgeState('on');
   else if (settings?.echoCancellation === false) setAecBadgeState('off');
   else setAecBadgeState('unknown');
+}
+
+/**
+ * Paint the `#versionBadge` header pill from main's
+ * `app:version` IPC response. Called once at boot from
+ * applyInitialVersionBadge() — the version metadata can't change
+ * mid-session (Vite defines bake at build start; the runtime git
+ * read in dev captures the working-tree state at process boot), so
+ * there's no companion subscriber on a main → renderer channel.
+ *
+ * Visible format:
+ *   v1.0.0 · 89f97a8           — clean working tree
+ *   v1.0.0 · 89f97a8 (dirty)   — uncommitted edits at process boot
+ *   v1.0.0                     — packaged build that lost its SHA
+ *                                (or a degraded `git` read in dev)
+ *
+ * The dirty state flips `data-state` to 'dirty', which the CSS uses
+ * to repaint the pill amber. The title tooltip includes the build
+ * time in localised form so the user can see at a glance "how old
+ * is this build" without leaving the window.
+ */
+function applyVersionBadge(version) {
+  if (!versionBadgeEl) return;
+  if (!version || typeof version !== 'object') {
+    versionBadgeEl.hidden = true;
+    return;
+  }
+
+  const pkgVersion = typeof version.pkgVersion === 'string' && version.pkgVersion
+    ? version.pkgVersion
+    : '0.0.0';
+  const gitSha = typeof version.gitSha === 'string' ? version.gitSha : '';
+  const gitDirty = version.gitDirty === true;
+  const builtAt = typeof version.builtAt === 'number' && version.builtAt > 0
+    ? version.builtAt
+    : null;
+
+  // Build the visible pill content. Using DOM nodes (not innerHTML)
+  // because the SHA + dirty marker have distinct typography via
+  // their own classes (.version-badge__sha is monospace,
+  // .version-badge__dirty is uppercase) and innerHTML would lose
+  // that without manual escaping of the version string anyway.
+  versionBadgeEl.replaceChildren();
+  versionBadgeEl.appendChild(document.createTextNode(`v${pkgVersion}`));
+  if (gitSha) {
+    versionBadgeEl.appendChild(document.createTextNode(' · '));
+    const shaSpan = document.createElement('span');
+    shaSpan.className = 'version-badge__sha';
+    shaSpan.textContent = gitSha;
+    versionBadgeEl.appendChild(shaSpan);
+  }
+  if (gitDirty) {
+    versionBadgeEl.appendChild(document.createTextNode(' '));
+    const dirtySpan = document.createElement('span');
+    dirtySpan.className = 'version-badge__dirty';
+    dirtySpan.textContent = '(dirty)';
+    versionBadgeEl.appendChild(dirtySpan);
+  }
+
+  versionBadgeEl.dataset.state = gitDirty ? 'dirty' : 'clean';
+
+  // Tooltip: spell out the dirty-vs-clean meaning and surface the
+  // build time as a localised string so the user has an at-a-glance
+  // "is this the build I just rebuilt?" answer without opening
+  // dev tools.
+  const tooltipParts = [`Two Way Flow v${pkgVersion}`];
+  if (gitSha) tooltipParts.push(`commit ${gitSha}${gitDirty ? ' + uncommitted edits' : ''}`);
+  if (builtAt) {
+    try {
+      tooltipParts.push(`built ${new Date(builtAt).toLocaleString()}`);
+    } catch {
+      // Date formatting failure is non-fatal — we just skip the
+      // built-at line in the tooltip rather than hiding the pill.
+    }
+  }
+  if (gitDirty) {
+    tooltipParts.push(
+      'Working tree was dirty when this window started — restart npm start to pick up newer file edits.',
+    );
+  }
+  versionBadgeEl.title = tooltipParts.join('\n');
+  versionBadgeEl.hidden = false;
+}
+
+/**
+ * Fetch the build-version metadata from main and apply it to the
+ * header pill. Wrapped in try/catch so a transient IPC failure (or
+ * an older packaged main that doesn't ship the `app:version` channel
+ * — which would surface here as `getAppVersion` being undefined)
+ * leaves the badge hidden instead of throwing during boot.
+ *
+ * Awaited at the bottom of this file alongside the other initial-
+ * render setup, but the function is intentionally fire-and-forget:
+ * the rest of the renderer doesn't block on it because the badge is
+ * purely informational.
+ */
+async function applyInitialVersionBadge() {
+  if (!versionBadgeEl) return;
+  try {
+    const version = await window.gemini?.getAppVersion?.();
+    applyVersionBadge(version);
+  } catch (err) {
+    console.warn('[version] getAppVersion failed:', err?.message || err);
+    versionBadgeEl.hidden = true;
+  }
 }
 
 /**
@@ -5394,6 +5500,13 @@ renderConnectionStatus();
 // Badge starts in "unknown" — the mic-capture path will flip it to
 // "on" / "off" the moment getUserMedia hands back a stream.
 setAecBadgeState('unknown');
+
+// Build-version pill (one-shot). Fired here, alongside the other
+// initial-render calls, so the user sees the running build's SHA
+// from the first frame. See applyVersionBadge() for the format +
+// dirty-state semantics; main's computeAppVersion() doc-block for
+// the dev-vs-packaged read decision.
+applyInitialVersionBadge();
 
 // Eagerly load persisted settings at boot so the user's custom
 // speaker-label tag colours are in effect from the first frame (the

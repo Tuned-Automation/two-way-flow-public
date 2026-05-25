@@ -295,6 +295,81 @@ a,
   }
 }
 
+/* ── Build-version badge ────────────────────────────────────────────
+ *
+ * Header pill that surfaces what build of the app is actually
+ * running — `v1.0.0 · 89f97a8` clean, `v1.0.0 · 89f97a8 (dirty)`
+ * when the working tree has uncommitted edits at process boot.
+ * Lives next to the AEC + connection pills because it's the same
+ * visual family (small, low-contrast status tag) but it's
+ * deliberately MORE muted (`opacity: 0.55`) since it's metadata,
+ * not live status. Painted once at renderer boot — see
+ * applyVersionBadge() in src/renderer.js.
+ *
+ * Two visual states keyed off `data-state`:
+ *   clean — neutral dim grey, fully blends with the other pills
+ *   dirty — amber-tinted so a "your saved edits aren't in this
+ *           running window unless you restart npm start" mismatch
+ *           is impossible to miss. Brighter than the base state on
+ *           purpose; this is the signal that earns its pixels.
+ *
+ * The SHA is rendered in a monospace span so it stays visually
+ * aligned across commits (proportional fonts wobble between
+ * different-width digits). The "v1.0.0" + (dirty) text uses the
+ * same font as the surrounding header.
+ *
+ * Sized to ~10px to match .aec-badge / .conn-pill — the row reads
+ * as one consistent strip of small status tags rather than a
+ * version pill that's clearly out of register.
+ */
+.version-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  white-space: nowrap;
+  opacity: 0.55;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease, opacity 160ms ease;
+}
+
+.version-badge[hidden] {
+  display: none;
+}
+
+.version-badge:hover {
+  opacity: 0.95;
+}
+
+.version-badge__sha {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0;
+}
+
+.version-badge__dirty {
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  font-weight: 600;
+}
+
+.version-badge[data-state='dirty'] {
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.4);
+  color: #fbbf24;
+  opacity: 0.8;
+}
+
+.version-badge[data-state='dirty']:hover {
+  opacity: 1;
+}
+
 /* ── Speaker-bleed hint banner ─────────────────────────────────────
  *
  * One-shot diagnostic surfaced when the cross-channel dedup fires

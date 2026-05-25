@@ -84,6 +84,29 @@
             <span class="conn-pill__dot" aria-hidden="true"></span>
             <span class="conn-pill__label">Off</span>
           </span>
+
+          <!-- Build-version pill. Painted once at boot from the
+               `app:version` IPC channel (window.gemini.getAppVersion
+               in src/preload.js → computeAppVersion in src/main.js).
+               Format:
+                 v1.0.0 · 89f97a8         (clean working tree)
+                 v1.0.0 · 89f97a8 (dirty) (uncommitted edits)
+               The dirty state flips the pill amber so the user spots
+               a "your saved file edits aren't in this running window
+               unless you restart npm start" mismatch instantly. The
+               title tooltip carries the human-readable build time so
+               the user can confirm "how old is this build" without
+               leaving the window. Hidden until the renderer
+               populates it so an empty pill never flashes pre-IPC. -->
+          <span
+            id="versionBadge"
+            class="version-badge"
+            data-state="unknown"
+            role="status"
+            aria-label="Build version"
+            title=""
+            hidden
+          ></span>
         </div>
 
         <div class="coach__controls">

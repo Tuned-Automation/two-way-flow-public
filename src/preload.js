@@ -137,6 +137,17 @@ import { contextBridge, ipcRenderer } from 'electron';
  *                                with the Tray's Quit menu so the
  *                                renderer doesn't have to distinguish
  *                                close-then-quit from quit-now.
+ *     app:version              — one-shot read of the build-version
+ *                                metadata used by the header
+ *                                `#versionBadge` pill. Returns
+ *                                { pkgVersion, gitSha, gitDirty,
+ *                                builtAt }. Cached in main for the
+ *                                process lifetime — none of the
+ *                                inputs change without a restart.
+ *                                Renderer calls once at boot. See
+ *                                computeAppVersion() in src/main.js
+ *                                for the dev-vs-packaged read
+ *                                decision.
  *
  *   main → renderer:
  *     gemini:opened            — session established
@@ -479,6 +490,20 @@ contextBridge.exposeInMainWorld('gemini', {
     close: () => ipcRenderer.invoke('window:close'),
     quit: () => ipcRenderer.invoke('window:quit'),
   },
+
+  /**
+   * Build-version metadata for the header `#versionBadge`. Resolves
+   * to { pkgVersion: '1.0.0', gitSha: '89f97a8', gitDirty: false,
+   * builtAt: 1716700000000 }. In dev mode the SHA + dirty flag are
+   * read at runtime via `git`; in a packaged build they're baked in
+   * at Vite-compile time (see vite.main.config.mjs + the
+   * computeAppVersion block-comment in src/main.js).
+   *
+   * Renderer calls this once at boot — the values can't change
+   * mid-session, so there's no companion subscriber on the
+   * main → renderer channel.
+   */
+  getAppVersion: () => ipcRenderer.invoke('app:version'),
 
   onOpened: subscribe('gemini:opened'),
   onTranscript: subscribe('gemini:transcript'),

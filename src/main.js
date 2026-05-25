@@ -17,6 +17,8 @@ import {
 } from 'electron';
 import path from 'node:path';
 import { writeFile, readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import started from 'electron-squirrel-startup';
 
 /* ────────────────────────────────────────────────────────────────────
@@ -67,6 +69,172 @@ function loadPackagedEnv() {
   }
 }
 loadPackagedEnv();
+
+/* ────────────────────────────────────────────────────────────────────
+ * Version-badge metadata — git-aware build identifier
+ *
+ * The renderer surfaces a tiny "v1.0.0 · 89f97a8" pill in the header
+ * via the `app:version` IPC channel (see registerIpcHandlers below).
+ * The pill exists because a user can easily end up running an old
+ * packaged build alongside an `npm start` dev window and not notice
+ * that their latest fixes aren't loaded — the SHA + dirty-flag give
+ * an at-a-glance answer to "is this the build I just rebuilt?".
+ *
+ * Two read paths, chosen by `app.isPackaged`:
+ *
+ *   - DEV (`npm start`)         — runtime `git rev-parse` + `git
+ *                                 status --porcelain`. This tracks
+ *                                 working-tree state across commits
+ *                                 without a Vite restart, so the
+ *                                 badge stays fresh as the user
+ *                                 iterates. The `.git` dir is
+ *                                 guaranteed to be reachable
+ *                                 (process started from the repo).
+ *
+ *   - PACKAGED (.app bundle)    — Vite-injected compile-time
+ *                                 constants (__APP_GIT_SHA__,
+ *                                 __APP_GIT_DIRTY__,
+ *                                 __APP_BUILT_AT__) from
+ *                                 vite.main.config.mjs. The
+ *                                 packaged bundle has no `.git`
+ *                                 directory and Spotlight launches
+ *                                 cwd from `/`, so a runtime `git`
+ *                                 call would always fail.
+ *
+ * Both paths fall back gracefully: a missing or unreadable git
+ * binary downgrades the badge to "v1.0.0" with no SHA, rather than
+ * crashing the app at startup. The dirty-flag distinguishes "your
+ * saved file edits won't be in this running window unless you
+ * restart npm start" from "this is exactly the committed HEAD" —
+ * the renderer paints the pill amber in the dirty state so the
+ * mismatch is impossible to miss.
+ *
+ * IPC channel:
+ *   renderer → main: ipcRenderer.invoke('app:version')
+ *   returns:         { pkgVersion, gitSha, gitDirty, builtAt }
+ *
+ * The value is computed once and cached for the process lifetime
+ * because none of the inputs can change without a restart (Vite
+ * defines bake at build start; the runtime git read captures the
+ * working-tree state at process boot).
+ * ──────────────────────────────────────────────────────────────────── */
+
+// `__APP_GIT_SHA__`, `__APP_GIT_DIRTY__`, `__APP_BUILT_AT__` below
+// are NOT declared as local bindings — esbuild's `define` (configured
+// in vite.main.config.mjs) only substitutes UNBOUND identifier
+// references, so any local `var __APP_GIT_SHA__` here would shadow
+// the define and silently leave the constant as `undefined` at
+// runtime. The references are intentionally undeclared globals; the
+// `typeof X !== 'undefined'` guard makes them safe to read outside a
+// Vite build (where the substitution doesn't run). See the long
+// block-comment above for the full read-path decision.
+/* global __APP_GIT_SHA__, __APP_GIT_DIRTY__, __APP_BUILT_AT__ */
+
+/** @type {{ pkgVersion: string, gitSha: string, gitDirty: boolean, builtAt: number } | null} */
+let APP_VERSION = null;
+
+/**
+ * Read package.json's "version" field. Uses readFileSync (rather than
+ * a top-level `import pkg from '../package.json'`) so the Vite-
+ * bundled main process doesn't have to ship the entire package.json
+ * as inline JSON. In dev mode the file is read from the project
+ * root; in packaged mode it's read from the asar root via
+ * app.getAppPath().
+ *
+ * Falls back to '0.0.0' if the file is unreadable — should never
+ * happen in practice, but a crash here would block startup before
+ * the BrowserWindow ever opens.
+ */
+function readPkgVersion() {
+  try {
+    const pkgPath = path.join(app.getAppPath(), 'package.json');
+    const raw = readFileSync(pkgPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.version === 'string' ? parsed.version : '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+/**
+ * Resolve the full version metadata once, lazily, the first time the
+ * IPC handler is invoked. Cached on the module-level `APP_VERSION` so
+ * subsequent calls are free. See the block-comment above for the
+ * dev-vs-packaged read-path decision.
+ *
+ * `stdio: ['ignore', 'pipe', 'ignore']` silences git's stderr (which
+ * would otherwise spam the dev console with "fatal: not a git
+ * repository" on a fresh checkout pulled from a tarball).
+ */
+function computeAppVersion() {
+  if (APP_VERSION) return APP_VERSION;
+
+  const pkgVersion = readPkgVersion();
+  let gitSha = '';
+  let gitDirty = false;
+  let builtAt = Date.now();
+
+  // Vite-injected fallbacks (always present in built artefacts).
+  const injectedSha =
+    typeof __APP_GIT_SHA__ !== 'undefined' && typeof __APP_GIT_SHA__ === 'string'
+      ? __APP_GIT_SHA__
+      : '';
+  const injectedDirty =
+    typeof __APP_GIT_DIRTY__ !== 'undefined' && typeof __APP_GIT_DIRTY__ === 'boolean'
+      ? __APP_GIT_DIRTY__
+      : false;
+  const injectedBuiltAt =
+    typeof __APP_BUILT_AT__ !== 'undefined' && typeof __APP_BUILT_AT__ === 'number'
+      ? __APP_BUILT_AT__
+      : 0;
+
+  if (app.isPackaged) {
+    // Packaged builds can't shell out to git — the bundle ships
+    // without a `.git` directory. Use the values baked in at
+    // vite.main.config.mjs build time.
+    gitSha = injectedSha;
+    gitDirty = injectedDirty;
+    builtAt = injectedBuiltAt || builtAt;
+  } else {
+    // Dev mode: re-read git at runtime so a fresh commit between
+    // Vite-build and the IPC call shows up in the badge without a
+    // `npm start` restart. The cwd is app.getAppPath() (= project
+    // root in dev) so `git` walks up from a sensible anchor even
+    // if Electron was launched with a different cwd.
+    const cwd = app.getAppPath();
+    try {
+      gitSha = execSync('git rev-parse --short HEAD', {
+        cwd,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      })
+        .toString()
+        .trim();
+    } catch {
+      gitSha = injectedSha;
+    }
+    try {
+      gitDirty =
+        execSync('git status --porcelain', {
+          cwd,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        })
+          .toString()
+          .trim().length > 0;
+    } catch {
+      gitDirty = injectedDirty;
+    }
+    // In dev, "built at" effectively means "when this Electron
+    // process started" — close enough to "how old is the running
+    // window" that the renderer can render a humanised "5m ago"
+    // string. The Vite-injected value (build start) and Date.now()
+    // (module load) are within ms of each other on `npm start`.
+    builtAt = injectedBuiltAt || builtAt;
+  }
+
+  APP_VERSION = { pkgVersion, gitSha, gitDirty, builtAt };
+  return APP_VERSION;
+}
+
 import { GeminiSession } from './gemini-session.js';
 import { DeepgramSession } from './deepgram-session.js';
 import { Coach } from './coach.js';
@@ -2591,6 +2759,19 @@ function registerIpcHandlers() {
     app.quit();
     return { ok: true };
   });
+
+  /**
+   * Build-version metadata for the header `#versionBadge` pill. See
+   * the long block-comment above computeAppVersion() near the top of
+   * this file for the dev-vs-packaged read-path decision and the
+   * dirty-flag semantics.
+   *
+   * Renderer wiring: window.gemini.getAppVersion() → renders once at
+   * boot (the values can't change mid-session — Vite defines bake at
+   * build start and the runtime git read captures the working-tree
+   * state at process boot). Cached after first read.
+   */
+  ipcMain.handle('app:version', () => computeAppVersion());
 
   // Renderer asks the coach for a fresh suggestion (seller pressed Skip
   // on the active suggestion card, or pressed → at the live edge of
