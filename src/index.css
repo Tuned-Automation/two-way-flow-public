@@ -1,13 +1,19 @@
 /* ─────────────────────────────────────────────────────────────────────
- *  2-Way Flow — three-column rubric coach overlay.
+ *  2-Way Flow — transcript-first rubric coach overlay.
  *
- *  Layout
+ *  Layout (v2)
  *  ─────────────────────────────────────────────────────────────────────
  *    .coach (root, 720x440 minus drag margin)
  *      ├── .coach__header           recording dot + speakers + controls
- *      ├── .coach__body             3 cols: rail / active pillar / captured
- *      ├── .coach__footer           transcript toggle + rubric switcher
- *      └── .drawer  (sibling)       transcript drawer overlay (hidden default)
+ *      └── .coach__body             3 cols: rail / transcript / captured
+ *            ├── .rail              60px column of pillar icons
+ *            ├── .transcript-pane   flex column: always-visible transcript
+ *            │                      list + pinned suggestion at the bottom
+ *            ├── .captured          200px right column of captured fields
+ *            └── .rail-overlay      slide-over panel (absolute, hidden by
+ *                                   default; slides in from the left over
+ *                                   the transcript pane when a pillar is
+ *                                   clicked)
  *
  *  Drag-region discipline
  *  ─────────────────────────────────────────────────────────────────────
@@ -35,6 +41,16 @@
   --radius-card: 14px;
   --radius-pane: 10px;
   --radius-pill: 999px;
+
+  /* Speaker-label tag colours (YOU / PROSPECT prefixes on each
+   * transcript turn). The renderer overrides these on
+   * `document.documentElement.style` whenever Appearance settings
+   * change, so the live transcript and summary modal both pick up
+   * the user's choices without needing to know about each rule.
+   * Defaults here mirror DEFAULT_SETTINGS.appearance.tagColors in
+   * src/settings.js — keep them in sync. */
+  --speaker-color-you: #f0f0f0;
+  --speaker-color-other: #c7d2fe;
 }
 
 html,
@@ -151,6 +167,256 @@ a,
   opacity: 0.85;
 }
 
+/* ── AEC (echo cancellation) status badge ───────────────────────────
+ *
+ * Tiny header indicator that surfaces whether Chromium's AEC3 echo
+ * canceller is actually active on the mic capture chain. Sits inside
+ * `.speakers` next to the You / Other pills because it's a property
+ * of the mic channel (channel 1) — the system-audio loopback
+ * (channel 2) doesn't run AEC by design and isn't represented here.
+ *
+ * Three visual states keyed off `data-state`:
+ *   unknown — neutral dim grey (pre-capture, or browser didn't
+ *             expose the setting)
+ *   on      — green outline + tint (browser honoured AEC3; prospect
+ *             bleed is being cancelled before Deepgram)
+ *   off     — red outline + tint (browser refused the constraint —
+ *             usually a Bluetooth / external USB interface quirk)
+ *
+ * Sized deliberately small (10px font, ~4px padding) so it reads as
+ * a status tag, not a clickable control. */
+.aec-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-dim);
+  white-space: nowrap;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+.aec-badge[data-state='on'] {
+  background: rgba(34, 197, 94, 0.14);
+  border-color: rgba(34, 197, 94, 0.45);
+  color: #4ade80;
+}
+
+.aec-badge[data-state='off'] {
+  background: rgba(248, 113, 113, 0.14);
+  border-color: rgba(248, 113, 113, 0.5);
+  color: var(--accent-red);
+}
+
+/* ── Connection-status pill (E4 / E5) ─────────────────────────────
+ *
+ * Header indicator that rolls the per-transport health (Deepgram +
+ * Gemini Live) up into a single worst-of state. Three visual
+ * states keyed off the data-state attribute:
+ *
+ *   - data-state='connected'    — green dot + "Live" label
+ *   - data-state='reconnecting' — amber dot + "Reconnecting" label
+ *                                 (subtle pulse so the rep reads it
+ *                                 as "actively retrying" not "stuck")
+ *   - data-state='down'         — red dot + "Off" label
+ *
+ * Sized + coloured to match the AEC badge so the header reads as a
+ * single row of small status tags. The dot is a separate child so
+ * the visual treatment can evolve independently of the text label.
+ * Hidden by default; the renderer reveals it once the call starts
+ * (see renderConnectionStatus gating in src/renderer.js).
+ *
+ * Per-transport state lives on the data-deepgram / data-gemini-live
+ * attributes (not used in CSS today — kept for future per-side
+ * styling and for the title-tooltip lookup).
+ */
+.conn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px 2px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-dim);
+  white-space: nowrap;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+.conn-pill__dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+.conn-pill[data-state='connected'] {
+  background: rgba(34, 197, 94, 0.14);
+  border-color: rgba(34, 197, 94, 0.45);
+  color: #4ade80;
+}
+
+.conn-pill[data-state='reconnecting'] {
+  background: rgba(251, 191, 36, 0.14);
+  border-color: rgba(251, 191, 36, 0.5);
+  color: #fbbf24;
+}
+
+.conn-pill[data-state='reconnecting'] .conn-pill__dot {
+  animation: conn-pill-pulse 900ms ease-in-out infinite alternate;
+}
+
+.conn-pill[data-state='down'] {
+  background: rgba(248, 113, 113, 0.14);
+  border-color: rgba(248, 113, 113, 0.5);
+  color: var(--accent-red);
+}
+
+@keyframes conn-pill-pulse {
+  from { opacity: 0.45; }
+  to   { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conn-pill[data-state='reconnecting'] .conn-pill__dot {
+    animation: none;
+    opacity: 0.85;
+  }
+}
+
+/* ── Speaker-bleed hint banner ─────────────────────────────────────
+ *
+ * One-shot diagnostic surfaced when the cross-channel dedup fires
+ * frequently — strong signal that the AI/prospect voice is bleeding
+ * into the user's mic via their speakers. Absolutely positioned over
+ * the body so showing/hiding it never reflows the surrounding layout
+ * (per the v2.5 spec: "should not push other UI around"). Visually
+ * sized to read as a status pill — same register as the AEC badge,
+ * but amber-tinted so it doesn't compete with the red recording
+ * indicator.
+ *
+ * Driven from src/renderer.js: noteDedupDrop() increments a counter
+ * that fires showDedupHintBanner() once per session at threshold;
+ * the close button calls hideDedupHintBanner().
+ */
+.dedup-hint {
+  -webkit-app-region: no-drag;
+  position: absolute;
+  top: 38px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px 3px 10px;
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: 0.1px;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.4);
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+}
+
+.dedup-hint[hidden] {
+  display: none;
+}
+
+.dedup-hint__dismiss {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(251, 191, 36, 0.16);
+  color: #fbbf24;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.dedup-hint__dismiss:hover {
+  background: rgba(251, 191, 36, 0.32);
+  color: #fde68a;
+}
+
+/* ── "Pillar coverage complete" banner ─────────────────────────────
+ *
+ * Transient success banner shown when the "Cover remaining" queue
+ * runs to completion. Visually mirrors the .dedup-hint register
+ * (same position / shape so it reads as part of the same banner
+ * family) but tinted green to signal completion rather than the
+ * dedup-hint's amber warning. Built lazily by the renderer
+ * (showCoverQueueCompleteBanner) so it only exists in the DOM
+ * while visible, and self-dismisses after ~3.5s. */
+.cover-queue-complete {
+  -webkit-app-region: no-drag;
+  position: absolute;
+  top: 38px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px 3px 10px;
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: 0.1px;
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.4);
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+}
+
+.cover-queue-complete__dismiss {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(74, 222, 128, 0.16);
+  color: #4ade80;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.cover-queue-complete__dismiss:hover {
+  background: rgba(74, 222, 128, 0.32);
+  color: #bbf7d0;
+}
+
 /* Header right side: controls. */
 .coach__controls {
   display: inline-flex;
@@ -212,6 +478,55 @@ a,
   transition: background 120ms ease, color 120ms ease;
 }
 
+/* ─── Coach mode toggle (v2.5) ────────────────────────────────────────
+ *
+ * Two-position pill that lives in the header controls group. Drives the
+ * pause-detection feature (Automated mode only) — the visual is a single
+ * rounded pill divided into two segments, with the active segment lit
+ * up. Persisted on the renderer side; tooltips explain.
+ *
+ * Sized smaller than the rec-toggle so it reads as a setting rather
+ * than an action. */
+.mode-toggle {
+  -webkit-app-region: no-drag;
+  display: inline-flex;
+  align-items: stretch;
+  padding: 1px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-soft);
+  gap: 0;
+}
+
+.mode-toggle__btn {
+  appearance: none;
+  background: transparent;
+  color: var(--text-dim);
+  border: 0;
+  border-radius: var(--radius-pill);
+  padding: 2px 9px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.mode-toggle__btn:hover {
+  color: var(--text-med);
+}
+
+.mode-toggle__btn[data-active='true'] {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text-strong);
+}
+
+.mode-toggle__btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
+}
+
 .coach__icon-btn:hover {
   background: rgba(255, 255, 255, 0.08);
   color: var(--text-strong);
@@ -222,23 +537,30 @@ a,
   outline-offset: 2px;
 }
 
-/* ─── Body: three-column layout ────────────────────────────────────── */
+/* ─── Body: three-column layout ──────────────────────────────────────
+ *
+ * Flex (not grid) so the rail-overlay can be positioned absolutely
+ * within this container with stable insets (left = rail width, right =
+ * captured width). `position: relative` makes the body the containing
+ * block for the overlay. */
 
 .coach__body {
-  display: grid;
-  grid-template-columns: 48px 1fr 220px;
+  position: relative;
+  display: flex;
   flex: 1 1 auto;
   min-height: 0;
+  overflow: hidden;
 }
 
 /* ─── Pillar rail (left column) ─────────────────────────────────────── */
 
 .rail {
   -webkit-app-region: no-drag;
+  flex: 0 0 60px;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 10px 6px;
+  padding: 10px 8px;
   border-right: 1px solid var(--border-soft);
   overflow-y: auto;
   scrollbar-width: thin;
@@ -262,8 +584,8 @@ a,
   background: transparent;
   border: 0;
   padding: 0;
-  width: 36px;
-  height: 36px;
+  width: 40px;
+  height: 40px;
   border-radius: 8px;
   color: var(--text-med);
   cursor: pointer;
@@ -285,10 +607,12 @@ a,
   outline-offset: 2px;
 }
 
-/* Pillar glyphs are intentionally uniform: a translucent disc with the
- * monogram in dim white. Status is communicated by the corner dot and the
- * selected/hover ring, not by per-pillar tints. The PILLAR.tint values in
- * src/rubric.js are deliberately ignored here for a monotone palette. */
+/* Pillar glyphs are intentionally uniform at rest: a translucent disc
+ * with the monogram in dim white. v2.5 introduces a per-pillar coverage
+ * rollup that tints the glyph as items get covered (see data-coverage
+ * rules below). The PILLAR.tint values in src/rubric.js are still
+ * deliberately ignored — this isn't a per-pillar palette, it's a
+ * shared 3-step progression. */
 .pillar__glyph {
   display: inline-flex;
   align-items: center;
@@ -300,7 +624,8 @@ a,
   font-weight: 600;
   background: rgba(255, 255, 255, 0.08);
   color: var(--text-med);
-  transition: background 120ms ease, color 120ms ease;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+  border: 1px solid transparent;
 }
 
 .pillar:hover .pillar__glyph,
@@ -309,7 +634,50 @@ a,
   color: var(--text-strong);
 }
 
-/* Corner status dot. Hidden when status is `idle` (no dot rendered). */
+/* ── v2.5: pillar coverage rollup ──────────────────────────────────
+ *
+ * Real pillars (no `data-synthetic`) get `data-coverage` set by the
+ * renderer based on how many of their items are in the `covered`
+ * state:
+ *
+ *   pending   — zero items covered. Default monotone glyph.
+ *   partial   — at least one covered, but not all. Orange tint
+ *               (matches the `logged` amber elsewhere in the
+ *               palette).
+ *   complete  — every item covered. Green tint.
+ *
+ * No red state — explicitly out of scope per the user. Synthetic
+ * pillars (live_signals / logged_questions) don't get this attribute;
+ * their indicator is the corner dot below. */
+.pillar[data-coverage='partial'] .pillar__glyph {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.pillar[data-coverage='partial']:hover .pillar__glyph,
+.pillar[data-coverage='partial'][data-selected='true'] .pillar__glyph {
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.22);
+  border-color: rgba(245, 158, 11, 0.65);
+}
+
+.pillar[data-coverage='complete'] .pillar__glyph {
+  color: #22c55e;
+  background: rgba(34, 197, 94, 0.16);
+  border-color: rgba(34, 197, 94, 0.5);
+}
+
+.pillar[data-coverage='complete']:hover .pillar__glyph,
+.pillar[data-coverage='complete'][data-selected='true'] .pillar__glyph {
+  color: #4ade80;
+  background: rgba(34, 197, 94, 0.24);
+  border-color: rgba(34, 197, 94, 0.7);
+}
+
+/* Corner status dot — RETAINED ONLY for synthetic pillars (live_signals,
+ * logged_questions). Real pillars communicate state via the glyph
+ * colour rollup above. */
 .pillar__dot {
   position: absolute;
   top: 4px;
@@ -321,88 +689,224 @@ a,
   background: transparent;
 }
 
-.pillar[data-status='in_progress'] .pillar__dot {
-  background: rgba(255, 255, 255, 0.4);
+.pillar[data-synthetic='true'][data-status='in_progress'] .pillar__dot {
+  background: #f59e0b;
 }
 
-.pillar[data-status='complete'] .pillar__dot {
+.pillar[data-synthetic='true'][data-status='complete'] .pillar__dot {
   background: var(--text-strong);
 }
 
-/* ─── Active pillar (middle column) ────────────────────────────────── */
+/* ─── Transcript pane (middle column) ──────────────────────────────── */
 
-/* Three-row flex: pinned header, scrolling body (checklist or live-signals
- * list), pinned footer (transcript ticker + coach suggestion). Only the
- * body scrolls — the footer never gets cropped no matter how long the
- * checklist is.
+/* Two-row flex: a scrolling transcript list on top, a pinned footer at
+ * the bottom that holds the coach's "ask this next" suggestion. Only
+ * the list scrolls — the suggestion never gets cropped no matter how
+ * long the conversation runs.
  *
- * `min-width: 0` is load-bearing: the active-pillar is a grid child of
- * .coach__body (track template `48px 1fr 220px`). Without it, no-wrap
- * content inside the ticker forces the 1fr track to auto-size to fit
- * the content, which pushes the captured pane on the right off-screen. */
-.active-pillar {
+ * `min-width: 0` is load-bearing inside the .coach__body flex container
+ * — without it, no-wrap content forces the pane to auto-size to fit and
+ * pushes the captured pane on the right off-screen. */
+.transcript-pane {
   -webkit-app-region: no-drag;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-}
-
-.active-pillar__header-slot {
-  padding: 12px 16px 4px;
-}
-
-.active-pillar__body {
   -webkit-user-select: text;
   user-select: text;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
-  overflow-y: auto;
-  padding: 4px 16px 10px;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+  display: flex;
+  flex-direction: column;
+  background: rgba(0, 0, 0, 0.18);
 }
 
-.active-pillar__body::-webkit-scrollbar {
+.transcript-pane__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.transcript-pane__list::-webkit-scrollbar {
   width: 5px;
 }
-.active-pillar__body::-webkit-scrollbar-thumb {
+.transcript-pane__list::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.18);
   border-radius: 2px;
 }
 
-.active-pillar__footer {
+/* Each committed transcript turn as its own paragraph. Pending text
+ * (in-flight partial from the live session) is rendered with a faint
+ * italic style so the seller can see what's still being transcribed. */
+.transcript-pane__line {
+  margin: 0;
+}
+
+.transcript-pane__line--pending {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.transcript-pane__empty {
+  margin: auto;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.transcript-pane__error {
+  margin: 0;
+  padding: 8px 16px;
+  color: var(--accent-red);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: center;
+  background: rgba(248, 113, 113, 0.06);
+  border-top: 1px solid rgba(248, 113, 113, 0.18);
+}
+
+/* Suggestion gets pinned to the bottom of the transcript pane. The
+ * thinking dot sits inline at the top-left so the seller can tell
+ * whether the coach is between roundtrips even when no suggestion is
+ * currently displayed. */
+.transcript-pane__footer {
   -webkit-user-select: text;
   user-select: text;
-  padding: 8px 16px 10px;
-  border-top: 1px solid var(--border-soft);
-  background: rgba(255, 255, 255, 0.02);
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.03);
 }
 
-/* If every child of the footer is hidden, drop the chrome so the empty
- * footer doesn't leave a dead band at the bottom of the column. */
-.active-pillar__footer:not(:has(> :not([hidden]))) {
+/* If every footer child is hidden, drop the chrome so the empty area
+ * doesn't leave a dead band under the transcript. */
+.transcript-pane__footer:not(:has(> :not([hidden]))) {
   border-top-color: transparent;
   background: transparent;
   padding: 0;
 }
 
-/* Single-line live transcript ticker. The renderer trims to the latest
- * TICKER_MAX_CHARS characters and prefixes "… " when the content was
- * clipped — keeps the active portion of speech in view without needing
- * any CSS bidi tricks. */
-.ticker {
-  margin: 0;
+/* ── v2.5: rep-initiated ask controls ─────────────────────────────
+ *
+ * Lives at the top of the transcript pane footer. Pull-based: the
+ * coach never auto-suggests; these three buttons (Suggest / Deeper /
+ * Pivot) are the rep's primary way to invoke a suggestion. The
+ * thinking dot sits inline at the left so the rep sees it light up
+ * the moment any ask fires. */
+.ask-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+}
+
+.ask-controls__buttons {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.ask-btn {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-med);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-pill);
+  padding: 3px 9px;
+  font: inherit;
   font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.ask-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: var(--text-strong);
+}
+
+.ask-btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
+}
+
+/* Cheap visual ack: 160ms scale-down when the rep clicks. Toggled by
+ * the renderer via data-pulsing="true|false". Avoids the rep clicking
+ * twice while the coach takes a tick to respond. */
+.ask-btn[data-pulsing='true'] {
+  transform: scale(0.94);
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.ask-btn__glyph {
+  display: inline-flex;
+  width: 12px;
+  height: 12px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-med);
+}
+
+.ask-btn:hover .ask-btn__glyph {
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--text-strong);
+}
+
+.ask-btn__label {
+  font-size: 11px;
+  letter-spacing: 0.2px;
+}
+
+/* "Recap in progress…" status pill (D8). Lives inside the Recap
+ * ask-btn as a child element so it positions naturally beside the
+ * label. Hidden by default; shown by the click handler in
+ * src/renderer.js and cleared the moment the coach:suggestion IPC
+ * for kind=='recap' arrives.
+ *
+ * Visual treatment: muted caption text with a subtle pulse so the
+ * rep reads it as "still working" rather than a static label.
+ * Doesn't reflow the button — the parent .ask-btn is already a
+ * flex row, so the pill just appears to the right of the label.
+ */
+.ask-btn__status {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
   color: var(--text-dim);
-  font-style: italic;
-  line-height: 1.35;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  margin-left: 2px;
+  animation: ask-btn-status-pulse 1100ms ease-in-out infinite alternate;
+}
+
+@keyframes ask-btn-status-pulse {
+  from { opacity: 0.55; }
+  to   { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ask-btn__status {
+    animation: none;
+    opacity: 0.85;
+  }
 }
 
 /* Coach suggestion card — the "ask this next" surface. */
@@ -414,6 +918,48 @@ a,
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.1);
+  /* Border-colour transition so the card greens in smoothly when the
+   * coach fires mark_question_asked rather than snapping. Keeps the
+   * "saw you ask it" feedback visible for a beat without feeling
+   * harsh. background is included so the tint fades in the same way. */
+  transition: border-color 220ms ease, background-color 220ms ease;
+}
+
+/* v2.5 redesign: pinned card greens the moment the coach validates
+ * the seller actually asked the pinned question. Mirrors the drawer's
+ * .logged-entry--asked treatment so the two surfaces read as the same
+ * signal. Gated in the renderer on settings.coach.trackQuestionState
+ * so when the feature is off the card stays in the neutral .suggestion
+ * skin even if a stale data-asked='true' attribute lingers. */
+.suggestion[data-asked='true'] {
+  border-color: rgba(74, 222, 128, 0.45);
+  background: rgba(74, 222, 128, 0.08);
+}
+
+/* Pulsing "thinking" dot — visible while a coach tick is in-flight.
+ * Coach ticks fire every 1.5s; without this dot the gap between
+ * suggestions feels like the app is hung. The pulse animation duration
+ * (200ms) is intentionally fast enough to read as activity, slow enough
+ * not to feel jittery. Inline in the ask-controls row so the rep sees
+ * it next to the buttons that may have triggered the tick. */
+.thinking-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex: 0 0 auto;
+  transition: opacity 120ms ease;
+}
+
+.thinking-dot[data-active='true'] {
+  background: var(--text-strong);
+  animation: thinking-pulse 200ms ease-in-out infinite alternate;
+}
+
+@keyframes thinking-pulse {
+  from { opacity: 0.35; transform: scale(0.9); }
+  to   { opacity: 1;    transform: scale(1.1); }
 }
 
 .suggestion__label {
@@ -427,11 +973,62 @@ a,
   gap: 6px;
 }
 
+/* v2.5: kind chip in the label row ("Suggest" / "Deeper" / "Pivot" /
+ * "Pause nudge"). Same hierarchy as the legacy "Ask next" label — the
+ * .suggestion__kind class is the canonical name going forward. */
+.suggestion__kind {
+  color: var(--text-dim);
+}
+
 .suggestion__pillar {
   color: var(--text-med);
   font-weight: 500;
   text-transform: none;
   letter-spacing: 0;
+}
+
+/* v2.5: inline Skip pill on the active suggestion card. Sits to the
+ * right of the label row (pushed via margin-left:auto). Click drops
+ * the current pin AND fires a fresh 'next'-kind ask. */
+.suggestion__skip {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  margin-left: auto;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: var(--radius-pill);
+  padding: 1px 8px;
+  font: inherit;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.suggestion__skip:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: var(--text-strong);
+}
+
+.suggestion__skip:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
+}
+
+/* v2.5: anchor quote — the transcript moment the suggestion is
+ * responding to. Pure text, muted italic, prefixed with "responding
+ * to:" via the renderer (kept out of CSS so screen readers see the
+ * full phrase). */
+.suggestion__anchor {
+  margin: 1px 0 0;
+  font-size: 10px;
+  font-style: italic;
+  color: var(--text-dim);
+  line-height: 1.4;
 }
 
 .suggestion__question {
@@ -475,27 +1072,140 @@ a,
   font-variant-numeric: tabular-nums;
 }
 
-.active-pillar__header {
+/* Coverage-queue progress badge. Only present while a queue is
+ * active. Sits inline in the suggestion card's nav row next to
+ * the "1 of 1 · live" position indicator. Reads as a status hint
+ * (faint pill chrome, monotone palette) so it doesn't compete with
+ * the question itself. The N-of-M text uses tabular numerals so
+ * the badge width stays stable as the queue advances. */
+.suggestion__queue-progress {
+  font-variant-numeric: tabular-nums;
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: var(--text-med);
+  letter-spacing: 0.3px;
+}
+
+/* ─── Rail overlay (slide-over pillar drill-in) ────────────────────── */
+
+/* Absolutely positioned within .coach__body so it overlays only the
+ * transcript-pane column (rail stays clickable on the left, captured
+ * pane stays visible on the right). data-open drives both the slide
+ * transform and the backdrop fade. */
+.rail-overlay {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Inset so the rail stays clickable on the left and the captured
+   * pane stays visible on the right. Values match .rail flex-basis
+   * and .captured flex-basis below. */
+  left: 60px;
+  right: 200px;
+  background: rgba(0, 0, 0, 0);
+  transition: background 200ms ease;
+  pointer-events: none;
+  z-index: 5;
+  display: flex;
+  overflow: hidden;
+}
+
+.rail-overlay[data-open='true'] {
+  background: rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+}
+
+.rail-overlay__panel {
+  -webkit-app-region: no-drag;
+  -webkit-user-select: text;
+  user-select: text;
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border-right: 1px solid var(--border-soft);
+  transform: translateX(-100%);
+  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+  box-shadow: 4px 0 18px rgba(0, 0, 0, 0.35);
+}
+
+.rail-overlay[data-open='true'] .rail-overlay__panel {
+  transform: translateX(0);
+}
+
+.rail-overlay__header {
+  padding: 12px 16px 6px;
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
+  border-bottom: 1px solid var(--border-soft);
 }
 
-.active-pillar__title {
+.rail-overlay__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 16px 14px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.rail-overlay__body::-webkit-scrollbar {
+  width: 5px;
+}
+.rail-overlay__body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+}
+
+.rail-overlay__title {
   margin: 0;
   font-size: 15px;
   font-weight: 600;
   color: var(--text-strong);
 }
 
-.active-pillar__counter {
+.rail-overlay__counter {
   font-size: 11px;
   font-weight: 500;
   color: var(--text-dim);
   padding: 2px 8px;
   border-radius: var(--radius-pill);
   background: var(--bg-pane);
+}
+
+.rail-overlay__close {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  background: transparent;
+  color: var(--text-dim);
+  border: 0;
+  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  margin-left: auto;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.rail-overlay__close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong);
+}
+
+.rail-overlay__empty {
+  margin: 16px 0 0;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-dim);
+  text-align: center;
 }
 
 .checklist {
@@ -507,9 +1217,25 @@ a,
   gap: 4px;
 }
 
+/* 4-state checklist row.
+ *
+ *   pending      — empty circle, dim text.
+ *   in_progress  — pulsing circle outline (CSS spinner via box-shadow).
+ *   covered      — filled tick, line-through label, dim text.
+ *   logged       — amber cycle arrow, normal weight, evidence on hover.
+ *
+ * State is driven by `data-state` on the .item; `data-covered` is kept
+ * as a legacy alias during the v2 transition so any external CSS still
+ * works. Evidence text under each label fades in on hover. */
 .item {
   display: grid;
-  grid-template-columns: 16px 1fr;
+  /* Three-column grid: tick (16px) · label (1fr) · optional ask
+   * button (auto). The third column only carries content when the
+   * item is in pending / in_progress state (see makeChecklistItem
+   * in renderer.js); covered / logged rows leave it empty and the
+   * column collapses to 0 width. Kept here as a default so adding
+   * the button doesn't reflow the rest of the row. */
+  grid-template-columns: 16px 1fr auto;
   gap: 8px;
   align-items: baseline;
   font-size: 13px;
@@ -529,28 +1255,252 @@ a,
   border: 1.5px solid rgba(255, 255, 255, 0.2);
   font-size: 9px;
   font-weight: 800;
-  color: transparent;
+  color: var(--text-dim);
+  background: transparent;
   transition: background 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
 .item__label {
   white-space: normal;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
-.item[data-covered='true'] {
+.item__label-text {
+  white-space: normal;
+}
+
+/* Pillar tag on logged items (e.g. "Finance"). Helps the seller know
+ * which pillar the logged item came from without opening that pillar. */
+.item__pillar-tag {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  align-self: flex-start;
+}
+
+/* Evidence reveal: hidden by default, fades in when the row is hovered
+ * or keyboard-focused. Keeps the checklist compact at rest. */
+.item__evidence {
+  display: none;
+  margin-top: 2px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+.item:hover .item__evidence,
+.item__boost:focus-visible .item__evidence,
+.item__boost:hover .item__evidence {
+  display: block;
+}
+
+/* ── state: pending (default) — only need the dim-circle outline ── */
+.item[data-state='pending'] .item__tick {
+  color: var(--text-faint);
+}
+
+/* ── state: in_progress — pulsing outline + glyph ── */
+.item[data-state='in_progress'] {
+  color: var(--text-strong);
+}
+
+.item[data-state='in_progress'] .item__tick {
+  color: var(--text-strong);
+  border-color: var(--text-strong);
+  animation: item-progress-pulse 1100ms ease-in-out infinite;
+}
+
+@keyframes item-progress-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.45); }
+  50%      { box-shadow: 0 0 0 4px rgba(255, 255, 255, 0); }
+}
+
+/* ── state: covered — filled tick, line-through label, dim text ── */
+.item[data-state='covered'] {
   color: var(--text-dim);
 }
 
-.item[data-covered='true'] .item__tick {
+.item[data-state='covered'] .item__tick {
   background: var(--text-strong);
   border-color: var(--text-strong);
   color: rgba(0, 0, 0, 0.85);
 }
 
-.item[data-covered='true'] .item__label {
+.item[data-state='covered'] .item__label-text {
   text-decoration: line-through;
   text-decoration-color: rgba(255, 255, 255, 0.3);
   text-decoration-thickness: 1px;
+}
+
+/* ── state: logged — amber cycle arrow, normal weight ── */
+.item[data-state='logged'] {
+  color: var(--text-strong);
+}
+
+/* Amber is the second semantic colour we admit into the palette (after
+ * red). It's used ONLY for the `logged` state — partially-addressed
+ * items the seller may need to circle back to. */
+.item[data-state='logged'] .item__tick {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.6);
+  background: rgba(251, 191, 36, 0.12);
+}
+
+/* The logged row in the synthetic pillar is interactive — wrap as a
+ * button-shaped affordance so the seller knows it's clickable. */
+.item--logged {
+  padding: 0;
+}
+
+.item__boost {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  color: inherit;
+  font: inherit;
+  width: 100%;
+  text-align: left;
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.item__boost:hover {
+  background: rgba(251, 191, 36, 0.08);
+  border-color: rgba(251, 191, 36, 0.35);
+}
+
+.item__boost:focus-visible {
+  outline: 2px solid rgba(251, 191, 36, 0.55);
+  outline-offset: 1px;
+}
+
+/* Legacy alias used during the v2 transition. `data-state` is the
+ * source of truth; this just keeps any external rule that still
+ * checks data-covered working. Same visual effect as
+ * `data-state='covered'`. */
+.item[data-covered='true']:not([data-state='covered']) {
+  color: var(--text-dim);
+}
+.item[data-covered='true']:not([data-state='covered']) .item__tick {
+  background: var(--text-strong);
+  border-color: var(--text-strong);
+  color: rgba(0, 0, 0, 0.85);
+}
+.item[data-covered='true']:not([data-state='covered']) .item__label-text {
+  text-decoration: line-through;
+  text-decoration-color: rgba(255, 255, 255, 0.3);
+  text-decoration-thickness: 1px;
+}
+
+/* ── Per-item "+ Ask" button on uncovered rubric rows ──────────────
+ *
+ * Lives in column 3 of the .item grid. Only rendered for pending /
+ * in_progress items (covered / logged rows leave column 3 empty).
+ * Style register: the same family as .ask-btn (header pill) but
+ * smaller and tuned to sit inline in the drawer — ~11px font,
+ * 2px 8px padding, transparent background, subtle border, hover
+ * lifts to a brighter border so it reads as interactive without
+ * shouting for attention.
+ *
+ * data-loading="true" is set for ~2s after a click so the seller
+ * gets immediate visual feedback even while the coach takes its
+ * tick (~700ms-1.5s) to respond. */
+.rail__ask-btn {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  align-self: center;
+  margin-left: 8px;
+  padding: 2px 8px;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: var(--radius-pill);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.rail__ask-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.32);
+  color: var(--text-strong);
+}
+
+.rail__ask-btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
+}
+
+/* Brief loading state — toggled by the renderer for ~2s after a
+ * click as a fallback in case the model returns nothing for this
+ * item. Reads as a faint subdued pill so the seller knows the
+ * click registered but the answer isn't here yet. */
+.rail__ask-btn[data-loading='true'] {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.22);
+  color: var(--text-strong);
+  opacity: 0.7;
+}
+
+/* ── "Cover remaining" footer button ───────────────────────────────
+ *
+ * Anchored at the bottom of the pillar drawer body when there are
+ * ≥2 uncovered items. Spans the drawer's content width so it reads
+ * as a primary affordance distinct from the inline per-item
+ * buttons. Same monotone register as the rest of the drawer chrome
+ * (no semantic colour — keeps the palette clean) but with a subtle
+ * dashed border so it reads as a "batch" action.
+ */
+.rail-overlay__footer {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+}
+
+.cover-remaining-btn {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  flex: 1 1 auto;
+  padding: 7px 12px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-med);
+  border: 1px dashed rgba(255, 255, 255, 0.25);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  text-align: center;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.cover-remaining-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.4);
+  color: var(--text-strong);
+}
+
+.cover-remaining-btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
 }
 
 /* Variant for the synthetic live_signals pillar: each row is a fired flag
@@ -613,19 +1563,13 @@ a,
   font-size: 11px;
 }
 
-.active-pillar__empty {
-  margin: 0;
-  font-size: 12px;
-  font-style: italic;
-  color: var(--text-dim);
-}
-
 /* ─── Captured pane (right column) ──────────────────────────────────── */
 
 .captured {
   -webkit-app-region: no-drag;
   -webkit-user-select: text;
   user-select: text;
+  flex: 0 0 200px;
   padding: 14px 14px;
   border-left: 1px solid var(--border-soft);
   overflow-y: auto;
@@ -683,106 +1627,1966 @@ a,
   font-style: italic;
 }
 
-/* ─── Footer ────────────────────────────────────────────────────────── */
-
-.coach__footer {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 14px;
-  border-top: 1px solid var(--border-soft);
+/* ─── Transcript pane: speaker-labelled lines (Phase 4) ──────────────
+ *
+ * Each transcript line carries a `data-speaker` attribute set by the
+ * renderer based on the Deepgram channel that produced it. The label
+ * prefix ("You:" / "Prospect:") is drawn by a CSS ::before so we don't
+ * have to repeat the string in the JS, and so the colour stays in
+ * the stylesheet's control. */
+.transcript-pane__line[data-speaker]::before {
+  display: inline;
+  margin-right: 6px;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
 }
 
-.link {
-  -webkit-app-region: no-drag;
-  appearance: none;
-  background: transparent;
+.transcript-pane__line[data-speaker='you']::before {
+  content: 'You';
+  color: var(--speaker-color-you);
+}
+
+.transcript-pane__line[data-speaker='other']::before {
+  content: 'Prospect';
+  color: var(--speaker-color-other);
+}
+
+/* In-flight partial: dim italic, same prefix colour palette. */
+.transcript-pane__line--pending[data-speaker='you']::before,
+.transcript-pane__line--pending[data-speaker='other']::before {
+  opacity: 0.6;
+}
+
+/* ─── Modal (permission + summary) ──────────────────────────────────
+ *
+ * Both dialogs use the native <dialog> element + .showModal(). The
+ * shared `.modal` chrome handles the backdrop dim, panel layout, and
+ * action-row buttons. Per-modal variants (`.summary-modal__panel`)
+ * extend it for shape-specific tweaks.
+ *
+ * Drag region: dialogs sit OUTSIDE the body's drag layer because the
+ * window's `-webkit-app-region: drag` is set at the body level. The
+ * dialog and its descendants still need `no-drag` on interactive
+ * children — we centralise that via the existing `button`/`input`
+ * blanket rule at the top of this file. */
+.modal {
+  /* Reset native dialog chrome before re-styling. */
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0;
+  padding: 0;
   border: 0;
-  color: var(--text-dim);
-  font: inherit;
-  font-size: 11px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 6px;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background 120ms ease, color 120ms ease;
-}
-
-.link:hover {
+  background: transparent;
   color: var(--text-strong);
-  background: rgba(255, 255, 255, 0.05);
+  -webkit-app-region: no-drag;
+  overflow: hidden;
 }
 
-.link__icon {
-  font-size: 11px;
-  opacity: 0.85;
+.modal[open] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-/* ─── Transcript drawer ─────────────────────────────────────────────── */
+/* Native dialog backdrop. The dim is dark + slightly desaturated so
+ * the panel reads as a clear focal point. */
+.modal::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
 
-/* When visible, the drawer overlays the body (rail/active/captured) and the
-   footer. The user toggles it via the footer button; the body underneath
-   is preserved and revealed again when toggled off. */
-.drawer {
+.modal__panel {
   -webkit-app-region: no-drag;
   -webkit-user-select: text;
   user-select: text;
-  position: absolute;
-  top: 56px; /* below the header */
-  left: 0;
-  right: 0;
-  bottom: 36px; /* above the footer */
-  padding: 14px 16px;
-  background: rgba(15, 17, 22, 0.96);
-  overflow-y: auto;
+  width: min(560px, calc(100% - 32px));
+  max-height: calc(100% - 32px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-card);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.modal__header {
+  padding: 14px 18px 4px;
+}
+
+.modal__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.modal__body {
+  padding: 8px 18px 4px;
   font-size: 13px;
-  line-height: 1.45;
-  color: rgba(255, 255, 255, 0.92);
+  line-height: 1.5;
+  color: var(--text-med);
+}
+
+.modal__body p {
+  margin: 0 0 8px;
+}
+
+.modal__body-secondary {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px 14px;
+  border-top: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+  flex-wrap: wrap;
+}
+
+.modal__btn {
+  appearance: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: var(--radius-pill);
+  padding: 5px 14px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+
+.modal__btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.modal__btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
+}
+
+.modal__btn--ghost {
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.12);
+  color: var(--text-med);
+}
+
+.modal__btn--primary {
+  background: rgba(255, 255, 255, 0.92);
+  color: rgba(0, 0, 0, 0.86);
+  border-color: rgba(255, 255, 255, 0.95);
+}
+
+.modal__btn--primary:hover {
+  background: rgba(255, 255, 255, 1);
+  color: rgba(0, 0, 0, 1);
+}
+
+/* ─── Summary modal ─────────────────────────────────────────────────
+ *
+ * Wider panel + a header / tab bar / body / footer scaffold so each
+ * tab can scroll independently. The body fills the remaining
+ * vertical space; the footer stays pinned at the bottom for the
+ * Copy / Save / Close actions. */
+
+.summary-modal__panel {
+  width: min(760px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+}
+
+.summary-modal__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.summary-modal__header .modal__title {
+  flex: 0 0 auto;
+}
+
+.summary-modal__duration {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-pane);
+}
+
+.summary-modal__header .coach__icon-btn {
+  margin-left: auto;
+}
+
+.summary-modal__tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.summary-modal__tab {
+  appearance: none;
+  background: transparent;
+  color: var(--text-med);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 6px 10px 7px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.summary-modal__tab:hover {
+  color: var(--text-strong);
+}
+
+.summary-modal__tab[data-active='true'] {
+  color: var(--text-strong);
+  border-bottom-color: var(--text-strong);
+}
+
+.summary-modal__tab:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: -2px;
+}
+
+.summary-modal__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.summary-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-strong);
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
-.drawer::-webkit-scrollbar {
-  width: 6px;
+.summary-panel[hidden] {
+  display: none;
 }
-.drawer::-webkit-scrollbar-thumb {
+
+.summary-panel::-webkit-scrollbar {
+  width: 5px;
+}
+
+.summary-panel::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.18);
-  border-radius: 3px;
+  border-radius: 2px;
 }
 
-.drawer__list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.drawer__line {
-  margin: 0;
-}
-
-.drawer__pending {
-  margin: 8px 0 0 0;
-  color: rgba(255, 255, 255, 0.6);
+.summary-panel__empty {
+  margin: auto;
+  font-size: 12px;
   font-style: italic;
-}
-
-.drawer__list:not([hidden]) + .drawer__pending:not([hidden]) {
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  padding-top: 8px;
-}
-
-.drawer__error {
-  margin: 0;
-  color: var(--accent-red);
-  font-weight: 500;
+  color: var(--text-dim);
   text-align: center;
 }
 
-/* Reduced motion: drop the recording-dot pulse. */
+/* Scorecard rows: pillar name + percent bar. */
+.scorecard__row {
+  display: grid;
+  grid-template-columns: 1fr 70px;
+  gap: 12px;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.scorecard__row:last-child {
+  border-bottom: 0;
+}
+
+.scorecard__name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.scorecard__name-label {
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.scorecard__name-meta {
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+
+.scorecard__bar {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.scorecard__bar-track {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.scorecard__bar-fill {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.7);
+  transform-origin: left center;
+  transform: scaleX(var(--pct, 0));
+  transition: transform 280ms ease;
+}
+
+.scorecard__bar-pct {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-med);
+  min-width: 36px;
+  text-align: right;
+}
+
+/* Facts table: group heading + label/value rows. */
+.facts-group {
+  margin-bottom: 16px;
+}
+
+.facts-group__heading {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.facts-row {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.facts-row:last-child {
+  border-bottom: 0;
+}
+
+.facts-row__label {
+  color: var(--text-med);
+  font-size: 12px;
+}
+
+.facts-row__value {
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* Transcript panel: list of speaker-labelled lines. Mirrors the
+ * live transcript pane styling so the user gets visual continuity. */
+.summary-transcript__line {
+  margin: 0 0 6px;
+}
+
+.summary-transcript__line[data-speaker]::before {
+  display: inline;
+  margin-right: 6px;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+.summary-transcript__line[data-speaker='you']::before {
+  content: 'You';
+  color: var(--speaker-color-you);
+}
+
+.summary-transcript__line[data-speaker='other']::before {
+  content: 'Prospect';
+  color: var(--speaker-color-other);
+}
+
+/* AI debrief panel. */
+.debrief__section + .debrief__section {
+  margin-top: 14px;
+}
+
+.debrief__heading {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.debrief__text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-strong);
+}
+
+.debrief__list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-strong);
+}
+
+.debrief__list li {
+  margin-bottom: 2px;
+}
+
+/* Footer: copy/save buttons + toast feedback. */
+.summary-modal__footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.summary-modal__footer-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.summary-modal__toast {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* ─── Captured pane: bullet-list value ──────────────────────────────
+ *
+ * Long field values are split into a compact disc list instead of a
+ * run-on paragraph. Shares `.captured__value` for font / colour; the
+ * `--list` variant resets margin and sets the bullet geometry. */
+.captured__value--list {
+  list-style: disc;
+  padding-left: 1rem;
+  margin: 0;
+}
+
+.captured__value--list li {
+  margin-bottom: 2px;
+}
+
+/* ─── Captured field recap tooltip ──────────────────────────────────
+ *
+ * Fixed overlay populated and positioned by renderer.js on mouseenter
+ * of any captured field value that has content. Fades in after a 200ms
+ * delay (avoids flash on fast mouse sweeps). pointer-events:none keeps
+ * it from blocking panel interaction. */
+.captured-tooltip {
+  position: fixed;
+  z-index: 9999;
+  max-width: 320px;
+  padding: 8px 12px;
+  background: rgba(30, 30, 40, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  -webkit-app-region: no-drag;
+}
+
+.captured-tooltip.visible {
+  opacity: 1;
+}
+
+/* ─── Quick-fix rollup card (Strategy A / Work-stream C) ─────────────
+ *
+ * Replaces the v1 regex-based "Total potential revenue" block at the
+ * top of #capturedPane. Money capture flows through the structured
+ * `record_meeting_fact` tool (src/coach.js) → factsSheet in main →
+ * Stage-2 background AI (src/quick-fix.js) → this card. Visual
+ * register matches the legacy block (dark surface + faint green wash
+ * + tabular numerics) so reps moving from v1 don't have to relearn
+ * the "money lives here" affordance.
+ *
+ * Three states:
+ *   - hidden (default; no facts captured this call)
+ *   - populated (headline + breakdown + assumptions)
+ *   - degraded (`stale` or `error` state pill at the bottom)
+ *
+ * Each breakdown row is clickable when its source maps to a real
+ * fact id — clicking drills the transcript pane to the anchor quote
+ * via .transcript-pane__line--highlight (below). 'derived' rows
+ * (`data-clickable='false'`) keep the default cursor so the rep
+ * doesn't expect a navigate-on-click that wouldn't have a target.
+ */
+.quick-fix {
+  padding: 12px;
+  margin-bottom: 16px;
+  border-radius: 10px;
+  background: rgba(74, 222, 128, 0.06);
+  border: 1px solid rgba(74, 222, 128, 0.2);
+}
+
+.quick-fix__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.quick-fix__title {
+  font-size: 10.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-dim);
+}
+
+/* Confidence pill — three colour variants. Sits to the right of the
+ * title row so the rep sees the confidence at a glance. Uses the
+ * same palette as the connection pill (green/amber/red) so the
+ * three confidence tiers map to the rep's existing mental model. */
+.quick-fix__confidence {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+}
+
+.quick-fix__confidence[data-level='high'] {
+  background: rgba(74, 222, 128, 0.16);
+  border-color: rgba(74, 222, 128, 0.4);
+  color: #4ade80;
+}
+
+.quick-fix__confidence[data-level='medium'] {
+  background: rgba(251, 191, 36, 0.16);
+  border-color: rgba(251, 191, 36, 0.45);
+  color: #fbbf24;
+}
+
+.quick-fix__confidence[data-level='low'] {
+  background: rgba(248, 113, 113, 0.16);
+  border-color: rgba(248, 113, 113, 0.45);
+  color: var(--accent-red);
+}
+
+.quick-fix__headline {
+  font-size: 22px;
+  font-weight: 700;
+  color: #4ade80;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  margin-bottom: 8px;
+}
+
+.quick-fix__breakdown {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.quick-fix__row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 6px;
+  margin: 0 -6px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-strong);
+  cursor: default;
+  transition: background 120ms ease;
+}
+
+.quick-fix__row[data-clickable='true'] {
+  cursor: pointer;
+}
+
+.quick-fix__row[data-clickable='true']:hover {
+  background: rgba(74, 222, 128, 0.08);
+}
+
+.quick-fix__row-label {
+  font-weight: 400;
+}
+
+.quick-fix__row-amount {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-strong);
+}
+
+/* Optional per-row notes line. Sits below the label/amount row in a
+ * muted register so it reads as supplementary annotation, not
+ * primary content. Spans both grid columns via grid-column: 1 / -1. */
+.quick-fix__row-notes {
+  grid-column: 1 / -1;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-style: italic;
+  margin-top: 2px;
+}
+
+/* Assumptions list — typically 0-5 short strings the Stage-2 model
+ * surfaces when it had to infer a conversion or skip a likely
+ * double-count. Sits at the bottom of the card; hidden when empty
+ * by the renderer. */
+.quick-fix__assumptions {
+  list-style: none;
+  padding-left: 0;
+  margin: 10px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.quick-fix__assumption {
+  padding-left: 10px;
+  position: relative;
+  line-height: 1.4;
+}
+
+.quick-fix__assumption::before {
+  content: '·';
+  position: absolute;
+  left: 0;
+  color: var(--text-dim);
+}
+
+/* Status pill — visible only in degraded states (stale = amber,
+ * error = red). Surfaces at the bottom of the card so the rep can
+ * see "the number you're looking at is from a few seconds ago" or
+ * "rollup is currently unavailable, what you see is the last good
+ * snapshot". */
+.quick-fix__status {
+  margin-top: 10px;
+  padding: 5px 8px;
+  font-size: 10.5px;
+  font-weight: 500;
+  border-radius: 6px;
+  border: 1px solid;
+}
+
+.quick-fix__status[data-status='stale'] {
+  background: rgba(251, 191, 36, 0.1);
+  border-color: rgba(251, 191, 36, 0.4);
+  color: #fbbf24;
+}
+
+.quick-fix__status[data-status='error'] {
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.4);
+  color: var(--accent-red);
+}
+
+/* Transcript-pane line highlight (used by the quick-fix drill-through).
+ * When the rep clicks a breakdown row, the renderer scrolls the
+ * transcript pane to the line whose text contains the source fact's
+ * anchor quote, then adds this class for ~2s. Brief amber pulse so
+ * the rep sees WHY the number is in the total. removeClass via
+ * setTimeout in the click handler.
+ */
+.transcript-pane__line--highlight {
+  animation: transcript-line-highlight 2000ms ease-out;
+}
+
+@keyframes transcript-line-highlight {
+  0%   { background: rgba(251, 191, 36, 0.4); }
+  60%  { background: rgba(251, 191, 36, 0.2); }
+  100% { background: rgba(251, 191, 36, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transcript-pane__line--highlight {
+    animation: none;
+    background: rgba(251, 191, 36, 0.18);
+  }
+}
+
+/* ─── Settings modal ───────────────────────────────────────────────
+ *
+ * Same architectural pattern as the summary modal: a native <dialog>
+ * with a custom panel inside, a tab bar that uses a flat-bottom
+ * underline indicator on the active tab, and a scrollable body. The
+ * panel is intentionally narrower than the summary modal (520px vs
+ * 760px) because the form is dense rather than wide.
+ *
+ * Reuses .modal::backdrop styling implicitly — the rules here mirror
+ * the .modal base so the dialog renders with the same dim + blur
+ * register as #permissionModal and #summaryModal. We don't extend
+ * .modal directly because the spec asked for a `.settings-modal`
+ * class so a future redesign can drift the chrome independently. */
+.settings-modal {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-strong);
+  -webkit-app-region: no-drag;
+  overflow: hidden;
+}
+
+.settings-modal[open] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.settings-modal::backdrop {
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.settings-modal__panel {
+  -webkit-app-region: no-drag;
+  -webkit-user-select: text;
+  user-select: text;
+  width: min(520px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-card);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.settings-modal__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.settings-modal__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-strong);
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-modal__title-glyph {
+  font-size: 14px;
+  opacity: 0.7;
+  line-height: 1;
+}
+
+.settings-modal__close {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  background: transparent;
+  color: var(--text-dim);
+  border: 0;
+  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  margin-left: auto;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.settings-modal__close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong);
+}
+
+.settings-modal__close:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
+}
+
+/* Tab bar — flat-bottom, with the active tab carrying a 2px
+ * underline. Mirrors .summary-modal__tabs visually so the two
+ * modals read as a family. */
+.settings-modal__tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.settings-modal__tab {
+  appearance: none;
+  background: transparent;
+  color: var(--text-med);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 6px 10px 7px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.settings-modal__tab:hover {
+  color: var(--text-strong);
+}
+
+.settings-modal__tab[aria-selected='true'] {
+  color: var(--text-strong);
+  border-bottom-color: var(--text-strong);
+}
+
+.settings-modal__tab:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: -2px;
+}
+
+.settings-modal__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* One tab content section per tab. The settings-tab is the scroll
+ * container — hidden via the `hidden` attribute when inactive so
+ * scroll position resets cleanly between tabs. */
+.settings-tab {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 18px 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-strong);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.settings-tab[hidden] {
+  display: none;
+}
+
+.settings-tab::-webkit-scrollbar {
+  width: 5px;
+}
+
+.settings-tab::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+}
+
+/* ── v2 Providers tab ───────────────────────────────────────────────
+ *
+ * The Providers tab uses a card-based layout: a default-provider
+ * segmented control at the top, then one card per provider stacked
+ * vertically. Auto-save replaces the explicit Save button — a small
+ * "Saved automatically" chip in the providers header signals that
+ * intent. The footer note reminds users that keys live locally.
+ *
+ * Design tokens for this tab (mirrors the spec)
+ *   - Card background:  rgba(20, 20, 30, 0.6)
+ *   - Card border:      rgba(255, 255, 255, 0.08)
+ *   - Card radius:      10px
+ *   - Section header:   12.5px / 600
+ *   - Status badge:     10px pill, ~2px / 8px padding, 999px radius
+ *   - Segmented active: rgba(255,255,255,0.06) bg, full text colour
+ *   - Eye icon:         opacity 0.6 idle, 1.0 active
+ *   - Test/Connect btn: 11px font, 4px/12px padding (smaller than Save)
+ */
+
+/* Top-level grouping inside the Providers tab. The two sections
+ * (default-provider + providers list) get the same vertical rhythm. */
+.settings-section {
+  margin-top: 0;
+}
+
+.settings-section + .settings-section {
+  margin-top: 18px;
+}
+
+.settings-section__heading {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.settings-section__subtitle {
+  margin: 2px 0 10px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+
+/* Heading + chip on the same row (used by the "Providers" header
+ * with the "✓ Saved automatically" chip pinned to the right). */
+.settings-section__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.settings-autosave-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-style: italic;
+  user-select: none;
+}
+
+.settings-autosave-chip__check {
+  font-size: 10px;
+  color: rgba(74, 222, 128, 0.75);
+  font-style: normal;
+}
+
+/* Segmented control for the default-provider selector. Three buttons
+ * sit on a faint pill-shaped track; the active button gets a soft
+ * highlight while the others read as flat ghost buttons. */
+.provider-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.provider-segmented__btn {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  flex: 1 1 0;
+  background: transparent;
+  color: var(--text-med);
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.provider-segmented__btn:hover {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.provider-segmented__btn[data-active='true'] {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.provider-segmented__btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: -2px;
+}
+
+/* Per-provider card. The card register matches the dark-glass aesthetic
+ * of the rest of the surface; the slight extra opacity (vs the modal
+ * panel) keeps cards visually separated when stacked. */
+.provider-card {
+  background: rgba(20, 20, 30, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.provider-card__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.provider-card__glyph {
+  font-size: 14px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-med);
+  line-height: 1;
+}
+
+.provider-card__title {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.provider-card__name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  line-height: 1.2;
+}
+
+.provider-card__subtitle {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Status pill. Three states drive different palettes via the
+ * `data-status` attribute (renderer flips it). */
+.provider-card__status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 999px;
+  line-height: 1.4;
+  letter-spacing: 0.1px;
+}
+
+.provider-card__status[data-status='connected'] {
+  background: rgba(74, 222, 128, 0.15);
+  color: #4ade80;
+  border: 1px solid rgba(74, 222, 128, 0.3);
+}
+
+.provider-card__status[data-status='env'] {
+  background: rgba(251, 191, 36, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.3);
+}
+
+.provider-card__status[data-status='unconfigured'] {
+  background: rgba(150, 150, 160, 0.1);
+  color: rgba(255, 255, 255, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Key row: password input (with the eye toggle absolutely positioned
+ * inside its wrap) + Test/Connect button + inline result message. */
+.provider-card__key-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.provider-card__input-wrap {
+  flex: 1 1 auto;
+  min-width: 0;
+  position: relative;
+}
+
+.provider-card__input {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 32px 6px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.provider-card__input:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.provider-card__input:focus,
+.provider-card__input:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 1px;
+  border-color: rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.provider-card__input::placeholder {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.provider-card__input[type='password'] {
+  letter-spacing: 0.18em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.provider-card__eye {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-med);
+  cursor: pointer;
+  font-size: 13px;
+  opacity: 0.6;
+  transition: opacity 120ms ease, background 120ms ease;
+}
+
+.provider-card__eye:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.provider-card__eye[aria-pressed='true'] {
+  opacity: 1;
+}
+
+.provider-card__eye:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 1px;
+}
+
+/* Test / Connect button. Smaller than the Save button — secondary
+ * register. The label toggles between "Connect" (unconfigured) and
+ * "Test" (configured) via the renderer. */
+.provider-card__test {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+  flex: 0 0 auto;
+}
+
+.provider-card__test:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.provider-card__test:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.provider-card__test:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+.provider-card__test:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 1px;
+}
+
+/* Inline result hint (Test → pass/fail). The renderer toggles
+ * `hidden` and writes the message; auto-hides after 3 s. */
+.provider-card__test-result {
+  font-size: 10.5px;
+  line-height: 1.2;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.provider-card__test-result[hidden] {
+  display: none;
+}
+
+.provider-card__test-result[data-result='ok'] {
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.25);
+}
+
+.provider-card__test-result[data-result='fail'] {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.1);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+}
+
+/* Model row inside a card. Label + select side-by-side; on narrow
+ * widths the select still wins because we let the flex layout shrink
+ * the label first. */
+.provider-card__model-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.provider-card__model-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.provider-card__model {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 28px 6px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-strong);
+  background-color: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='none' stroke='rgba(255,255,255,0.55)' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round' d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.provider-card__model:hover {
+  background-color: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.provider-card__model:focus,
+.provider-card__model:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 1px;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.provider-card__model option {
+  background: var(--bg-card);
+  color: var(--text-strong);
+}
+
+/* ─── Appearance tab ────────────────────────────────────────────────
+ *
+ * Two-up grid of preview "tags" + their colour pickers. The preview
+ * pulls live from --speaker-color-you / --speaker-color-other so
+ * picking a new colour updates the swatch immediately AND the live
+ * transcript pane behind the modal (the variables are defined on
+ * :root, not scoped). The renderer also writes the same variables
+ * on every `input` event for the same reason.
+ *
+ * Extension point: add new appearance controls (font scale, accent
+ * colour, theme) as sibling sections inside the same .settings-section.
+ * The two-column grid only applies to .appearance-tag-grid; other
+ * subsections can flow vertically without colliding. */
+.appearance-tag-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.appearance-tag-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px;
+  background: rgba(20, 20, 30, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+}
+
+.appearance-tag-card__preview {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.appearance-tag-card__preview[data-speaker='you']   { color: var(--speaker-color-you); }
+.appearance-tag-card__preview[data-speaker='other'] { color: var(--speaker-color-other); }
+
+.appearance-tag-card__label {
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.appearance-tag-card__picker {
+  width: 64px;
+  height: 32px;
+  padding: 2px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.appearance-tag-card__picker::-webkit-color-swatch-wrapper { padding: 0; }
+.appearance-tag-card__picker::-webkit-color-swatch { border: 0; border-radius: 4px; }
+
+.appearance-actions {
+  margin-top: 16px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.appearance-reset-btn {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 11px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.appearance-reset-btn:hover {
+  color: rgba(255, 255, 255, 0.85);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+/* Bottom-of-tab footer note. Reads as a subtle hint with a warning
+ * glyph; italic to lower its visual weight further. */
+.settings-footer-note {
+  margin: 18px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+
+.settings-footer-note__glyph {
+  flex: 0 0 auto;
+  font-size: 11px;
+  opacity: 0.75;
+  margin-top: 1px;
+}
+
+.settings-footer-note em {
+  font-style: italic;
+}
+
+/* Placeholder body for tabs that aren't built out yet (Appearance,
+ * Advanced). Keeps the modal's footprint consistent so switching to
+ * an empty tab doesn't visually shrink the dialog. */
+.settings-coming-soon {
+  margin: 24px 0;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--text-dim);
+  text-align: center;
+  line-height: 1.6;
+}
+
+/* ── Advanced tab — coach behaviour toggles ───────────────────────────
+ *
+ * Stack of card-shaped checkbox rows. Visual register matches the
+ * Providers tab cards (same dark fill, same hairline border, same
+ * 10px radius) so switching tabs feels seamless.
+ *
+ * The renderer auto-saves on `change`; there's no Save button.
+ * `.settings-section__title` is the legacy heading class the rest
+ * of the modal uses; this tab re-uses it for parity. */
+.settings-section__title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.advanced-toggle {
+  display: flex;
+  padding: 12px;
+  background: rgba(20, 20, 30, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  margin-bottom: 8px;
+}
+
+.advanced-toggle__label {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  column-gap: 10px;
+  align-items: start;
+  cursor: pointer;
+}
+
+.advanced-toggle__input {
+  grid-row: 1 / 3;
+  margin-top: 2px;
+}
+
+.advanced-toggle__title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.advanced-toggle__sub {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.55);
+  line-height: 1.4;
+}
+
+/* Disabled state for the auto-reformulate row when the parent
+ * trackQuestionState toggle is off — purely visual; the renderer
+ * also sets the checkbox's `disabled` attribute so it can't be
+ * toggled. */
+.advanced-toggle[data-disabled='true'] {
+  opacity: 0.5;
+}
+
+.advanced-toggle[data-disabled='true'] .advanced-toggle__label {
+  cursor: not-allowed;
+}
+
+/* ── Settings stub tabs (Audio / Help in Phase 1) ────────────────────
+ *
+ * Both tabs are empty placeholders that say "coming in Phase N" until
+ * their respective phase lands. The placeholder paragraph re-uses
+ * .settings-section__subtitle's typography but loses the subtitle's
+ * usual top-margin context — it sits in a tab where nothing else
+ * follows, so a touch of vertical breathing room reads better than a
+ * tight subtitle directly under the heading. */
+.settings-tab__placeholder {
+  margin-top: 6px;
+  padding: 16px;
+  border: 1px dashed rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  background: rgba(20, 20, 30, 0.35);
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+/* ── Settings → General → Data subsection ────────────────────────────
+ *
+ * Three stacked "action rows" (Export / Import / Reset). Each row is a
+ * card-shaped block matching the Coach tab's .advanced-toggle visual
+ * register: 12px padding, hairline border, 10px radius. The left side
+ * is the explainer (title + descriptive line); the right side is the
+ * controls (optional checkbox + the action button).
+ *
+ * The danger variant tints the border + background subtly so the Reset
+ * row reads as destructive without screaming. The actual confirmation
+ * gate is the #settingsResetConfirm modal — visual weight here is the
+ * second line of defence, not the first.
+ *
+ * Layout note: the rows use flexbox with `wrap: wrap` so a narrow
+ * window (or a future smaller-modal mode) doesn't truncate the action
+ * button. The .data-action__controls block can drop below the info
+ * block on a wrap. */
+.data-action {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  background: rgba(20, 20, 30, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  margin-bottom: 8px;
+}
+
+.data-action__info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 240px;
+}
+
+.data-action__title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.data-action__desc {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.55);
+  line-height: 1.4;
+}
+
+.data-action__controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.data-action__option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-med);
+  cursor: pointer;
+  user-select: none;
+}
+
+.data-action__option input[type='checkbox'] {
+  margin: 0;
+}
+
+.data-action__btn {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.data-action__btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.data-action__btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 2px;
+}
+
+/* Danger variant for the Reset row + button. The hue is a desaturated
+ * red so it reads as "be careful here" without using the same accent
+ * as the recording dot — that's reserved for live-call state. */
+.data-action--danger {
+  border-color: rgba(248, 113, 113, 0.25);
+  background: rgba(40, 18, 22, 0.6);
+}
+
+.data-action__btn--danger {
+  border-color: rgba(248, 113, 113, 0.4);
+  color: var(--accent-red);
+}
+
+.data-action__btn--danger:hover {
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.6);
+}
+
+/* Modal extras for the reset confirmation + import preview dialogs.
+ * Both reuse the .modal__panel chrome (already defined further up in
+ * this file). The additions below cover the per-dialog body bits:
+ * the checkbox row in the reset confirm, the source/error/diff slots
+ * in the import preview, and a danger-styled action button. */
+.modal__option {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 12.5px;
+  color: var(--text-med);
+  cursor: pointer;
+  user-select: none;
+}
+
+.modal__option input[type='checkbox'] {
+  margin: 0;
+}
+
+.modal__btn--danger {
+  background: rgba(248, 113, 113, 0.16);
+  border: 1px solid rgba(248, 113, 113, 0.5);
+  color: var(--accent-red);
+}
+
+.modal__btn--danger:hover {
+  background: rgba(248, 113, 113, 0.26);
+  border-color: rgba(248, 113, 113, 0.7);
+}
+
+/* Import preview modal: a wider panel because the diff table can
+ * easily run past the default modal width. */
+.settings-import__panel {
+  min-width: min(540px, 92vw);
+  max-width: min(640px, 96vw);
+}
+
+.settings-import__source {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+.settings-import__error {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  border-radius: 8px;
+  background: rgba(248, 113, 113, 0.1);
+  color: var(--accent-red);
+  font-size: 12px;
+}
+
+/* Diff list: one row per top-level settings block. Each row is a
+ * grid (label | summary) so the labels align cleanly down the left.
+ * The summary text is intentionally text-only — a JSON diff is overkill
+ * for the rough "is this importing what I expect?" check the preview
+ * exists for. Phases that add more nuanced diffs can switch this to
+ * a fuller component without touching the structural CSS. */
+.settings-import__diff {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.settings-import__diff-row {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  background: rgba(20, 20, 30, 0.4);
+  font-size: 11.5px;
+}
+
+.settings-import__diff-row--changed {
+  border-color: rgba(248, 196, 113, 0.35);
+  background: rgba(40, 32, 18, 0.5);
+}
+
+.settings-import__diff-row--same {
+  opacity: 0.6;
+}
+
+.settings-import__diff-key {
+  font-weight: 600;
+  color: var(--text-med);
+  text-transform: capitalize;
+}
+
+.settings-import__diff-summary {
+  color: var(--text-strong);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+/* ── Audio tab (Phase 2) ─────────────────────────────────────────────
+ *
+ * Mic + system-audio device pickers, processing toggles, Deepgram
+ * model select, and the "applies on next Start" hint. The constraint
+ * toggles reuse `.advanced-toggle` (defined further up — same visual
+ * register as the Coach tab) and the model select reuses
+ * `.provider-card__model` so the dropdown chrome matches the
+ * Providers tab. Only the picker layout + Refresh button + apply hint
+ * are unique to Audio. */
+
+/* Picker row — a label sitting above a select / refresh-button pair.
+ * Same spacing rhythm as the .data-action__btn group in General so
+ * the two tabs feel related without sharing markup. */
+.audio-picker {
+  margin-top: 12px;
+}
+
+.audio-picker:first-of-type {
+  margin-top: 6px;
+}
+
+.audio-picker__label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-med);
+}
+
+.audio-picker__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.audio-picker__select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Refresh button — slimmer than .data-action__btn (paired with a
+ * select rather than standing alone) but shares the same neutral
+ * glass treatment so it reads as a sibling control, not a primary
+ * action. */
+.audio-picker__refresh {
+  appearance: none;
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+  -webkit-app-region: no-drag;
+}
+
+.audio-picker__refresh:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.audio-picker__refresh:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 2px;
+}
+
+.audio-picker__refresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Helper text density: a touch tighter than .settings-section__subtitle
+ * because picker hints sit directly under the row they describe. */
+.audio-picker__hint {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-dim);
+}
+
+/* "Changes apply on next Start" notice. JS-gated visibility: the
+ * renderer sets `hidden` based on state.status. Amber accent because
+ * it's informational (vs the red of an error / danger row). */
+.audio-apply-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 10px 12px;
+  border: 1px solid rgba(248, 196, 113, 0.35);
+  border-radius: 8px;
+  background: rgba(40, 32, 18, 0.5);
+  color: var(--text-med);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.audio-apply-hint__dot {
+  color: rgba(248, 196, 113, 0.95);
+  font-size: 14px;
+  line-height: 1;
+  flex: 0 0 auto;
+  padding-top: 1px;
+}
+
+/* ── Logged-questions drawer — asked / replaced affordances ──────────
+ *
+ * Surfaces under the `logged_questions` synthetic pillar when the
+ * Coach → Track question state toggle is on. Each entry from the
+ * suggestion history renders as a logged-entry row; the modifier
+ * classes set the green outline + tint (asked) and the muted style
+ * (replaced).
+ *
+ * Gated by JS — the renderer reads settings.coach.trackQuestionState
+ * and only applies these classes when the toggle is on, so flipping
+ * the toggle off rolls back to neutral styling without a CSS reset. */
+/* Subheading separating the rubric-logged items from the history
+ * block in the Logged drawer. Lightweight rule — uses the existing
+ * text-dim token to recede so the rubric items stay primary. */
+.rail-overlay__subheading {
+  margin: 14px 0 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.logged-entries {
+  display: flex;
+  flex-direction: column;
+}
+
+.logged-entry {
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  margin-bottom: 4px;
+}
+
+.logged-entry__pillar-tag {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.logged-entry__question {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-strong);
+}
+
+.logged-entry__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.logged-entry__badge {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-dim);
+}
+
+.logged-entry__evidence {
+  display: block;
+  font-style: italic;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+.logged-entry--asked {
+  border: 1px solid rgba(74, 222, 128, 0.4);
+  background: rgba(74, 222, 128, 0.06);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.logged-entry--asked .logged-entry__badge {
+  background: rgba(74, 222, 128, 0.18);
+  color: rgba(74, 222, 128, 0.95);
+}
+
+.logged-entry--replaced {
+  opacity: 0.7;
+}
+
+/* Reduced motion: drop the recording-dot pulse and the coach thinking pulse.
+ * Also disable the rail-overlay slide transition. */
 @media (prefers-reduced-motion: reduce) {
   .coach[data-status='listening'] .rec__dot {
     animation: none;
+  }
+  .thinking-dot[data-active='true'] {
+    animation: none;
+    opacity: 0.85;
+  }
+  .rail-overlay__panel {
+    transition: none;
+  }
+  .item[data-state='in_progress'] .item__tick {
+    animation: none;
+  }
+  .scorecard__bar-fill {
+    transition: none;
+  }
+  .settings-save:active {
+    transform: none;
   }
 }

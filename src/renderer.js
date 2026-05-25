@@ -2,20 +2,65 @@ import './index.css';
 import {
   PILLARS,
   PILLARS_BY_ID,
+  ITEMS,
   ITEMS_BY_PILLAR,
   ITEMS_BY_ID,
   FIELDS_BY_ID,
   CAPTURED_FIELDS,
   FIELD_GROUPS,
   FLAGS_BY_ID,
+  SUGGESTION_SENTINEL_ITEM_IDS,
 } from './rubric.js';
 
-/* ── Coach ticker / history behaviour ──────────────────────────────── */
-const TICKER_MAX_CHARS = 80;
+/** Rubric declaration index — lets us sort runtime collections (e.g.
+ *  the Logged pillar's item list) into stable rubric order. */
+const ITEM_DECLARATION_INDEX = Object.fromEntries(
+  ITEMS.map((it, i) => [it.id, i]),
+);
+
+/* ── Coach history behaviour ───────────────────────────────────────── */
 const COACH_HISTORY_MAX = 50;
 
+/* v2.5 redesign: coach interaction mode.
+ *
+ *   'signalled' (default) — coach never auto-suggests; rep drives via
+ *                           the three ask buttons or Skip.
+ *   'automated'           — same as signalled, plus a pause-triggered
+ *                           nudge when both speakers go quiet for ≥6s.
+ *
+ * Persisted in localStorage under `coach.mode`. Read once at startup
+ * and applied to the toggle UI; written every time the user flips
+ * the toggle. Forwarded to main via window.gemini.setCoachMode on
+ * session start AND on every flip so the pause detector stays in
+ * sync without restarting the session.
+ */
+const COACH_MODE_LS_KEY = 'coach.mode';
+const COACH_MODE_DEFAULT = 'signalled';
+const VALID_COACH_MODES = new Set(['signalled', 'automated']);
+
+function readSavedCoachMode() {
+  try {
+    const v = localStorage.getItem(COACH_MODE_LS_KEY);
+    return VALID_COACH_MODES.has(v) ? v : COACH_MODE_DEFAULT;
+  } catch {
+    return COACH_MODE_DEFAULT;
+  }
+}
+
+function persistCoachMode(mode) {
+  try { localStorage.setItem(COACH_MODE_LS_KEY, mode); } catch { /* private mode */ }
+}
+
+/** Set of sentinel item ids the coach can emit for non-rubric
+ *  suggestions. Currently only 'freeform.deeper' (Deeper-kind asks
+ *  whose natural follow-up doesn't map to any rubric item). The
+ *  renderer treats these as opaque — no pillar lookup, no rubric
+ *  badge — so the suggestion card still renders the question + anchor
+ *  quote without crashing on a failed ITEMS_BY_ID lookup. */
+const SUGGESTION_SENTINEL_SET = new Set(SUGGESTION_SENTINEL_ITEM_IDS);
+
 /**
- * Renderer entry — three-column rubric coach overlay.
+ * Renderer entry — transcript-first rubric coach overlay.
  *
  * Pipeline when "listening":
  *   getUserMedia → MediaStreamAudioSourceNode
@@ -23,26 +68,31 @@ const COACH_HISTORY_MAX = 50;
  *     └─ AudioWorkletNode (pcm-worklet) → IPC → Gemini Live
  *
  * Inbound IPC:
- *   gemini:*  — transcripts (drawer), errors
- *   scoring:flag  → state.flags
- *   scoring:item  → state.coveredItems[pillarId]
- *   scoring:field → state.capturedFields[fieldId]
+ *   gemini:*  — transcripts (now always-visible in the middle column),
+ *               errors
+ *   scoring:flag       → state.flags
+ *   scoring:item-state → state.itemStates[itemId]   (4-state lifecycle:
+ *                          pending / in_progress / covered / logged)
+ *   scoring:field      → state.capturedFields[fieldId]
+ *   coach:tick-start / coach:tick-end → state.coachThinking
+ *
+ * Outbound IPC (renderer → main):
+ *   coach:skip   — seller pressed → at the live edge of suggestion history
+ *   coach:boost  — seller clicked a logged item; resurface it as next
+ *
+ * Layout (v2):
+ *   - Left rail: pillar icons (clicking opens the rail overlay).
+ *   - Middle: always-visible transcript scroll buffer + suggestion pinned
+ *     at the bottom + thinking-dot.
+ *   - Right: captured fields (unchanged).
+ *   - Slide-over rail overlay sits above the transcript pane (hidden by
+ *     default; opens on pillar click, closes on Esc / backdrop click).
  *
  * Rendering is one-way: render functions are pure over `state`. Anything
  * that mutates `state` calls the relevant render fn at the end.
- *
- * Extension points:
- *   - To add a new column or pane, follow the same `state` + `renderXxx()`
- *     pattern. Pure render functions keep diffing trivial.
- *   - To add a new IPC scoring event (e.g. category scores), add the
- *     channel to preload.js, push a new state slot, and write a render
- *     fn. The pipeline below stays narrow.
  */
 
 const PCM_WORKLET_URL = './pcm-worklet.js';
-
-/** Default pillar shown on the right (synthetic — owns flag display). */
-const DEFAULT_PILLAR_ID = 'live_signals';
 
 /** RMS thresholds for "is the user speaking" — calibrated for normal voice. */
 const SPEAKER_RMS_ON = 0.04;
@@ -55,23 +105,176 @@ const coachEl = document.getElementById('coach');
 const recIndicatorEl = document.getElementById('recIndicator'); // eslint-disable-line no-unused-vars
 const recTimerEl = document.getElementById('recTimer');
 const speakerEls = Array.from(document.querySelectorAll('.speaker'));
+const aecBadgeEl = document.getElementById('aecBadge');
+const connectionStatusEl = document.getElementById('connectionStatus');
 const recToggleEl = document.getElementById('recToggle');
 const minButtonEl = document.getElementById('minButton');
 const closeButtonEl = document.getElementById('closeButton');
 const railEl = document.getElementById('pillarRail');
-const activePillarEl = document.getElementById('activePillar'); // eslint-disable-line no-unused-vars
-const activePillarHeaderEl = document.getElementById('activePillarHeader');
-const activePillarBodyEl = document.getElementById('activePillarBody');
-const tickerEl = document.getElementById('transcriptTicker');
-const coachSuggestionEl = document.getElementById('coachSuggestion');
-const capturedPaneEl = document.getElementById('capturedPane');
-const transcriptToggleEl = document.getElementById('transcriptToggle');
-const transcriptDrawerEl = document.getElementById('transcriptDrawer');
+const transcriptPaneEl = document.getElementById('transcriptPane'); // eslint-disable-line no-unused-vars
 const transcriptListEl = document.getElementById('transcriptList');
-const transcriptPendingEl = document.getElementById('transcriptPending');
 const transcriptErrorEl = document.getElementById('transcriptError');
-const bodyEl = document.querySelector('.coach__body');
-const footerEl = document.querySelector('.coach__footer');
+const coachSuggestionEl = document.getElementById('coachSuggestion');
+const coachThinkingDotEl = document.getElementById('coachThinkingDot');
+const capturedPaneEl = document.getElementById('capturedPane');
+const capturedTooltipEl = document.getElementById('capturedTooltip');
+/* Strategy A / Work-stream C: Quick-fix rollup card.
+ *
+ * Lives at the top of #capturedPane in index.html (rather than being
+ * built lazily) so the renderer can manage its visibility + content
+ * without having to splice it in/out of the captured pane's
+ * replaceChildren flow. Populated by renderQuickFix() on every
+ * scoring:quick-fix IPC; hidden when no rollup is available. */
+const quickFixEl = document.getElementById('quickFix');
+const railOverlayEl = document.getElementById('railOverlay');
+const railOverlayHeaderEl = document.getElementById('railOverlayHeader');
+const railOverlayBodyEl = document.getElementById('railOverlayBody');
+
+/* Speaker-bleed hint banner (one-shot per session). See the
+ * recentDedupDrops doc-block below for the trigger logic. */
+const dedupHintBannerEl = document.getElementById('dedupHintBanner');
+const dedupHintDismissEl = document.getElementById('dedupHintDismiss');
+
+/* Phase 4: Screen Recording permission modal. */
+const permissionModalEl = document.getElementById('permissionModal');
+const permissionRetryBtnEl = document.getElementById('permissionRetry');
+const permissionContinueBtnEl = document.getElementById('permissionContinue');
+const permissionOpenSettingsBtnEl = document.getElementById('permissionOpenSettings');
+
+/* v2.5 redesign: coach interaction mode toggle + ask buttons. */
+const coachModeToggleEl = document.getElementById('coachModeToggle');
+const coachModeBtnEls = coachModeToggleEl
+  ? Array.from(coachModeToggleEl.querySelectorAll('.mode-toggle__btn'))
+  : [];
+const askBtnEls = Array.from(document.querySelectorAll('.ask-btn'));
+
+/* Phase 5: post-call summary modal. */
+const summaryModalEl = document.getElementById('summaryModal');
+const summaryDurationEl = document.getElementById('summaryDuration');
+const summaryCloseXEl = document.getElementById('summaryCloseX');
+const summaryTabEls = Array.from(document.querySelectorAll('.summary-modal__tab'));
+const summaryPanelEls = {
+  scorecard: document.getElementById('summaryPanelScorecard'),
+  facts: document.getElementById('summaryPanelFacts'),
+  transcript: document.getElementById('summaryPanelTranscript'),
+  debrief: document.getElementById('summaryPanelDebrief'),
+};
+const summaryCopyJsonEl = document.getElementById('summaryCopyJson');
+const summaryCopyMdEl = document.getElementById('summaryCopyMd');
+const summarySaveEl = document.getElementById('summarySave');
+const summaryCloseEl = document.getElementById('summaryClose');
+const summaryToastEl = document.getElementById('summaryToast');
+
+/* Settings modal (v3 — six tabs after Phase 1 of the Settings
+ * expansion: Providers / Audio / Appearance / Coach / General /
+ * Help). The form is auto-saved on idle / blur / segmented click —
+ * no Save button. Lookup is by id / data-attribute so the renderer
+ * keeps working as long as the markup contract holds. Audio and Help
+ * tabs are intentionally empty stubs in Phase 1; General hosts the
+ * Data subsection (export / import / reset).
+ *
+ * Element lookups
+ *   - settingsModalEl                 the <dialog>
+ *   - settingsModalCloseEl            the × button
+ *   - settingsTabEls                  the 6 tab buttons (Providers /
+ *                                     Audio / Appearance / Coach /
+ *                                     General / Help)
+ *   - settingsTabContentEls           the 6 <section data-tab-content>
+ *                                     panels they switch between
+ *   - settingsDefaultProviderEl       the segmented control wrapper
+ *   - settingsProviderCardEls         the 3 .provider-card articles
+ *   - PROVIDER_IDS                    canonical id list — order
+ *                                     matters only for keyboard nav
+ *                                     across the segmented buttons.
+ */
+const PROVIDER_IDS = ['anthropic', 'gemini', 'openai'];
+
+const settingsButtonEl = document.getElementById('settingsButton');
+const settingsModalEl = document.getElementById('settingsModal');
+const settingsModalCloseEl = document.getElementById('settingsModalClose');
+const settingsTabEls = Array.from(document.querySelectorAll('.settings-modal__tab'));
+const settingsTabContentEls = Array.from(
+  document.querySelectorAll('.settings-modal [data-tab-content]'),
+);
+const settingsDefaultProviderEl = document.getElementById('settingsDefaultProvider');
+const settingsDefaultProviderBtnEls = settingsDefaultProviderEl
+  ? Array.from(settingsDefaultProviderEl.querySelectorAll('.provider-segmented__btn'))
+  : [];
+const settingsProviderCardEls = Array.from(
+  document.querySelectorAll('.provider-card[data-provider]'),
+);
+
+/* Coach tab — behaviour toggles (renamed from "Advanced" in schema
+ * v3). Both default OFF; the renderer reads the persisted values out
+ * of settingsCache on first modal open and re-renders the drawer
+ * whenever they change. */
+const settingsCoachTrackEl = document.getElementById('coachTrackQuestionState');
+const settingsCoachAutoReformulateEl = document.getElementById('coachAutoReformulate');
+
+/* Audio tab (Phase 2) — capture device pickers, AEC/NS/AGC toggles,
+ * Deepgram model select, hide-AEC-badge toggle, and the
+ * "applies on next Start" hint. The autosave helpers below wire
+ * each control to its `audio.*` field path; the dropdown populators
+ * (enumerateDevices + listAudioSources) hydrate on first modal open
+ * and on Refresh-button clicks.
+ *
+ * Caveats live in code comments adjacent to each control:
+ *   - Mic device ID: getUserMedia falls back to OS default if the
+ *     persisted device unplugs. See micPickerPopulate().
+ *   - AEC toggle: Chromium command-line force-switches in
+ *     [src/main.js](src/main.js) lines 72–76 may override
+ *     `echoCancellation: false` on some platforms. The toggle's
+ *     sub-text surfaces this.
+ *   - Deepgram model: NOT hot-swappable mid-call; the WS query
+ *     string bakes at connect time. The applyHint surfaces this. */
+const audioMicSelectEl = document.getElementById('audioMicDevice');
+const audioMicRefreshBtnEl = document.getElementById('audioMicRefresh');
+const audioSysSourceSelectEl = document.getElementById('audioSysSource');
+const audioSysRefreshBtnEl = document.getElementById('audioSysRefresh');
+const audioAecEl = document.getElementById('audioAec');
+const audioNoiseSuppressionEl = document.getElementById('audioNoiseSuppression');
+const audioAutoGainControlEl = document.getElementById('audioAutoGainControl');
+const audioDeepgramModelEl = document.getElementById('audioDeepgramModel');
+const audioHideAecBadgeEl = document.getElementById('audioHideAecBadge');
+const audioApplyHintEl = document.getElementById('audioApplyHint');
+
+/* General → Data subsection (Phase 1: Reset / Export / Import).
+ * Refs are eager so the wiring below can register listeners
+ * unconditionally — missing elements simply skip via the
+ * instanceof guards. */
+const settingsExportBtnEl = document.getElementById('settingsExportBtn');
+const settingsExportIncludeKeysEl = document.getElementById('settingsExportIncludeKeys');
+const settingsImportBtnEl = document.getElementById('settingsImportBtn');
+const settingsResetBtnEl = document.getElementById('settingsResetBtn');
+
+/* Reset confirmation dialog (#settingsResetConfirm) — siblings of
+ * #settingsModal so showModal() puts them on the top layer above. */
+const settingsResetConfirmEl = document.getElementById('settingsResetConfirm');
+const settingsResetCancelEl = document.getElementById('settingsResetCancel');
+const settingsResetConfirmBtnEl = document.getElementById('settingsResetConfirmBtn');
+const settingsResetPreserveKeysEl = document.getElementById('settingsResetPreserveKeys');
+
+/* Import preview dialog (#settingsImportPreview). The renderer
+ * populates the source path, error message, and diff body before
+ * showing it. */
+const settingsImportPreviewEl = document.getElementById('settingsImportPreview');
+const settingsImportSourceEl = document.getElementById('settingsImportSource');
+const settingsImportErrorEl = document.getElementById('settingsImportError');
+const settingsImportDiffEl = document.getElementById('settingsImportDiff');
+const settingsImportCancelEl = document.getElementById('settingsImportCancel');
+const settingsImportApplyEl = document.getElementById('settingsImportApply');
+
+/* Appearance tab — speaker-label colour pickers + reset. Refs are
+ * captured eagerly because the initial-render path applies the
+ * persisted colours BEFORE the user ever opens the modal (see the
+ * `ensureSettingsLoaded()` call at the bottom of this file). The
+ * DEFAULT_TAG_* constants must match
+ * DEFAULT_SETTINGS.appearance.tagColors in src/settings.js. */
+const appearanceColorYouEl = document.getElementById('appearanceColorYou');
+const appearanceColorOtherEl = document.getElementById('appearanceColorOther');
+const appearanceResetBtnEl = document.getElementById('appearanceResetBtn');
+const DEFAULT_TAG_YOU = '#f0f0f0';
+const DEFAULT_TAG_OTHER = '#c7d2fe';
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
@@ -79,32 +282,108 @@ const state = {
   /** 'idle' | 'starting' | 'listening' | 'error' */
   status: 'idle',
 
-  /* Audio pipeline */
-  stream: null,
+  /* Audio pipeline — shared AudioContext + two independent capture
+   * chains (mic + system loopback). Each chain has its own
+   * MediaStream, MediaStreamAudioSourceNode, AnalyserNode (for the
+   * speaker-activity pill), and AudioWorkletNode (which posts Int16
+   * PCM back to the renderer via .port). System audio chain is
+   * optional — if getDisplayMedia fails or the user opts for
+   * mic-only, the `sys` fields stay null. */
   audioContext: null,
-  source: null,
-  analyser: null,
-  workletNode: null,
-  analyserBuffer: null,
   rafId: null,
+
+  /** Mic chain (channel 1 → salesperson). */
+  mic: {
+    stream: null,
+    source: null,
+    analyser: null,
+    workletNode: null,
+    analyserBuffer: null,
+    lastActiveAt: 0,
+  },
+
+  /** System audio loopback chain (channel 2 → prospect). Optional. */
+  sys: {
+    stream: null,
+    source: null,
+    analyser: null,
+    workletNode: null,
+    analyserBuffer: null,
+    lastActiveAt: 0,
+  },
 
   /* Recording timer */
   recordingStartedAt: null,
   timerInterval: null,
 
-  /* Active speaker (drives header pills) */
-  activeSpeaker: null, // 'you' | 'other' | null
-  speakerOnAt: 0,
-  speakerOffTimer: null,
+  /* Active speakers (drives header pills). Each channel independently
+   * lights up when its RMS crosses SPEAKER_RMS_ON; falls back to false
+   * after SPEAKER_RMS_OFF_AFTER_MS of silence on that channel. With
+   * dual streams both pills can be active at once during cross-talk. */
+  activeSpeakers: { you: false, other: false },
 
-  /* Rubric UI */
-  selectedPillarId: DEFAULT_PILLAR_ID,
+  /* System-audio capture status — drives the permission modal and
+   * informs the user when the prospect channel isn't being captured. */
+  systemAudioStatus: 'unknown', // 'unknown' | 'capturing' | 'denied' | 'unsupported' | 'mic-only'
+
+  /**
+   * Connection-status mirror (E4 / E5). Updated by the
+   * `connection:status` IPC subscriber. Drives the header pill.
+   *
+   *   deepgram   — 'connected' | 'reconnecting' | 'down'
+   *   geminiLive — 'connected' | 'reconnecting' | 'down' | 'closed'
+   *
+   * 'closed' is Gemini-Live-specific — Deepgram is still canonical
+   * for transcripts, so a Live close becomes a soft-degrade rather
+   * than a fatal error (the renderer's `onClosed` handler in E2
+   * keeps the call going). The renderer rolls these up into a
+   * worst-of visual: green when both are connected, amber on any
+   * reconnecting, red when both are down.
+   *
+   * Initial 'down' state is replaced by the first IPC broadcast
+   * after a session starts (or kept as-is when the user is idle).
+   */
+  connection: {
+    /** @type {'connected'|'reconnecting'|'down'} */
+    deepgram: 'down',
+    /** @type {'connected'|'reconnecting'|'down'|'closed'} */
+    geminiLive: 'down',
+  },
+
+  /* Rubric UI
+   * ─────────
+   * `activePillarId` is the source of truth for the slide-over overlay.
+   * null = closed, '<pillarId>' = open and showing that pillar.        */
+  activePillarId: null,
   /** pillarId → 'idle' | 'in_progress' | 'complete' */
   pillarStatus: Object.fromEntries(PILLARS.map((p) => [p.id, 'idle'])),
-  /** pillarId → Map<itemId, { evidence, at }> */
-  coveredItems: Object.fromEntries(PILLARS.map((p) => [p.id, new Map()])),
+  /** itemId → { state, evidence, confidence, source, at }.
+   *  Absence from the map IS the implicit `pending` state. Mirrors
+   *  coachContext.itemStates in main.js — fed by `scoring:item-state`. */
+  itemStates: new Map(),
   /** fieldId → { value, evidence, at } */
   capturedFields: {},
+  /**
+   * Strategy A / Work-stream C: Stage-2 rollup mirror. Populated by
+   * the `scoring:quick-fix` IPC every time the worker produces a new
+   * rollup. Shape: { headlineUsdAnnual, breakdown, assumptions,
+   * confidence, currency, updatedAt, stale, error } or null until
+   * the first rollup lands. Read by renderQuickFix to populate the
+   * static #quickFix card at the top of #capturedPane.
+   */
+  quickFix: null,
+  /**
+   * Active facts snapshot the rollup above was computed from.
+   * Mirrored from the same IPC payload so the renderer's drill-
+   * through (breakdown row click → scroll-to-anchor-quote in the
+   * transcript pane) can look up a fact by id without having to
+   * mirror the whole factsSheet in renderer state. Reset to [] when
+   * a new call starts (clearScoringState).
+   *
+   * Entry shape mirrors src/main.js → coachContext.factsSheet.entries:
+   *   { id, kind, amount, unit, period, basis, quote, recordedAt, supersedes }
+   */
+  quickFixEntries: [],
   /** Fired live flags in arrival order, deduped by id. */
   flags: [],
 
@@ -112,14 +391,269 @@ const state = {
   coachHistory: [], // SuggestionEntry[]
   /** Index into coachHistory of the displayed suggestion. -1 = none yet. */
   coachIndex: -1,
+  /**
+   * Per-call suggestion-history mirror, fed by `scoring:suggestion-history`
+   * IPC (Coach → Track question state). Array of plain objects in
+   * arrival order: { id, itemId, questionText, kind, pinnedAt, asked,
+   * askedAt, evidence, replaced }. Main is the source of truth; the
+   * renderer just keeps a local copy to render the logged-questions
+   * drawer.
+   *
+   * Reset on every Stop (clearScoringState) so a new call starts with
+   * an empty list.
+   */
+  suggestionHistory: [],
+  /**
+   * Coach behaviour toggles, mirrored from settings.coach. Read on
+   * boot via settings:load and refreshed on settings:changed (broadcast
+   * by main whenever the user flips a checkbox).
+   *
+   * Renamed from `state.advanced` in schema v3 to match the new "Coach"
+   * tab label. The shape is unchanged — just the parent key moved.
+   *
+   * Drives:
+   *   - Whether the logged-questions drawer applies the green
+   *     outline / replaced styling to suggestion-history entries.
+   *   - Whether the auto-reformulate checkbox in the Coach tab is
+   *     enabled (it only makes sense when track-question-state is on).
+   *
+   * Both default OFF so the existing pipeline is unchanged.
+   */
+  coach: {
+    trackQuestionState: false,
+    autoReformulate: false,
+  },
+  /** True while a coach tick is in flight — drives the pulsing "thinking"
+   *  dot next to the suggestion area. Fed by coach:tick-start / -end IPC. */
+  coachThinking: false,
+  /** v2.5: 'signalled' | 'automated'. Loaded from localStorage at boot
+   *  (default 'signalled'); updated by the header toggle. Forwarded to
+   *  main on session start AND on every flip. */
+  coachMode: readSavedCoachMode(),
 
-  /* Transcript drawer */
-  transcript: { committed: [], pending: '' },
-  transcriptOpen: false,
+  /**
+   * "Cover remaining" queue. Active when the seller clicks the
+   * Cover-remaining button at the bottom of the pillar drawer — we
+   * fire a `coach:ask-item` for each uncovered item in turn, cycling
+   * to the next one whenever the seller dismisses the current pinned
+   * suggestion (Skip). Cleared when:
+   *   - the queue exhausts (transient "pillar coverage complete"
+   *     banner shows), OR
+   *   - the seller clicks any of the existing Suggest / Deeper /
+   *     Pivot / Recap ask buttons (they're cancelling the queue by
+   *     reaching for a different ask), OR
+   *   - the session ends (clearScoringState).
+   *
+   * Shape: { pillarId, items: ItemDef[], index } or null when no
+   * queue is active. `items` is captured at queue-start time so
+   * mid-queue rubric mutations (e.g. the coach marking an item
+   * covered) don't reshuffle the cycle order — the seller's "cover
+   * everything that was uncovered when I pressed the button" intent
+   * stays stable.
+   */
+  coverQueue: null,
+
+  /**
+   * Always-visible transcript scroll buffer (formerly the drawer).
+   *   committed:        Array of finalised lines, each with its
+   *                     speaker tag, in arrival order.
+   *   pendingBySpeaker: Current in-flight partial per channel. Each
+   *                     interim message from main REPLACES the slot
+   *                     (Deepgram's interim_results give us the full
+   *                     current segment text each time). Cleared on
+   *                     the matching `finished` message.
+   */
+  transcript: {
+    committed: [], // Array<{ speaker: 'you'|'other', text: string }>
+    pendingBySpeaker: { you: '', other: '' },
+  },
   errorMessage: null,
+
+  /* Phase 5: post-call summary modal state. */
+  summary: {
+    /** Last `summary:ready` payload (null until first stop completes). */
+    payload: null,
+    /** Currently visible tab. */
+    activeTab: 'scorecard',
+  },
 };
 
+/* ── Cross-channel duplicate suppression (renderer mirror) ─────────────
+ *
+ * The canonical version of this dedupe lives in main.js
+ * (handleDeepgramTranscript). We mirror it here because the renderer
+ * also appends to its own committed list — without a matching guard,
+ * the UI transcript pane would still show duplicates even though
+ * coachContext.transcriptLines in main is clean.
+ *
+ * Thresholds and resolution rule are intentionally identical to main's
+ * so the two views stay in lockstep — see the corresponding doc-block
+ * in src/main.js for the rationale on each tuning value and the
+ * "always keep PROSPECT, drop YOU" attribution bias.
+ */
+const RENDERER_CROSS_CHANNEL_WINDOW_MS = 5000;
+const RENDERER_CROSS_CHANNEL_DEDUPE_MIN_CHARS = 3;
+
+/** @type {{ you: { text: string, ts: number } | null, other: { text: string, ts: number } | null }} */
+const recentRendererCommitBySpeaker = { you: null, other: null };
+
+/* Mirror of main.js's DEBUG_TRANSCRIPT — flip this to `true` in the
+ * renderer to log a one-line summary per commit (speaker, KEEP/DROP,
+ * which side was dropped, and a 50-char preview). Off by default. */
+const DEBUG_TRANSCRIPT = false;
+
+/**
+ * Module-scope state for the "speaker bleed detected" UI hint. We
+ * count cross-channel drops as a proxy for "the user has speaker
+ * bleed" — when enough drops accumulate in a short window we surface
+ * a one-time, dismissable banner suggesting headphones. The drop
+ * counter ages itself (decrement after 30 s) so a quiet stretch
+ * doesn't pile up false positives across an otherwise clean call.
+ */
+let recentDedupDrops = 0;
+let dedupHintShown = false;
+const DEDUP_HINT_THRESHOLD = 5;
+const DEDUP_DROP_AGE_MS = 30_000;
+
+/** Schedule a decrement of `recentDedupDrops` 30 s after a drop fires
+ *  so a brief noisy stretch followed by a quiet period doesn't keep
+ *  the counter permanently warm. */
+function scheduleDedupDropDecay() {
+  setTimeout(() => {
+    recentDedupDrops = Math.max(0, recentDedupDrops - 1);
+  }, DEDUP_DROP_AGE_MS);
+}
+
+function normaliseForMatch(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+/** Length-aware near-identity check. Mirror of main.js's
+ *  isNearIdentical(); see the doc-block there for the rationale on
+ *  the short-string exact-match gate. Factored out of main for
+ *  clarity rather than imported — the renderer and main run in
+ *  different processes so they can't share modules. */
+function isNearIdentical(a, b) {
+  const na = normaliseForMatch(a);
+  const nb = normaliseForMatch(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  // For short strings (≤12 normalised chars), require exact match only.
+  // The Jaccard token check is meaningless on 1–2 token strings and
+  // would catch unrelated content like "yes" vs "yeah".
+  const shortLen = 12;
+  if (na.length <= shortLen || nb.length <= shortLen) return false;
+  if (na.length >= nb.length && na.includes(nb)) return true;
+  if (nb.length >= na.length && nb.includes(na)) return true;
+  const ta = new Set(na.split(/\s+/));
+  const tb = new Set(nb.split(/\s+/));
+  let intersection = 0;
+  for (const w of ta) if (tb.has(w)) intersection++;
+  const union = ta.size + tb.size - intersection;
+  return union > 0 && intersection / union >= 0.85;
+}
+
+/**
+ * Renderer counterpart of main.js's findAndRemoveMatchingLine. Walks
+ * backwards through a list of committed entries (`{ speaker, text }`
+ * objects here, not prefixed strings) and splices out the most recent
+ * entry for `speaker` whose text is near-identical to `committed`.
+ * Returns true iff an entry was removed. Used by the PROSPECT-biased
+ * dedup path when an incoming PROSPECT commit matches a YOU line
+ * we've already shown.
+ */
+function findAndRemoveMatchingCommitted(list, speaker, committed, maxLookback = 4) {
+  const start = list.length - 1;
+  const end = Math.max(0, start - maxLookback + 1);
+  for (let i = start; i >= end; i--) {
+    const entry = list[i];
+    if (!entry || entry.speaker !== speaker) continue;
+    if (isNearIdentical(entry.text, committed)) {
+      list.splice(i, 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Called every time the cross-channel dedup fires a drop. Bumps the
+ * rolling counter, schedules its 30 s decay, and (on first crossing
+ * of DEDUP_HINT_THRESHOLD per session) surfaces the speaker-bleed
+ * hint banner. Idempotent — repeated crossings after the banner has
+ * shown are no-ops until clearScoringState() resets the guards.
+ *
+ * The threshold (5 drops within ~30 s) is a heuristic: roughly the
+ * point where the bleed is producing more duplicate fragments than
+ * could plausibly be coincidence, but not so high that a noisy
+ * 30-second stretch is needed to trip it.
+ */
+function noteDedupDrop() {
+  recentDedupDrops += 1;
+  scheduleDedupDropDecay();
+  if (recentDedupDrops >= DEDUP_HINT_THRESHOLD && !dedupHintShown) {
+    dedupHintShown = true;
+    showDedupHintBanner();
+  }
+}
+
+function showDedupHintBanner() {
+  if (!dedupHintBannerEl) {
+    // Banner element missing (DOM removed by future redesign?) —
+    // fall back to a console warn so the diagnostic isn't completely
+    // silent. The dedup itself still works regardless.
+    console.warn(
+      '[transcript] speaker bleed detected — headphones will significantly improve attribution.',
+    );
+    return;
+  }
+  dedupHintBannerEl.hidden = false;
+}
+
+function hideDedupHintBanner() {
+  if (!dedupHintBannerEl) return;
+  dedupHintBannerEl.hidden = true;
+}
+
+if (dedupHintDismissEl) {
+  dedupHintDismissEl.addEventListener('click', hideDedupHintBanner);
+}
+
 /* ── Helpers ───────────────────────────────────────────────────────── */
+
+/** Item lifecycle glyphs. Single source of truth for the checklist
+ *  visuals — also reused by the Logged synthetic pillar so the icons
+ *  stay consistent. `pending` is the default; the renderer treats an
+ *  absent entry in state.itemStates as pending. */
+const ITEM_GLYPHS = {
+  pending: '○',
+  in_progress: '◐', // visual hint while the CSS spinner overlays it
+  covered: '✓',
+  logged: '↺',
+};
+
+/** Look up the current state for an item, defaulting to 'pending' when
+ *  absent. Centralised so render fns don't have to repeat the fallback. */
+function itemStateFor(itemId) {
+  return state.itemStates.get(itemId)?.state || 'pending';
+}
+
+/** Enumerate every item currently in `logged` state across all pillars,
+ *  in stable rubric order. Used by the Logged synthetic pillar body. */
+function loggedItems() {
+  const out = [];
+  for (const [itemId, entry] of state.itemStates) {
+    if (entry?.state === 'logged') out.push({ itemId, entry });
+  }
+  // Sort by rubric declaration order for stable display. ITEMS_BY_ID
+  // doesn't carry an index, so build a quick map.
+  out.sort((a, b) => {
+    const ai = ITEM_DECLARATION_INDEX[a.itemId] ?? 0;
+    const bi = ITEM_DECLARATION_INDEX[b.itemId] ?? 0;
+    return ai - bi;
+  });
+  return out;
+}
 
 function setStatus(next) {
   state.status = next;
@@ -135,6 +669,17 @@ function setStatus(next) {
     recToggleEl.textContent = 'Start';
     recToggleEl.setAttribute('aria-label', 'Start recording');
   }
+  // Phase 2: the Audio tab's "applies on next Start" hint is gated by
+  // the call status — visible while listening / starting, hidden in
+  // idle / error. Calling unconditionally here keeps the hint in sync
+  // with every transition without an explicit subscriber per state.
+  // Forward-declared via hoisting (function declaration further down).
+  if (typeof refreshAudioApplyHint === 'function') refreshAudioApplyHint();
+  // The connection-status pill is also gated by the call status —
+  // hidden in idle, visible during listening / starting. Re-render
+  // here so the pill appears / disappears with every status flip
+  // without each call site having to remember to invalidate it.
+  if (typeof renderConnectionStatus === 'function') renderConnectionStatus();
 }
 
 function formatTimer(ms) {
@@ -143,6 +688,129 @@ function formatTimer(ms) {
   const m = String(Math.floor(totalSec / 60)).padStart(2, '0');
   const s = String(totalSec % 60).padStart(2, '0');
   return `${m}:${s}`;
+}
+
+/**
+ * AEC badge — a tiny header indicator that surfaces whether Chromium's
+ * AEC3 echo canceller is actually active on the mic capture chain.
+ *
+ * Driven by the MediaTrackSettings.echoCancellation value the browser
+ * reports back from getUserMedia:
+ *   - `true`      → green "AEC"     — prospect bleed is being cancelled
+ *                                     before reaching Deepgram. This is
+ *                                     the happy path.
+ *   - `false`     → red   "AEC off" — Chromium refused the constraint
+ *                                     (rare; usually a Bluetooth or
+ *                                     external USB interface that
+ *                                     doesn't support AEC).
+ *   - `undefined` → grey  "AEC ?"   — pre-capture, or the browser
+ *                                     didn't expose the setting.
+ *
+ * State is held purely on the DOM (`data-state`) so we don't need a
+ * separate render fn — the badge has no other state to track.
+ */
+function setAecBadgeState(next) {
+  if (!aecBadgeEl) return;
+  if (next === 'on') {
+    aecBadgeEl.dataset.state = 'on';
+    aecBadgeEl.textContent = 'AEC';
+    aecBadgeEl.title = 'Echo cancellation active — speaker bleed removed before transcription.';
+  } else if (next === 'off') {
+    aecBadgeEl.dataset.state = 'off';
+    aecBadgeEl.textContent = 'AEC off';
+    aecBadgeEl.title =
+      'Browser refused echo cancellation. Speaker bleed may appear in your transcript — try wired headphones.';
+  } else {
+    aecBadgeEl.dataset.state = 'unknown';
+    aecBadgeEl.textContent = 'AEC ?';
+    aecBadgeEl.title = 'Echo cancellation status unknown (not yet capturing, or browser did not report).';
+  }
+}
+
+/** Map a MediaTrackSettings dict to the badge's three visual states.
+ *  Centralised so the mic-capture path and any future re-read (e.g.
+ *  after a deviceId switch) both land on the same logic. */
+function updateAecBadgeFromSettings(settings) {
+  if (settings?.echoCancellation === true) setAecBadgeState('on');
+  else if (settings?.echoCancellation === false) setAecBadgeState('off');
+  else setAecBadgeState('unknown');
+}
+
+/**
+ * Roll the per-transport connection statuses up into a single
+ * worst-of pill in the header. The pill has three visual states
+ * driven by the data-state attribute:
+ *
+ *   - 'connected'    (green) — both transports healthy
+ *   - 'reconnecting' (amber) — at least one is mid-retry; the other
+ *                              may be connected or also reconnecting
+ *   - 'down'         (red)   — both transports are down / unavailable
+ *
+ * The label tracks the worst-of state in human-friendly words ("Live"
+ * / "Reconnecting" / "Off") and the title tooltip spells out the
+ * per-transport breakdown so the rep can see WHICH side is degraded.
+ *
+ * Gemini-Live-only 'closed' is treated as 'down' for the rollup —
+ * conceptually it means "flag detection is off but the call is OK
+ * because Deepgram is still streaming". The renderer's onClosed
+ * handler in the E2 decoupling block is what keeps the call alive.
+ *
+ * Hidden when the call is idle so the pill doesn't surface a stale
+ * "Off" between calls. Revealed automatically once any transport
+ * transitions out of the idle 'down' default — see the IPC
+ * subscriber below.
+ */
+function renderConnectionStatus() {
+  if (!connectionStatusEl) return;
+  const dg = state.connection.deepgram;
+  const gl = state.connection.geminiLive;
+
+  // Worst-of rollup:
+  //   - both connected → 'connected'
+  //   - any reconnecting → 'reconnecting'
+  //   - everything else → 'down'
+  let rollup;
+  if (dg === 'connected' && gl === 'connected') rollup = 'connected';
+  else if (dg === 'reconnecting' || gl === 'reconnecting') rollup = 'reconnecting';
+  else rollup = 'down';
+
+  connectionStatusEl.dataset.state = rollup;
+  connectionStatusEl.dataset.deepgram = dg;
+  connectionStatusEl.dataset.geminiLive = gl;
+
+  const label = connectionStatusEl.querySelector('.conn-pill__label');
+  if (label instanceof HTMLElement) {
+    label.textContent =
+      rollup === 'connected' ? 'Live'
+        : rollup === 'reconnecting' ? 'Reconnecting'
+          : 'Off';
+  }
+
+  connectionStatusEl.title = formatConnectionTooltip(dg, gl);
+
+  // Hide while the call is idle (both transports 'down' AND the
+  // status hasn't been broadcast since reset — i.e. state.status is
+  // idle). Shown the moment a transport reports anything other than
+  // the default 'down', and stays visible through reconnects so the
+  // rep can see the state of an in-flight session.
+  const inCall = state.status === 'listening' || state.status === 'starting';
+  connectionStatusEl.hidden = !inCall;
+}
+
+/** Human-readable tooltip for the connection pill — spells out each
+ *  transport so the rep knows which side is degraded when the rollup
+ *  reads amber or red. */
+function formatConnectionTooltip(deepgram, geminiLive) {
+  const labelFor = (status) => {
+    switch (status) {
+      case 'connected': return 'connected';
+      case 'reconnecting': return 'reconnecting';
+      case 'closed': return 'dropped (call still streaming via Deepgram)';
+      case 'down':
+      default: return 'down';
+    }
+  };
+  return `Deepgram: ${labelFor(deepgram)} · Gemini Live: ${labelFor(geminiLive)}`;
 }
 
 /* ── Render fns (pure over state) ──────────────────────────────────── */
@@ -156,7 +824,8 @@ function renderTimer() {
 
 function renderSpeakers() {
   for (const el of speakerEls) {
-    el.dataset.active = String(el.dataset.id === state.activeSpeaker);
+    const id = el.dataset.id;
+    el.dataset.active = String(Boolean(state.activeSpeakers[id]));
   }
 }
 
@@ -168,9 +837,39 @@ function renderRail() {
   }
   for (const el of railEl.children) {
     const id = el.dataset.id;
-    el.dataset.selected = String(id === state.selectedPillarId);
+    const pillar = PILLARS_BY_ID[id];
+    el.dataset.selected = String(id === state.activePillarId);
     el.dataset.status = state.pillarStatus[id] || 'idle';
+    // v2.5: real pillars get a 3-level coverage rollup
+    //   (pending = no items covered → default monotone glyph,
+    //    partial = some items covered  → orange glyph,
+    //    complete = every item covered → green glyph).
+    // Synthetic pillars (live_signals, logged_questions) are
+    // excluded — their colour stays as-is.
+    if (pillar && !pillar.synthetic) {
+      el.dataset.coverage = computePillarCoverage(id);
+    }
   }
+}
+
+/**
+ * Compute the 3-level coverage state for a real pillar, used by the
+ * data-coverage attribute on its rail button to drive the glyph colour
+ * rollup. Synthetic pillars (live_signals, logged_questions) don't
+ * call this — their indicator stays separate.
+ *
+ * @returns {'pending'|'partial'|'complete'}
+ */
+function computePillarCoverage(pillarId) {
+  const items = ITEMS_BY_PILLAR[pillarId] || [];
+  if (items.length === 0) return 'pending';
+  let covered = 0;
+  for (const it of items) {
+    if (itemStateFor(it.id) === 'covered') covered += 1;
+  }
+  if (covered === 0) return 'pending';
+  if (covered >= items.length) return 'complete';
+  return 'partial';
 }
 
 function makePillarButton(pillar) {
@@ -178,8 +877,12 @@ function makePillarButton(pillar) {
   btn.type = 'button';
   btn.className = 'pillar';
   btn.dataset.id = pillar.id;
-  btn.dataset.selected = String(pillar.id === state.selectedPillarId);
+  btn.dataset.selected = String(pillar.id === state.activePillarId);
   btn.dataset.status = state.pillarStatus[pillar.id] || 'idle';
+  if (pillar.synthetic) btn.dataset.synthetic = 'true';
+  // Default coverage; renderRail recomputes for real pillars after
+  // building. Synthetic pillars don't set this attribute.
+  if (!pillar.synthetic) btn.dataset.coverage = 'pending';
   btn.setAttribute('aria-label', pillar.name);
   btn.title = pillar.name;
 
@@ -188,91 +891,188 @@ function makePillarButton(pillar) {
   glyph.textContent = pillar.glyph;
   btn.appendChild(glyph);
 
-  const dot = document.createElement('span');
-  dot.className = 'pillar__dot';
-  dot.setAttribute('aria-hidden', 'true');
-  btn.appendChild(dot);
+  // Corner dot is retained ONLY for synthetic pillars (live_signals
+  // shows "flags fired", logged_questions shows "items waiting to
+  // circle back"). Real pillars use the glyph colour rollup above
+  // instead. Per v2.5: REPLACE the per-item dot/badge with glyph colour
+  // for real pillars; synthetic pillars stay as they were.
+  if (pillar.synthetic) {
+    const dot = document.createElement('span');
+    dot.className = 'pillar__dot';
+    dot.setAttribute('aria-hidden', 'true');
+    btn.appendChild(dot);
+  }
 
   btn.addEventListener('click', () => selectPillar(pillar.id));
   return btn;
 }
 
+/**
+ * Open (or switch) the rail overlay to show a pillar's checklist.
+ * Clicking the same pillar that's already open is a no-op; clicking a
+ * different pillar swaps the contents without re-running the slide
+ * animation. Closing is via Esc or backdrop click.
+ */
 function selectPillar(id) {
   if (!PILLARS_BY_ID[id]) return;
-  if (state.selectedPillarId === id) return;
-  state.selectedPillarId = id;
+  state.activePillarId = id;
   renderRail();
-  renderActivePillar();
+  renderRailOverlay();
 }
 
-function renderActivePillar() {
-  const pillar = PILLARS_BY_ID[state.selectedPillarId];
-  if (!pillar) return;
-
-  const header = document.createElement('div');
-  header.className = 'active-pillar__header';
-
-  const title = document.createElement('h2');
-  title.className = 'active-pillar__title';
-  title.textContent = pillar.name;
-  header.appendChild(title);
-
-  if (pillar.synthetic) {
-    const counter = document.createElement('span');
-    counter.className = 'active-pillar__counter';
-    counter.textContent = `${state.flags.length} fired`;
-    header.appendChild(counter);
-  } else {
-    const items = ITEMS_BY_PILLAR[pillar.id] || [];
-    const covered = state.coveredItems[pillar.id]?.size || 0;
-    const counter = document.createElement('span');
-    counter.className = 'active-pillar__counter';
-    counter.textContent = `${covered} of ${items.length}`;
-    header.appendChild(counter);
-  }
-
-  const body = pillar.synthetic
-    ? renderLiveSignalsBody()
-    : renderChecklistBody(pillar);
-
-  activePillarHeaderEl.replaceChildren(header);
-  activePillarBodyEl.replaceChildren(body);
+function closePillarOverlay() {
+  if (state.activePillarId === null) return;
+  state.activePillarId = null;
+  renderRail();
+  renderRailOverlay();
 }
 
 /**
- * Single-line transcript ticker pinned to the bottom of the active pillar.
- * Shows the latest committed turn followed by any in-flight partial,
- * trimmed to TICKER_MAX_CHARS from the right so the newest text is
- * always visible. CSS handles the (rare) overflow with ellipsis.
+ * Render the slide-over panel content for the currently active pillar.
+ * The overlay's open/closed state is driven by `state.activePillarId`
+ * via the data-open attribute on the root element — CSS owns the
+ * transform and backdrop transitions.
  */
-function renderTicker() {
-  const lastCommitted = state.transcript.committed[state.transcript.committed.length - 1] || '';
-  const pending = state.transcript.pending || '';
-  const combined = (lastCommitted + ' ' + pending).trim();
+function renderRailOverlay() {
+  const pillarId = state.activePillarId;
+  const isOpen = pillarId !== null;
+  railOverlayEl.dataset.open = String(isOpen);
+  railOverlayEl.setAttribute('aria-hidden', String(!isOpen));
 
-  if (!combined) {
-    tickerEl.hidden = true;
-    tickerEl.textContent = '';
+  if (!isOpen) return;
+  const pillar = PILLARS_BY_ID[pillarId];
+  if (!pillar) return;
+
+  // ── header (title + counter + close button) ──────────────────────
+  const title = document.createElement('h2');
+  title.id = 'railOverlayTitle';
+  title.className = 'rail-overlay__title';
+  title.textContent = pillar.name;
+
+  const counter = document.createElement('span');
+  counter.className = 'rail-overlay__counter';
+  if (pillar.id === 'live_signals') {
+    counter.textContent = `${state.flags.length} fired`;
+  } else if (pillar.id === 'logged_questions') {
+    counter.textContent = `${loggedItems().length} pending`;
+  } else {
+    const items = ITEMS_BY_PILLAR[pillar.id] || [];
+    let covered = 0;
+    for (const it of items) {
+      if (itemStateFor(it.id) === 'covered') covered += 1;
+    }
+    counter.textContent = `${covered} of ${items.length}`;
+  }
+
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'rail-overlay__close';
+  close.setAttribute('aria-label', 'Close pillar');
+  close.title = 'Close (Esc)';
+  close.textContent = '×';
+  close.addEventListener('click', closePillarOverlay);
+
+  railOverlayHeaderEl.replaceChildren(title, counter, close);
+
+  // ── body (depends on which synthetic / real pillar we're showing) ─
+  let body;
+  if (pillar.id === 'live_signals') body = renderLiveSignalsBody();
+  else if (pillar.id === 'logged_questions') body = renderLoggedBody();
+  else body = renderChecklistBody(pillar);
+  railOverlayBodyEl.replaceChildren(body);
+}
+
+/**
+ * Render the always-visible transcript list in the middle column.
+ *
+ * Lines are speaker-labelled (You / Prospect) via the CSS ::before
+ * pseudo-element keyed off `data-speaker`. We pass the speaker as a
+ * data attribute rather than baking the prefix into the textContent
+ * so the colour and casing of the label stays in stylesheet control.
+ *
+ * In-flight partials (one per speaker channel) render at the bottom
+ * in a faint italic style. Auto-scrolls to keep the newest text in
+ * view unless the user has manually scrolled up.
+ */
+function renderTranscriptPane() {
+  const { committed, pendingBySpeaker } = state.transcript;
+  const pendingYou = pendingBySpeaker.you || '';
+  const pendingOther = pendingBySpeaker.other || '';
+
+  if (
+    committed.length === 0 &&
+    !pendingYou &&
+    !pendingOther &&
+    !state.errorMessage
+  ) {
+    const placeholder = document.createElement('p');
+    placeholder.className = 'transcript-pane__empty';
+    placeholder.textContent = 'Transcript will appear here once the call starts.';
+    transcriptListEl.replaceChildren(placeholder);
+    transcriptErrorEl.hidden = true;
     return;
   }
 
-  const trimmed = combined.length > TICKER_MAX_CHARS
-    ? '… ' + combined.slice(combined.length - TICKER_MAX_CHARS)
-    : combined;
+  const children = [];
+  for (const line of committed) {
+    const p = document.createElement('p');
+    p.className = 'transcript-pane__line';
+    p.dataset.speaker = line.speaker;
+    p.textContent = line.text;
+    children.push(p);
+  }
+  if (pendingYou) {
+    const p = document.createElement('p');
+    p.className = 'transcript-pane__line transcript-pane__line--pending';
+    p.dataset.speaker = 'you';
+    p.textContent = pendingYou;
+    children.push(p);
+  }
+  if (pendingOther) {
+    const p = document.createElement('p');
+    p.className = 'transcript-pane__line transcript-pane__line--pending';
+    p.dataset.speaker = 'other';
+    p.textContent = pendingOther;
+    children.push(p);
+  }
+  transcriptListEl.replaceChildren(...children);
 
-  tickerEl.textContent = trimmed;
-  tickerEl.hidden = false;
+  // Auto-scroll to bottom unless the user has scrolled up (within 40px
+  // of the bottom counts as "tracking the live edge").
+  const nearBottom =
+    transcriptListEl.scrollHeight -
+      transcriptListEl.scrollTop -
+      transcriptListEl.clientHeight <
+    40;
+  if (nearBottom) {
+    transcriptListEl.scrollTop = transcriptListEl.scrollHeight;
+  }
+
+  if (state.errorMessage) {
+    transcriptErrorEl.textContent = state.errorMessage;
+    transcriptErrorEl.hidden = false;
+  } else {
+    transcriptErrorEl.hidden = true;
+  }
 }
 
 /**
  * Render the suggestion at `state.coachIndex` (or hide the card if there
- * isn't one yet). Includes a bottom-row nav affordance so the seller knows
- * what ←/→ do without us writing it on the screen any louder.
+ * isn't one yet). v2.5 redesign:
+ *   - Includes an inline Skip pill on the card (rep can dismiss the
+ *     suggestion + ask for a new 'next'-kind one in one click).
+ *   - Renders the model's `anchorQuote` under the question as
+ *     "responding to: …" so the rep can see what the suggestion is
+ *     reacting to.
+ *   - Handles the 'freeform.deeper' sentinel id (Deeper-kind asks may
+ *     not map to a rubric item — we render the question + anchor
+ *     without a pillar badge).
+ *   - Tags the kind ("Suggest" / "Deeper" / "Pivot" / "Pause nudge") in
+ *     place of the static "Ask next" label so the rep can see why the
+ *     card appeared.
  *
- * History semantics: `coachHistory[coachHistory.length - 1]` is the latest
- * "live" suggestion; lower indices are older ones we've stored. Pressing
- * ← walks back, → walks forward. At the live end, → escalates into a
- * `coach:skip` IPC so the coach picks a fresh item.
+ * History semantics still work: ←/→ walk through previous suggestions;
+ * → at the live edge issues a 'next' ask via skipCoachSuggestion.
  */
 function renderCoachSuggestion() {
   const history = state.coachHistory;
@@ -284,21 +1084,83 @@ function renderCoachSuggestion() {
   }
 
   const sug = history[idx];
-  const item = sug.itemId ? ITEMS_BY_ID[sug.itemId] : null;
+  const isFreeform = sug.itemId ? SUGGESTION_SENTINEL_SET.has(sug.itemId) : false;
+  const item = sug.itemId && !isFreeform ? ITEMS_BY_ID[sug.itemId] : null;
   const pillar = item ? PILLARS_BY_ID[item.pillarId] : null;
 
+  // ── Asked state ────────────────────────────────────────────────────
+  // Mirror the drawer's logged-entry--asked styling on the pinned card
+  // so the rep gets immediate "the coach saw you ask this" feedback
+  // without having to open the Logged drawer.
+  //
+  // The lookup is keyed by suggestionId (threaded through from main on
+  // the coach:suggestion IPC, see onCoachSuggestion above) — one source
+  // of truth instead of fuzzy text matching.
+  //
+  // Gated on settings.coach.trackQuestionState so the feature is
+  // wholly opt-in: when the toggle is off, mark_question_asked never
+  // fires, the entry's `asked` flag stays false, and the pinned card
+  // styling stays neutral.
+  const historyEntry = sug.suggestionId
+    ? state.suggestionHistory.find((e) => e.id === sug.suggestionId)
+    : null;
+  const isAsked = Boolean(
+    state.coach.trackQuestionState && historyEntry && historyEntry.asked,
+  );
+
   // --- label row -----------------------------------------------------
+  // Kind chip on the left ("Suggest" / "Deeper" / "Pivot" / "Pause"),
+  // pillar tag in the middle (or nothing for freeform suggestions),
+  // Skip pill on the right.
   const label = document.createElement('div');
   label.className = 'suggestion__label';
   const labelKind = document.createElement('span');
-  labelKind.textContent = 'Ask next';
+  labelKind.className = 'suggestion__kind';
+  labelKind.textContent = labelForKind(sug.kind);
   label.appendChild(labelKind);
   if (pillar) {
     const pillarLabel = document.createElement('span');
     pillarLabel.className = 'suggestion__pillar';
     pillarLabel.textContent = `· ${pillar.short}`;
     label.appendChild(pillarLabel);
+  } else if (isFreeform) {
+    // Freeform sentinels carry no pillar association. The kind chip
+    // already labels the card ("DEEPER" / "RECAP"), so adding a
+    // secondary subtitle would be redundant for Recap — only Deeper
+    // gets the "Follow-up" hint because the kind name alone is too
+    // generic to convey "this is a reply to what they just said".
+    if (sug.kind === 'deeper') {
+      const pillarLabel = document.createElement('span');
+      pillarLabel.className = 'suggestion__pillar';
+      pillarLabel.textContent = '· Follow-up';
+      label.appendChild(pillarLabel);
+    }
   }
+
+  // Inline Skip pill on the active suggestion card. Clicking it
+  // dismisses the suggestion AND triggers a fresh ask:
+  //   - When a cover-queue is active, advance to the next item in
+  //     the queue (a targeted ask) instead of firing a generic
+  //     'next' ask. That keeps the queue cycling without the seller
+  //     having to re-click Cover-remaining.
+  //   - Otherwise fan out to coach:skip → Coach.skip() →
+  //     requestSuggestion({ kind: 'next' }), the legacy behaviour.
+  const skipBtn = document.createElement('button');
+  skipBtn.type = 'button';
+  skipBtn.className = 'suggestion__skip';
+  skipBtn.title = state.coverQueue
+    ? 'Skip and move to the next item in the queue'
+    : 'Skip and get another suggestion';
+  skipBtn.setAttribute('aria-label', 'Skip suggestion');
+  skipBtn.textContent = 'Skip';
+  skipBtn.addEventListener('click', () => {
+    if (state.coverQueue) {
+      advanceCoverQueue();
+    } else {
+      window.gemini.skipCoachSuggestion?.();
+    }
+  });
+  label.appendChild(skipBtn);
 
   // --- question + rationale -----------------------------------------
   const question = document.createElement('p');
@@ -306,6 +1168,17 @@ function renderCoachSuggestion() {
   question.textContent = sug.question;
 
   const children = [label, question];
+
+  // Anchor quote — required-ish per the v2.5 prompt (the coach drops
+  // suggestions without one). Surfaces what the suggestion is
+  // reacting to. Plain text, muted italic, no chrome.
+  if (sug.anchorQuote) {
+    const anchor = document.createElement('p');
+    anchor.className = 'suggestion__anchor';
+    anchor.textContent = `responding to: “${sug.anchorQuote}”`;
+    children.push(anchor);
+  }
+
   if (sug.rationale) {
     const rationale = document.createElement('span');
     rationale.className = 'suggestion__rationale';
@@ -331,6 +1204,19 @@ function renderCoachSuggestion() {
     : `${idx + 1} of ${history.length}`;
   nav.appendChild(position);
 
+  // Coverage-queue progress hint — only present when a cover queue is
+  // active. Sits next to the existing position indicator so the seller
+  // can see at a glance how far through the cycle they are. The badge
+  // disappears the moment the queue is cleared (completion / cancel).
+  if (state.coverQueue) {
+    const queue = document.createElement('span');
+    queue.className = 'suggestion__queue-progress';
+    const human = state.coverQueue.index + 1;
+    const total = state.coverQueue.items.length;
+    queue.textContent = `Coverage queue · ${human} of ${total}`;
+    nav.appendChild(queue);
+  }
+
   const right = document.createElement('span');
   right.className = 'suggestion__nav-side';
   // Right is always available — at the live edge it means "skip / get
@@ -342,7 +1228,41 @@ function renderCoachSuggestion() {
   children.push(nav);
 
   coachSuggestionEl.replaceChildren(...children);
+  // Asked-state styling (CSS keys off the data attribute — see the
+  // .suggestion[data-asked='true'] rule in src/index.css mirroring
+  // .logged-entry--asked). Toggling rather than setting unconditionally
+  // so old DOM doesn't keep a stale data-asked='true' when a fresh
+  // un-asked suggestion takes the pin.
+  if (isAsked) coachSuggestionEl.dataset.asked = 'true';
+  else delete coachSuggestionEl.dataset.asked;
   coachSuggestionEl.hidden = false;
+}
+
+/** Human-readable kind label shown in the suggestion card's top-left.
+ *  Falls through to 'Suggest' for unknown / legacy entries so older
+ *  history items still render sensibly. The CSS upper-cases this in
+ *  the card chrome, so e.g. "Recap" surfaces as RECAP. */
+function labelForKind(kind) {
+  switch (kind) {
+    case 'deeper': return 'Deeper';
+    case 'pivot':  return 'Pivot';
+    case 'pause':  return 'Pause nudge';
+    case 'recap':  return 'Recap';
+    case 'next':
+    default:       return 'Suggest';
+  }
+}
+
+/**
+ * Show / hide the pulsing "thinking" dot next to the suggestion area.
+ * Bound to coach:tick-start / coach:tick-end IPC events. The dot is the
+ * only visible signal that the coach is between roundtrips — without it
+ * a 1.5s pause feels like the app is unresponsive.
+ */
+function renderCoachThinking() {
+  if (!coachThinkingDotEl) return;
+  coachThinkingDotEl.hidden = !state.coachThinking;
+  coachThinkingDotEl.dataset.active = String(state.coachThinking);
 }
 
 /** Push a new live suggestion into history, optionally moving the
@@ -366,7 +1286,7 @@ function renderChecklistBody(pillar) {
   const items = ITEMS_BY_PILLAR[pillar.id] || [];
   if (items.length === 0) {
     const p = document.createElement('p');
-    p.className = 'active-pillar__empty';
+    p.className = 'rail-overlay__empty';
     p.textContent = 'No checklist items for this pillar.';
     return p;
   }
@@ -374,39 +1294,450 @@ function renderChecklistBody(pillar) {
   const ul = document.createElement('ul');
   ul.className = 'checklist';
 
-  const coveredMap = state.coveredItems[pillar.id] || new Map();
-
   for (const it of items) {
-    const li = document.createElement('li');
-    li.className = 'item';
-    const covered = coveredMap.has(it.id);
-    li.dataset.covered = String(covered);
-    if (covered) {
-      const ev = coveredMap.get(it.id)?.evidence;
-      if (ev) li.title = ev;
-    }
+    ul.appendChild(makeChecklistItem(it));
+  }
 
-    const tick = document.createElement('span');
-    tick.className = 'item__tick';
-    tick.setAttribute('aria-hidden', 'true');
-    tick.textContent = '✓';
-    li.appendChild(tick);
+  // "Cover remaining" — fires a queue of targeted asks for every
+  // uncovered item in this pillar, cycling through them one at a
+  // time. Only surfaces when there are 2+ uncovered items (1 item
+  // is just a per-item Ask click). The button sits at the bottom of
+  // the drawer beneath the checklist; the queue itself lives on
+  // state.coverQueue.
+  const uncovered = uncoveredItemsForPillar(pillar.id);
+  if (uncovered.length >= 2) {
+    const wrap = document.createElement('div');
+    wrap.className = 'rail-overlay__footer';
 
-    const label = document.createElement('span');
-    label.className = 'item__label';
-    label.textContent = it.label;
-    li.appendChild(label);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cover-remaining-btn';
+    btn.dataset.pillarId = pillar.id;
+    btn.title = `Queue questions for all ${uncovered.length} uncovered items in this pillar`;
+    btn.textContent = `▶ Cover remaining (${uncovered.length})`;
+    btn.addEventListener('click', () => startCoverQueue(pillar.id));
+    wrap.appendChild(btn);
 
-    ul.appendChild(li);
+    // Return a fragment so the caller's replaceChildren() works
+    // without an extra wrapping div in the DOM.
+    const frag = document.createDocumentFragment();
+    frag.appendChild(ul);
+    frag.appendChild(wrap);
+    return frag;
   }
 
   return ul;
 }
 
+/**
+ * Render a single checklist row in the 4-state visual language:
+ *   pending     ○ (empty circle, dim text)
+ *   in_progress ◐ + CSS spinner overlay (pulsing)
+ *   covered     ✓ (filled tick, line-through label)
+ *   logged      ↺ (cycle arrow, amber tint)
+ *
+ * Evidence quote — if available — surfaces both as the native title
+ * tooltip and as an inline reveal underneath the label on hover (the
+ * CSS uses `:hover .item__evidence { display: block; }`).
+ */
+function makeChecklistItem(it) {
+  const entry = state.itemStates.get(it.id);
+  const itemState = entry?.state || 'pending';
+
+  const li = document.createElement('li');
+  li.className = 'item';
+  li.dataset.state = itemState;
+  // Preserve the legacy `data-covered` selector for any CSS rule that
+  // still keys off it during the layout transition. Trivially derived
+  // from state — kill once the layout settles.
+  li.dataset.covered = String(itemState === 'covered');
+  if (entry?.evidence) li.title = entry.evidence;
+
+  const glyph = document.createElement('span');
+  glyph.className = 'item__tick';
+  glyph.setAttribute('aria-hidden', 'true');
+  glyph.textContent = ITEM_GLYPHS[itemState] || ITEM_GLYPHS.pending;
+  li.appendChild(glyph);
+
+  const labelWrap = document.createElement('span');
+  labelWrap.className = 'item__label';
+
+  const label = document.createElement('span');
+  label.className = 'item__label-text';
+  label.textContent = it.label;
+  labelWrap.appendChild(label);
+
+  if (entry?.evidence) {
+    const ev = document.createElement('span');
+    ev.className = 'item__evidence';
+    ev.textContent = `“${entry.evidence}”`;
+    labelWrap.appendChild(ev);
+  }
+  li.appendChild(labelWrap);
+
+  // Per-item targeted-ask button. Only surface on items the seller
+  // could plausibly still want a question for — pending OR
+  // in_progress. Once an item is covered (asked + answered + moved
+  // on) or logged (touched-but-dropped, surfaced by the Logged
+  // pillar), the rail's ask button stops being useful: covered
+  // items don't need re-asking, and the Logged pillar already
+  // offers a boost interaction for circling back.
+  if (itemState === 'pending' || itemState === 'in_progress') {
+    const askBtn = document.createElement('button');
+    askBtn.type = 'button';
+    askBtn.className = 'rail__ask-btn';
+    askBtn.dataset.itemId = it.id;
+    askBtn.title = `Generate a question for: ${it.label}`;
+    askBtn.setAttribute('aria-label', `Ask coach for: ${it.label}`);
+    askBtn.textContent = '+ Ask';
+    askBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      requestCoachAskItem(it.id);
+      // Cheap loading hint — the suggestion arrives async on the
+      // next coach tick, which can take up to ~1.5s. The 2s timer
+      // is a fallback in case the model returns nothing for this
+      // item (rare, but possible). The button isn't disabled
+      // because the seller might want to re-fire if the first
+      // suggestion didn't land cleanly.
+      askBtn.dataset.loading = 'true';
+      setTimeout(() => { askBtn.dataset.loading = 'false'; }, 2000);
+    });
+    li.appendChild(askBtn);
+  }
+
+  return li;
+}
+
+/**
+ * Synthetic pillar body for the Logged pillar.
+ *
+ * Two sources are interleaved:
+ *
+ *   1. Logged rubric items — anything in `logged` state across the
+ *      whole rubric. Rendered as clickable boost buttons (existing
+ *      behaviour).
+ *   2. Suggestion history — every question the coach has pinned
+ *      this call (Advanced → Track question state). Rendered as a
+ *      read-only entry; when `trackQuestionState` is on, the entry
+ *      gets a green outline + tint if the AI marked it as asked,
+ *      and a muted "Reformulated" badge if a newer wording took the
+ *      pin. When the toggle is off, the entries still render but
+ *      without the colour gating.
+ *
+ * The suggestion-history block sits below the logged rubric items so
+ * the rubric-driven "circle back" affordances stay the primary
+ * surface — the history is supplementary context.
+ */
+function renderLoggedBody() {
+  const items = loggedItems();
+  const history = state.suggestionHistory;
+
+  if (items.length === 0 && history.length === 0) {
+    const p = document.createElement('p');
+    p.className = 'rail-overlay__empty';
+    p.textContent =
+      'No logged questions yet. Items that were touched but not closed out will appear here so you can circle back.';
+    return p;
+  }
+
+  const frag = document.createDocumentFragment();
+
+  if (items.length > 0) {
+    const ul = document.createElement('ul');
+    ul.className = 'checklist';
+    for (const { itemId, entry } of items) {
+      const li = renderLoggedRubricItem(itemId, entry);
+      if (li) ul.appendChild(li);
+    }
+    frag.appendChild(ul);
+  }
+
+  if (history.length > 0) {
+    frag.appendChild(renderSuggestionHistoryBlock(history));
+  }
+
+  return frag;
+}
+
+/** Build one logged-rubric-item row. Factored out so the renderer
+ *  doesn't grow when the drawer body gains additional sources. */
+function renderLoggedRubricItem(itemId, entry) {
+  const meta = ITEMS_BY_ID[itemId];
+  if (!meta) return null;
+
+  const li = document.createElement('li');
+  li.className = 'item item--logged';
+  li.dataset.state = 'logged';
+  if (entry?.evidence) li.title = entry.evidence;
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'item__boost';
+  button.title = 'Resurface this as the next suggestion';
+  button.setAttribute('aria-label', `Boost: ${meta.label}`);
+  button.addEventListener('click', () => requestCoachBoost(itemId));
+
+  const glyph = document.createElement('span');
+  glyph.className = 'item__tick';
+  glyph.setAttribute('aria-hidden', 'true');
+  glyph.textContent = ITEM_GLYPHS.logged;
+  button.appendChild(glyph);
+
+  const labelWrap = document.createElement('span');
+  labelWrap.className = 'item__label';
+
+  const pillar = PILLARS_BY_ID[meta.pillarId];
+  const pillarTag = document.createElement('span');
+  pillarTag.className = 'item__pillar-tag';
+  pillarTag.textContent = pillar?.short || meta.pillarId;
+  labelWrap.appendChild(pillarTag);
+
+  const label = document.createElement('span');
+  label.className = 'item__label-text';
+  label.textContent = meta.label;
+  labelWrap.appendChild(label);
+
+  if (entry?.evidence) {
+    const ev = document.createElement('span');
+    ev.className = 'item__evidence';
+    ev.textContent = `“${entry.evidence}”`;
+    labelWrap.appendChild(ev);
+  }
+
+  button.appendChild(labelWrap);
+  li.appendChild(button);
+  return li;
+}
+
+/**
+ * Build the suggestion-history block. Each entry renders the
+ * question text plus a pillar tag (if the item id maps to a rubric
+ * row), plus the asked / replaced badges keyed off
+ * `state.coach.trackQuestionState`.
+ *
+ * When the toggle is OFF: entries render neutrally (no green
+ * outline). The block heading reads "Suggested questions" and we
+ * skip the badge column — the seller still gets a log of what the
+ * coach pinned, but no AI-asked validation overlay.
+ *
+ * When the toggle is ON: asked entries get .logged-entry--asked
+ * (green outline + tint), replaced entries get .logged-entry--replaced
+ * (muted opacity) plus a "Reformulated" badge.
+ */
+function renderSuggestionHistoryBlock(history) {
+  const wrap = document.createElement('section');
+  wrap.className = 'logged-entries';
+
+  const heading = document.createElement('h3');
+  heading.className = 'rail-overlay__subheading';
+  heading.textContent = state.coach.trackQuestionState
+    ? 'Suggested questions'
+    : 'Suggested questions (this call)';
+  wrap.appendChild(heading);
+
+  // Oldest first reads more naturally as a call log; the array is
+  // already in arrival order so we just iterate forwards.
+  for (const entry of history) {
+    wrap.appendChild(renderSuggestionHistoryEntry(entry));
+  }
+  return wrap;
+}
+
+function renderSuggestionHistoryEntry(entry) {
+  const div = document.createElement('div');
+  div.className = 'logged-entry';
+  // Asked / replaced styling is gated on the trackQuestionState
+  // toggle so flipping it off rolls the drawer back to neutral
+  // visuals without re-rendering everything from scratch.
+  if (state.coach.trackQuestionState) {
+    if (entry.asked) div.classList.add('logged-entry--asked');
+    else if (entry.replaced) div.classList.add('logged-entry--replaced');
+  }
+  if (entry.evidence) div.title = entry.evidence;
+
+  const meta = entry.itemId && !SUGGESTION_SENTINEL_SET.has(entry.itemId)
+    ? ITEMS_BY_ID[entry.itemId]
+    : null;
+  const pillar = meta ? PILLARS_BY_ID[meta.pillarId] : null;
+
+  if (pillar) {
+    const tag = document.createElement('span');
+    tag.className = 'logged-entry__pillar-tag';
+    tag.textContent = pillar.short || pillar.id;
+    div.appendChild(tag);
+  }
+
+  const q = document.createElement('span');
+  q.className = 'logged-entry__question';
+  q.textContent = entry.questionText || '(no question text)';
+  div.appendChild(q);
+
+  // Asked / replaced annotations only when the toggle is on — without
+  // the AI validation signal the badges would be misleading.
+  if (state.coach.trackQuestionState && (entry.asked || entry.replaced)) {
+    const metaRow = document.createElement('span');
+    metaRow.className = 'logged-entry__meta';
+    const badge = document.createElement('span');
+    badge.className = 'logged-entry__badge';
+    if (entry.asked) {
+      badge.textContent = 'Asked';
+      metaRow.appendChild(badge);
+      if (entry.evidence) {
+        const ev = document.createElement('span');
+        ev.className = 'logged-entry__evidence';
+        ev.textContent = `“${entry.evidence}”`;
+        metaRow.appendChild(ev);
+      }
+    } else if (entry.replaced) {
+      badge.textContent = 'Reformulated';
+      metaRow.appendChild(badge);
+    }
+    div.appendChild(metaRow);
+  }
+
+  return div;
+}
+
+/**
+ * Renderer → main: ask the coach to prioritise an item in the next
+ * suggestion. Wired up from clicking a logged item. Fire-and-forget;
+ * the response arrives async via `coach:suggestion`.
+ */
+function requestCoachBoost(itemId) {
+  console.log('[coach] boost requested:', itemId);
+  window.gemini.boostCoachItem?.(itemId);
+}
+
+/**
+ * Renderer → main: ask the coach to generate a question for a SPECIFIC
+ * rubric item id. Fires from the per-item `+ Ask` button in the pillar
+ * drawer and from the "Cover remaining" queue as it cycles through
+ * items. Fire-and-forget; the response arrives async via
+ * `coach:suggestion` and lands on the suggestion card the usual way.
+ */
+function requestCoachAskItem(itemId) {
+  console.log('[coach] ask-item requested:', itemId);
+  window.gemini.askItem?.(itemId);
+}
+
+/* ── "Cover remaining" coverage queue ───────────────────────────────
+ *
+ * When the seller hits the Cover-remaining button at the bottom of a
+ * pillar's drawer, we snapshot every uncovered item in that pillar
+ * (pending OR in_progress) and cycle through them one at a time. Each
+ * advance fires a targeted ask via askItem; the seller can dismiss the
+ * resulting suggestion (Skip) to advance to the next, or cancel by
+ * reaching for any other ask button (Suggest / Deeper / Pivot / Recap).
+ *
+ * The queue lives on state.coverQueue (see the state shape doc above).
+ * UI signal: a small "Coverage queue · N of M" badge in the suggestion
+ * card's nav row, plus a transient banner on completion.
+ */
+
+/** Items in `pillar` that are NOT yet covered or logged. The queue
+ *  picks from pending + in_progress only — covered/logged items have
+ *  already been touched, so the seller doesn't need a fresh question
+ *  for them. */
+function uncoveredItemsForPillar(pillarId) {
+  const items = ITEMS_BY_PILLAR[pillarId] || [];
+  return items.filter((it) => {
+    const s = itemStateFor(it.id);
+    return s === 'pending' || s === 'in_progress';
+  });
+}
+
+/**
+ * Start (or restart) the cover queue for the given pillar. Snapshots
+ * the pillar's uncovered items, stashes them on state.coverQueue, and
+ * fires the targeted ask for the first item. No-op if the pillar has
+ * zero uncovered items.
+ */
+function startCoverQueue(pillarId) {
+  const items = uncoveredItemsForPillar(pillarId);
+  if (items.length === 0) return;
+  state.coverQueue = { pillarId, items, index: 0 };
+  console.log('[coach] cover-queue start:', pillarId, '— items:', items.length);
+  requestCoachAskItem(items[0].id);
+  renderCoachSuggestion();
+}
+
+/**
+ * Advance the cover queue by one. If we walk off the end, clear the
+ * queue and surface a transient "pillar coverage complete" banner so
+ * the seller knows the cycle finished. Called from the Skip handler
+ * on the suggestion card AND from the right-arrow keyboard shortcut
+ * when at the live edge.
+ */
+function advanceCoverQueue() {
+  const q = state.coverQueue;
+  if (!q) return;
+  const nextIndex = q.index + 1;
+  if (nextIndex >= q.items.length) {
+    clearCoverQueue({ showCompletion: true });
+    return;
+  }
+  q.index = nextIndex;
+  console.log('[coach] cover-queue advance:', nextIndex + 1, '/', q.items.length);
+  requestCoachAskItem(q.items[nextIndex].id);
+  renderCoachSuggestion();
+}
+
+/**
+ * Drop the active queue. Called from (a) advanceCoverQueue when the
+ * cycle finishes, (b) any of the other ask buttons (the seller has
+ * effectively cancelled by reaching for a different ask), and (c)
+ * clearScoringState when the session ends.
+ *
+ * `showCompletion` shows the transient "pillar coverage complete"
+ * banner — set true ONLY when the queue ran to completion naturally.
+ * Cancelling early should silently drop the queue.
+ */
+function clearCoverQueue({ showCompletion = false } = {}) {
+  const wasActive = !!state.coverQueue;
+  state.coverQueue = null;
+  if (wasActive) renderCoachSuggestion();
+  if (wasActive && showCompletion) showCoverQueueCompleteBanner();
+}
+
+/* Transient "pillar coverage complete" banner. Mirrors the visual
+ * register of .dedup-hint but in green to read as a success signal
+ * (rather than amber which the dedup-hint uses for a warning). Built
+ * lazily via JS so we don't have to touch index.html — the banner
+ * only exists in the DOM while it's visible. */
+let _coverQueueBannerTimer = null;
+function showCoverQueueCompleteBanner() {
+  // Tear down any previous instance so a back-to-back completion
+  // doesn't double-stack banners.
+  hideCoverQueueCompleteBanner();
+  const banner = document.createElement('div');
+  banner.id = 'coverQueueCompleteBanner';
+  banner.className = 'cover-queue-complete';
+  banner.setAttribute('role', 'status');
+  const msg = document.createElement('span');
+  msg.textContent = 'Pillar coverage complete';
+  banner.appendChild(msg);
+  const dismiss = document.createElement('button');
+  dismiss.type = 'button';
+  dismiss.className = 'cover-queue-complete__dismiss';
+  dismiss.setAttribute('aria-label', 'Dismiss');
+  dismiss.textContent = '×';
+  dismiss.addEventListener('click', hideCoverQueueCompleteBanner);
+  banner.appendChild(dismiss);
+  document.body.appendChild(banner);
+  clearTimeout(_coverQueueBannerTimer);
+  _coverQueueBannerTimer = setTimeout(hideCoverQueueCompleteBanner, 3500);
+}
+
+function hideCoverQueueCompleteBanner() {
+  clearTimeout(_coverQueueBannerTimer);
+  const el = document.getElementById('coverQueueCompleteBanner');
+  if (el && el.parentNode) el.parentNode.removeChild(el);
+}
+
 function renderLiveSignalsBody() {
   if (state.flags.length === 0) {
     const p = document.createElement('p');
-    p.className = 'active-pillar__empty';
+    p.className = 'rail-overlay__empty';
     p.textContent = 'No flags yet. Keep going — the coach is listening.';
     return p;
   }
@@ -453,6 +1784,348 @@ function renderLiveSignalsBody() {
   return wrap;
 }
 
+/* ── Captured-pane bullet splitting + recap tooltip ─────────────────── */
+
+/**
+ * Decide whether a field value should be split into bullet items and,
+ * if so, return the raw split array. Returns null to keep as single line.
+ *
+ * Trigger: length > 60, OR contains ';', OR comma-space split ≥ 3 items.
+ * Split priority:
+ *   1. Semicolons — strong sentence boundaries (any count ≥ 2).
+ *   2. ", " — only when split produces ≥ 3 items.
+ *   3. null  — can't split meaningfully; stay as single line.
+ */
+function splitIntoBullets(text) {
+  const shouldBullet =
+    text.length > 60 ||
+    text.includes(';') ||
+    text.split(', ').length > 2;
+  if (!shouldBullet) return null;
+  if (text.includes(';')) {
+    const parts = text.split(';').map((s) => s.trim()).filter(Boolean);
+    if (parts.length >= 2) return parts;
+  }
+  const commaParts = text.split(', ').map((s) => s.trim()).filter(Boolean);
+  if (commaParts.length >= 3) return commaParts;
+  return null;
+}
+
+/** Strip trailing punctuation and capitalise the first letter. */
+function cleanBulletItem(raw) {
+  const s = raw.replace(/[;,]+$/, '').trim();
+  if (!s.length) return '';
+  return s[0].toUpperCase() + s.slice(1);
+}
+
+/* ── Quick-fix rollup (Strategy A / Work-stream C) ────────────────
+ *
+ * Replaces the v1 regex-based "Total potential revenue" block at the
+ * top of #capturedPane. Money capture now flows through the
+ * `record_meeting_fact` tool (src/coach.js) → structured factsSheet
+ * in main → Stage-2 background AI (src/quick-fix.js) → this
+ * renderer.
+ *
+ * Lifecycle
+ *   - Main fires `scoring:quick-fix` with { quickFix, entries }
+ *     on every Stage-2 roundtrip (success OR fallback-with-stale).
+ *   - The subscriber mirrors the payload onto state.quickFix /
+ *     state.quickFixEntries and calls renderQuickFix.
+ *   - renderQuickFix populates the static #quickFix section in
+ *     index.html (no DOM creation outside the existing nodes).
+ *
+ * Drill-through
+ *   - Each breakdown row carries its source fact id. Clicking a row
+ *     looks up the fact in state.quickFixEntries, then finds the
+ *     transcript line whose text contains the anchor quote, scrolls
+ *     to it, and adds .transcript-pane__line--highlight for ~2s.
+ *   - Rows with source === 'derived' aren't clickable; the
+ *     data-clickable='false' attribute suppresses the hover affordance.
+ */
+
+/** Pretty-print a positive dollar amount in compact ($4M / $20K / $750) form.
+ *  Kept as a stand-alone helper so the quick-fix card can format
+ *  both the headline and per-row amounts identically without
+ *  pulling in a number-formatting library. Mirrors the v1 formatMoney
+ *  exactly so reps moving from the old rollup don't have to relearn
+ *  the abbreviations. */
+function formatMoney(amount) {
+  if (!Number.isFinite(amount) || amount === 0) return '$0';
+  const abs = Math.abs(amount);
+  const sign = amount < 0 ? '-' : '';
+  if (abs >= 1_000_000) {
+    return `${sign}$${(abs / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  }
+  if (abs >= 1_000) return `${sign}$${(abs / 1_000).toFixed(0)}K`;
+  return `${sign}$${abs.toLocaleString()}`;
+}
+
+/**
+ * Populate the static #quickFix card from state.quickFix +
+ * state.quickFixEntries. Idempotent — safe to call on every
+ * scoring:quick-fix IPC even when the rollup hasn't materially
+ * changed (the DOM diff is cheap because the card has a fixed
+ * structure).
+ *
+ * Visibility rules:
+ *   - state.quickFix === null   → hide entirely (no money facts yet)
+ *   - quickFix.error === true   → show "Rollup unavailable" status
+ *   - quickFix.stale === true   → show "Rollup paused, retrying…"
+ *   - otherwise                 → show the rollup, status hidden
+ *
+ * The card stays hidden until the FIRST roundtrip completes —
+ * surfacing an empty card during the initial debounce would just be
+ * noise (the rep can see the existing field grid below).
+ */
+function renderQuickFix() {
+  if (!quickFixEl) return;
+  const rollup = state.quickFix;
+  if (!rollup) {
+    quickFixEl.hidden = true;
+    return;
+  }
+  quickFixEl.hidden = false;
+
+  // Headline + confidence pill
+  const headlineEl = quickFixEl.querySelector('.quick-fix__headline');
+  const confidenceEl = quickFixEl.querySelector('.quick-fix__confidence');
+  if (headlineEl instanceof HTMLElement) {
+    headlineEl.textContent = formatMoney(rollup.headlineUsdAnnual)
+      + (rollup.currency && rollup.currency !== 'USD' ? ` ${rollup.currency}` : '')
+      + ' / year';
+  }
+  if (confidenceEl instanceof HTMLElement) {
+    confidenceEl.textContent = rollup.confidence || 'medium';
+    confidenceEl.dataset.level = rollup.confidence || 'medium';
+  }
+
+  // Breakdown rows. Each row is clickable when source maps to a real
+  // fact id — clicking drills to the anchor quote in the transcript
+  // pane (see drillToQuickFixSource below). 'derived' rows aren't
+  // clickable because there's no single anchor to scroll to.
+  const breakdownEl = quickFixEl.querySelector('.quick-fix__breakdown');
+  if (breakdownEl instanceof HTMLElement) {
+    breakdownEl.replaceChildren();
+    for (const row of rollup.breakdown || []) {
+      const li = document.createElement('li');
+      li.className = 'quick-fix__row';
+      const isDerived = row.source === 'derived';
+      li.dataset.clickable = String(!isDerived);
+      if (!isDerived) {
+        li.dataset.factId = row.source;
+        li.title = 'Click to find this in the transcript';
+        li.addEventListener('click', () => drillToQuickFixSource(row.source));
+      }
+      const label = document.createElement('span');
+      label.className = 'quick-fix__row-label';
+      label.textContent = row.label;
+      const amount = document.createElement('span');
+      amount.className = 'quick-fix__row-amount';
+      amount.textContent = formatMoney(row.amountUsdAnnual);
+      li.appendChild(label);
+      li.appendChild(amount);
+      if (row.notes) {
+        const notes = document.createElement('span');
+        notes.className = 'quick-fix__row-notes';
+        notes.textContent = row.notes;
+        li.appendChild(notes);
+      }
+      breakdownEl.appendChild(li);
+    }
+  }
+
+  // Assumptions list. Hidden when empty so the card stays tight on
+  // call-start (no facts → no assumptions → no empty section).
+  const assumptionsEl = quickFixEl.querySelector('.quick-fix__assumptions');
+  if (assumptionsEl instanceof HTMLElement) {
+    assumptionsEl.replaceChildren();
+    for (const text of rollup.assumptions || []) {
+      if (typeof text !== 'string' || !text.trim()) continue;
+      const li = document.createElement('li');
+      li.className = 'quick-fix__assumption';
+      li.textContent = text;
+      assumptionsEl.appendChild(li);
+    }
+    assumptionsEl.hidden = !assumptionsEl.children.length;
+  }
+
+  // Status pill — visible when the worker is in a degraded state.
+  // Two visual variants keyed off data-status:
+  //   'error' → red "Rollup unavailable" (3+ consecutive failures)
+  //   'stale' → amber "Rollup paused, retrying…" (single failure)
+  const statusEl = quickFixEl.querySelector('.quick-fix__status');
+  if (statusEl instanceof HTMLElement) {
+    if (rollup.error) {
+      statusEl.hidden = false;
+      statusEl.dataset.status = 'error';
+      statusEl.textContent = 'Rollup unavailable. Showing last value.';
+    } else if (rollup.stale) {
+      statusEl.hidden = false;
+      statusEl.dataset.status = 'stale';
+      statusEl.textContent = 'Rollup paused, retrying…';
+    } else {
+      statusEl.hidden = true;
+      statusEl.textContent = '';
+      delete statusEl.dataset.status;
+    }
+  }
+}
+
+/**
+ * Drill from a quick-fix breakdown row back to the moment in the
+ * transcript pane where the source fact was stated. Lookup is:
+ *
+ *   1. Find the fact in state.quickFixEntries by id.
+ *   2. Substring-match the fact's quote against each committed line.
+ *      First match wins (so the earliest mention wins when the
+ *      prospect repeats themselves).
+ *   3. Scroll the transcript pane to that line and add the
+ *      .transcript-pane__line--highlight class for ~2s so the rep
+ *      can see WHY the number is in the total.
+ *
+ * Failure modes (all silent in the UI):
+ *   - Unknown id → no-op (most likely a row that was rendered
+ *     before the corresponding entries mirror updated).
+ *   - No matching transcript line → no-op (the quote may have been
+ *     paraphrased by the model; we don't try fuzzy matching here).
+ */
+function drillToQuickFixSource(factId) {
+  if (!factId || typeof factId !== 'string') return;
+  const entry = (state.quickFixEntries || []).find((e) => e && e.id === factId);
+  if (!entry || !entry.quote || typeof entry.quote !== 'string') return;
+  const needle = entry.quote.trim();
+  if (!needle) return;
+  const lines = state.transcript.committed || [];
+  let matchIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i]?.text || '';
+    if (text.includes(needle)) { matchIdx = i; break; }
+  }
+  if (matchIdx < 0) return;
+  // Find the corresponding DOM node — the transcript list renders
+  // one <p.transcript-pane__line> per committed line in arrival
+  // order, so the same index applies. We grab from the live DOM (not
+  // a cached reference) because renderTranscriptPane may have
+  // rebuilt the list since the rollup was rendered.
+  if (!transcriptListEl) return;
+  const lineEls = transcriptListEl.querySelectorAll('.transcript-pane__line:not(.transcript-pane__line--pending)');
+  const target = lineEls[matchIdx];
+  if (!(target instanceof HTMLElement)) return;
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  target.classList.add('transcript-pane__line--highlight');
+  setTimeout(() => {
+    target.classList.remove('transcript-pane__line--highlight');
+  }, 2000);
+}
+
+/**
+ * Truncate text to ≤ 60 words, preferring to break at the last clause
+ * boundary (comma, semicolon, or em-dash) within the first 60 words.
+ */
+function truncateValueTo60Words(text) {
+  const words = text.split(/\s+/);
+  if (words.length <= 60) return text;
+  const shortened = words.slice(0, 60).join(' ');
+  const lastPunct = Math.max(
+    shortened.lastIndexOf(','),
+    shortened.lastIndexOf(';'),
+    shortened.lastIndexOf('—'),
+  );
+  return lastPunct > 20 ? shortened.slice(0, lastPunct).trim() : shortened;
+}
+
+/**
+ * Map a captured field id to one of four tooltip template categories.
+ * Keyword matching is substring-based, applied to the lowercase field id.
+ */
+function recapCategory(fieldId) {
+  const id = fieldId.toLowerCase();
+  if (/pain|problem|gap|challenge/.test(id)) return 'pain';
+  if (/decision|who|stakeholder/.test(id)) return 'decision';
+  if (/budget|cost|annual|revenue|spend/.test(id)) return 'finance';
+  return 'default';
+}
+
+/**
+ * Build a verbatim spoken-recap sentence the rep can say to the prospect.
+ * If the value splits into bullets, they're joined with ", and " before
+ * being substituted into the category-specific template.
+ */
+function buildRecapSentence(fieldId, rawValue) {
+  const bullets = splitIntoBullets(rawValue);
+  let valueStr;
+  if (bullets) {
+    const items = bullets
+      .map((b) => {
+        const c = cleanBulletItem(b);
+        return c ? c[0].toLowerCase() + c.slice(1) : '';
+      })
+      .filter(Boolean);
+    if (items.length === 1) valueStr = items[0];
+    else if (items.length === 2) valueStr = `${items[0]} and ${items[1]}`;
+    else valueStr = `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
+  } else {
+    valueStr = rawValue;
+  }
+  const v = truncateValueTo60Words(valueStr);
+  const vLow = v ? v[0].toLowerCase() + v.slice(1) : v;
+  switch (recapCategory(fieldId)) {
+    case 'pain':
+      return `If I'm hearing you right, you mentioned ${vLow}. Is that a fair summary?`;
+    case 'decision':
+      return `So if I understand correctly, ${vLow}. Did I get that right?`;
+    case 'finance':
+      return `Just to make sure I've got this — ${vLow}. Is that in the right ballpark?`;
+    default:
+      return `You mentioned ${vLow} earlier. Does that still sound accurate?`;
+  }
+}
+
+let _capturedTooltipTimer = null;
+
+function showCapturedTooltip(el) {
+  if (!capturedTooltipEl) return;
+  const fieldId = el.dataset.tooltipFieldId;
+  const rawValue = el.dataset.tooltipValue;
+  if (!fieldId || !rawValue) return;
+  // Rebuild tooltip body: primary recap line + optional small italic evidence
+  // line. Using child elements (not innerHTML) keeps text safely escaped.
+  capturedTooltipEl.replaceChildren();
+  const recapEl = document.createElement('div');
+  // Allow callers to override the recap sentence per-element (e.g. the
+  // revenue-rollup component bullets use a bespoke "potential value"
+  // template). Falls back to the standard category-based recap.
+  const customRecap = el.dataset.tooltipRecap;
+  recapEl.textContent = customRecap || buildRecapSentence(fieldId, rawValue);
+  capturedTooltipEl.appendChild(recapEl);
+  const evidence = el.dataset.tooltipEvidence;
+  if (evidence) {
+    const evEl = document.createElement('em');
+    evEl.style.display = 'block';
+    evEl.style.marginTop = '6px';
+    evEl.style.fontSize = '10.5px';
+    evEl.style.opacity = '0.7';
+    evEl.textContent = `Evidence: "${evidence}"`;
+    capturedTooltipEl.appendChild(evEl);
+  }
+  const rect = el.getBoundingClientRect();
+  let top = rect.bottom + 12;
+  let left = rect.left;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  if (left + 320 > vw - 8) left = Math.max(8, vw - 320 - 8);
+  if (top + 80 > vh - 8) top = Math.max(8, rect.top - 80 - 12);
+  capturedTooltipEl.style.top = `${Math.round(top)}px`;
+  capturedTooltipEl.style.left = `${Math.round(left)}px`;
+  clearTimeout(_capturedTooltipTimer);
+  _capturedTooltipTimer = setTimeout(() => capturedTooltipEl.classList.add('visible'), 200);
+}
+
+function hideCapturedTooltip() {
+  clearTimeout(_capturedTooltipTimer);
+  if (capturedTooltipEl) capturedTooltipEl.classList.remove('visible');
+}
+
 function renderCaptured() {
   /** @type {Record<string, HTMLElement[]>} */
   const byGroup = {};
@@ -467,16 +2140,36 @@ function renderCaptured() {
     label.textContent = f.label;
     pair.appendChild(label);
 
-    const value = document.createElement('span');
-    value.className = 'captured__value';
+    // Build value element — bullet list or plain span
+    let valueEl;
     if (captured?.value) {
-      value.textContent = captured.value;
-      if (captured.evidence) pair.title = captured.evidence;
+      const bullets = splitIntoBullets(captured.value);
+      if (bullets && bullets.length >= 2) {
+        valueEl = document.createElement('ul');
+        valueEl.className = 'captured__value captured__value--list';
+        for (const raw of bullets) {
+          const cleaned = cleanBulletItem(raw);
+          if (!cleaned) continue;
+          const li = document.createElement('li');
+          li.textContent = cleaned;
+          valueEl.appendChild(li);
+        }
+      } else {
+        valueEl = document.createElement('span');
+        valueEl.className = 'captured__value';
+        valueEl.textContent = captured.value;
+      }
+      valueEl.dataset.tooltipFieldId = f.id;
+      valueEl.dataset.tooltipValue = captured.value;
+      if (captured.evidence) valueEl.dataset.tooltipEvidence = captured.evidence;
+      valueEl.addEventListener('mouseenter', () => showCapturedTooltip(valueEl));
+      valueEl.addEventListener('mouseleave', hideCapturedTooltip);
     } else {
-      value.classList.add('captured__value--empty');
-      value.textContent = '—';
+      valueEl = document.createElement('span');
+      valueEl.className = 'captured__value captured__value--empty';
+      valueEl.textContent = '—';
     }
-    pair.appendChild(value);
+    pair.appendChild(valueEl);
 
     (byGroup[f.group] ||= []).push(pair);
   }
@@ -495,69 +2188,82 @@ function renderCaptured() {
     out.push(group);
   }
 
+  /* Strategy A / Work-stream C: the legacy regex revenue-rollup block
+   * is gone. The quick-fix card now lives at the top of #capturedPane
+   * as a static element in index.html (#quickFix) — it's populated
+   * separately by renderQuickFix() in response to the scoring:quick-fix
+   * IPC, not by this function.
+   *
+   * We have to preserve the #quickFix element across replaceChildren()
+   * calls here. Strategy: snapshot it, replace children, then prepend
+   * it back. Cheap because it's a single DOM node we already have a
+   * reference to.
+   */
   capturedPaneEl.replaceChildren(...out);
-}
-
-function renderTranscriptDrawer() {
-  // Visibility of the drawer container.
-  transcriptDrawerEl.hidden = !state.transcriptOpen;
-  transcriptToggleEl.setAttribute('aria-expanded', String(state.transcriptOpen));
-  const labelSpan = transcriptToggleEl.querySelector('span:last-child');
-  if (labelSpan) {
-    labelSpan.textContent = state.transcriptOpen ? 'Hide transcript' : 'Show transcript';
-  }
-
-  if (!state.transcriptOpen) return;
-
-  if (state.errorMessage) {
-    transcriptErrorEl.textContent = state.errorMessage;
-    transcriptErrorEl.hidden = false;
-    transcriptListEl.hidden = true;
-    transcriptPendingEl.hidden = true;
-    return;
-  }
-  transcriptErrorEl.hidden = true;
-
-  const hasCommitted = state.transcript.committed.length > 0;
-  transcriptListEl.hidden = !hasCommitted;
-  transcriptListEl.replaceChildren(
-    ...state.transcript.committed.map((line) => {
-      const p = document.createElement('p');
-      p.className = 'drawer__line';
-      p.textContent = line;
-      return p;
-    }),
-  );
-
-  const hasPending = state.transcript.pending.length > 0;
-  transcriptPendingEl.hidden = !hasPending;
-  transcriptPendingEl.textContent = state.transcript.pending;
-
-  transcriptDrawerEl.scrollTop = transcriptDrawerEl.scrollHeight;
+  if (quickFixEl) capturedPaneEl.prepend(quickFixEl);
 }
 
 function showConnectionError(message) {
   state.errorMessage = message || 'Connection lost';
-  // Auto-open the drawer so the error is visible immediately.
-  state.transcriptOpen = true;
-  renderTranscriptDrawer();
+  renderTranscriptPane();
 }
 
 function clearScoringState() {
   state.flags = [];
-  state.coveredItems = Object.fromEntries(PILLARS.map((p) => [p.id, new Map()]));
+  state.itemStates = new Map();
   state.capturedFields = {};
+  // Strategy A / Work-stream C: wipe the rollup mirror so a previous
+  // call's headline + breakdown doesn't linger into the new session.
+  // renderQuickFix below renders this as "hidden" when null.
+  state.quickFix = null;
+  state.quickFixEntries = [];
   state.pillarStatus = Object.fromEntries(PILLARS.map((p) => [p.id, 'idle']));
-  state.transcript = { committed: [], pending: '' };
+  state.transcript = {
+    committed: [],
+    pendingBySpeaker: { you: '', other: '' },
+  };
+  // Drop stale cross-channel dedupe state; a fresh call shouldn't
+  // inherit the previous session's last commits.
+  recentRendererCommitBySpeaker.you = null;
+  recentRendererCommitBySpeaker.other = null;
+  // Reset the speaker-bleed counter + one-shot hint guard so the
+  // banner can re-surface on the next call if the user is still on
+  // speakers. Hint-shown intentionally clears here, not on app boot —
+  // we want to remind once per session, not once per process lifetime.
+  recentDedupDrops = 0;
+  dedupHintShown = false;
+  hideDedupHintBanner();
   state.coachHistory = [];
   state.coachIndex = -1;
+  state.coachThinking = false;
+  // Drop the per-call suggestion-history mirror so the next session
+  // starts with a clean drawer. The Coach toggles persist (they're
+  // user preferences, not per-call state).
+  state.suggestionHistory = [];
   state.errorMessage = null;
+  // Drop any in-flight cover-queue cycle silently — a fresh session
+  // shouldn't inherit the previous call's queue or show a stale
+  // completion banner. hideCoverQueueCompleteBanner() also tears
+  // down any visible banner from the previous session.
+  state.coverQueue = null;
+  hideCoverQueueCompleteBanner();
+  // Also clear any lingering "Recap in progress…" pill — if the user
+  // hit Stop right after clicking Recap, the safety timer would still
+  // be running and could surface a stale pill on the next call.
+  hideRecapInProgressPill();
+  // Reset the connection-status mirror so a previous session's
+  // 'connected' / 'down' doesn't leak into the new session's pill
+  // before the first connection:status broadcast lands. Main also
+  // resets its mirror in resetCoachContext and broadcasts the empty
+  // state, so the two stay in lockstep.
+  state.connection = { deepgram: 'down', geminiLive: 'down' };
   renderRail();
-  renderActivePillar();
+  renderRailOverlay();
   renderCaptured();
-  renderTicker();
+  renderQuickFix();
+  renderTranscriptPane();
   renderCoachSuggestion();
-  renderTranscriptDrawer();
+  renderCoachThinking();
 }
 
 /* ── Status / pillar progression ──────────────────────────────────── */
@@ -567,9 +2273,22 @@ function recomputePillarStatus(pillarId) {
     state.pillarStatus.live_signals = state.flags.length === 0 ? 'idle' : 'in_progress';
     return;
   }
+  if (pillarId === 'logged_questions') {
+    // The Logged pillar derives its status from any item currently in
+    // `logged` state across the entire rubric.
+    const hasLogged = loggedItems().length > 0;
+    state.pillarStatus.logged_questions = hasLogged ? 'in_progress' : 'idle';
+    return;
+  }
   const items = ITEMS_BY_PILLAR[pillarId] || [];
-  const covered = state.coveredItems[pillarId]?.size || 0;
-  if (covered === 0) state.pillarStatus[pillarId] = 'idle';
+  let covered = 0;
+  let touched = 0;
+  for (const it of items) {
+    const s = itemStateFor(it.id);
+    if (s === 'covered') covered += 1;
+    if (s !== 'pending') touched += 1;
+  }
+  if (touched === 0) state.pillarStatus[pillarId] = 'idle';
   else if (covered >= items.length) state.pillarStatus[pillarId] = 'complete';
   else state.pillarStatus[pillarId] = 'in_progress';
 }
@@ -594,23 +2313,43 @@ function applyFlag({ id, evidence }) {
   });
   recomputePillarStatus('live_signals');
   renderRail();
-  if (state.selectedPillarId === 'live_signals') renderActivePillar();
+  if (state.activePillarId === 'live_signals') renderRailOverlay();
 }
 
-function applyItemCovered({ itemId, evidence }) {
+function applyItemStateChange({ itemId, state: nextState, evidence, confidence, source }) {
   if (typeof itemId !== 'string') return;
+  if (nextState !== 'in_progress' && nextState !== 'covered' && nextState !== 'logged') return;
   const meta = ITEMS_BY_ID[itemId];
   if (!meta) {
     console.warn('[scoring] unknown item id:', itemId);
     return;
   }
-  const map = state.coveredItems[meta.pillarId];
-  if (!map) return;
-  if (map.has(itemId)) return; // already covered, ignore re-firing
-  map.set(itemId, { evidence: typeof evidence === 'string' ? evidence : '', at: Date.now() });
+
+  // Terminal state: once an item is covered, ignore any subsequent
+  // demotion. The coach is told this in the prompt, but main also
+  // guards — belt-and-braces here too.
+  const prev = state.itemStates.get(itemId);
+  if (prev?.state === 'covered' && nextState !== 'covered') return;
+
+  state.itemStates.set(itemId, {
+    state: nextState,
+    evidence: typeof evidence === 'string' ? evidence : '',
+    confidence: typeof confidence === 'number' ? confidence : 0,
+    source: typeof source === 'string' ? source : 'model',
+    at: Date.now(),
+  });
+
   recomputePillarStatus(meta.pillarId);
+  // The synthetic Logged pillar's status depends on items across the
+  // whole rubric, so it needs to re-evaluate on every transition.
+  recomputePillarStatus('logged_questions');
   renderRail();
-  if (state.selectedPillarId === meta.pillarId) renderActivePillar();
+  if (
+    state.activePillarId === meta.pillarId ||
+    state.activePillarId === 'logged_questions'
+  ) {
+    renderRailOverlay();
+  }
 }
 
 function applyFieldCaptured({ fieldId, value, evidence }) {
@@ -627,98 +2366,75 @@ function applyFieldCaptured({ fieldId, value, evidence }) {
   renderCaptured();
 }
 
-/* ── Audio capture / speaker activity ──────────────────────────────── */
+/* ── Audio capture / speaker activity ────────────────────────────────
+ *
+ * Each capture chain has its own AnalyserNode. The single rAF tick
+ * reads both, computes per-channel RMS, and toggles its speaker pill
+ * independently — so during cross-talk both pills can light up at the
+ * same time. */
 
-function tickAnalyser() {
-  if (!state.analyser || !state.analyserBuffer) return;
-  state.analyser.getByteTimeDomainData(state.analyserBuffer);
-
+/**
+ * Compute RMS for one chain. Returns `null` if the chain isn't
+ * initialised. The `level` is RMS * LEVEL_GAIN clipped to [0, 1].
+ */
+function readChannelLevel(chain) {
+  if (!chain.analyser || !chain.analyserBuffer) return null;
+  chain.analyser.getByteTimeDomainData(chain.analyserBuffer);
   let sumSquares = 0;
-  for (let i = 0; i < state.analyserBuffer.length; i++) {
-    const sample = (state.analyserBuffer[i] - 128) / 128;
+  for (let i = 0; i < chain.analyserBuffer.length; i++) {
+    const sample = (chain.analyserBuffer[i] - 128) / 128;
     sumSquares += sample * sample;
   }
-  const rms = Math.sqrt(sumSquares / state.analyserBuffer.length);
-  const level = Math.min(1, rms * LEVEL_GAIN);
+  const rms = Math.sqrt(sumSquares / chain.analyserBuffer.length);
+  return Math.min(1, rms * LEVEL_GAIN);
+}
 
-  // Speaker activity: if the user is speaking, mark 'you' active. We have
-  // no real second-speaker source today, so 'other' never becomes active
-  // from this signal. Treat as a placeholder — real diarization is the
-  // next step (requires system-audio capture on macOS).
+/**
+ * Per-channel speaker-activity update. Latches the pill on whenever
+ * the channel is loud enough, latches off after a quiet period to
+ * absorb micro-pauses inside a sentence.
+ */
+function updateChannelActivity(speaker, level, now) {
+  if (level == null) return false;
+  const chain = speaker === 'you' ? state.mic : state.sys;
+  const wasActive = state.activeSpeakers[speaker];
+  let nextActive = wasActive;
+
   if (level > SPEAKER_RMS_ON) {
-    if (state.activeSpeaker !== 'you') {
-      state.activeSpeaker = 'you';
-      renderSpeakers();
-    }
-    state.speakerOnAt = performance.now();
-    if (state.speakerOffTimer) {
-      clearTimeout(state.speakerOffTimer);
-      state.speakerOffTimer = null;
-    }
-  } else if (state.activeSpeaker === 'you' && !state.speakerOffTimer) {
-    state.speakerOffTimer = setTimeout(() => {
-      state.activeSpeaker = null;
-      state.speakerOffTimer = null;
-      renderSpeakers();
-    }, SPEAKER_RMS_OFF_AFTER_MS);
+    chain.lastActiveAt = now;
+    nextActive = true;
+  } else if (wasActive && now - chain.lastActiveAt > SPEAKER_RMS_OFF_AFTER_MS) {
+    nextActive = false;
   }
+
+  if (nextActive !== wasActive) {
+    state.activeSpeakers[speaker] = nextActive;
+    return true;
+  }
+  return false;
+}
+
+function tickAnalyser() {
+  const now = performance.now();
+
+  const youLevel = readChannelLevel(state.mic);
+  const otherLevel = readChannelLevel(state.sys);
+
+  let changed = false;
+  if (updateChannelActivity('you', youLevel, now)) changed = true;
+  if (updateChannelActivity('other', otherLevel, now)) changed = true;
+  if (changed) renderSpeakers();
 
   state.rafId = requestAnimationFrame(tickAnalyser);
 }
 
-async function startCapture() {
-  if (state.status === 'listening' || state.status === 'starting') return;
-  setStatus('starting');
-  clearScoringState();
-
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1,
-      },
-      video: false,
-    });
-  } catch (err) {
-    console.error('[mic] getUserMedia failed:', err);
-    showConnectionError('Microphone blocked. Enable mic access in System Settings.');
-    setStatus('idle');
-    return;
-  }
-
-  const result = await window.gemini.start();
-  if (!result?.ok) {
-    stream.getTracks().forEach((t) => t.stop());
-    showConnectionError(
-      result?.error === 'missing_api_key'
-        ? 'Missing GEMINI_API_KEY in .env'
-        : 'Connection lost',
-    );
-    setStatus('idle');
-    return;
-  }
-
-  const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  const audioContext = new AudioCtx();
-  if (audioContext.state === 'suspended') {
-    try { await audioContext.resume(); } catch { /* ignore */ }
-  }
-
-  try {
-    await audioContext.audioWorklet.addModule(PCM_WORKLET_URL);
-  } catch (err) {
-    console.error('[mic] failed to load PCM worklet:', err);
-    stream.getTracks().forEach((t) => t.stop());
-    await audioContext.close().catch(() => {});
-    await window.gemini.stop();
-    showConnectionError('Audio worklet failed to load');
-    setStatus('idle');
-    return;
-  }
-
+/**
+ * Build a single capture chain (source → analyser + worklet) on the
+ * shared AudioContext. Used twice in startCapture(): once for the mic
+ * (channel 1, send via sendMicAudio), once for the system audio
+ * loopback (channel 2, send via sendSystemAudio).
+ */
+function buildCaptureChain({ stream, audioContext, sendChunk }) {
   const source = audioContext.createMediaStreamSource(stream);
   const analyser = audioContext.createAnalyser();
   analyser.fftSize = 1024;
@@ -734,17 +2450,271 @@ async function startCapture() {
   workletNode.port.onmessage = (event) => {
     const buffer = event.data;
     if (buffer && buffer.byteLength > 0) {
-      window.gemini.sendAudio(new Uint8Array(buffer));
+      sendChunk(new Uint8Array(buffer));
     }
   };
   source.connect(workletNode);
 
-  state.stream = stream;
+  return {
+    stream,
+    source,
+    analyser,
+    workletNode,
+    analyserBuffer: new Uint8Array(analyser.fftSize),
+    lastActiveAt: 0,
+  };
+}
+
+/**
+ * Try to open a system-audio loopback stream via the renderer's
+ * `getDisplayMedia`. Returns the stream on success or `null` on
+ * failure. Failure cases are not raised — the caller is expected to
+ * surface the permission modal and continue with mic-only capture.
+ *
+ * The browser API requires a video track in the request and in the
+ * response, but we don't actually want screen pixels. We stop +
+ * detach the video tracks immediately so the OS-level screen-capture
+ * preview indicator doesn't show.
+ */
+async function tryOpenSystemAudioStream() {
+  try {
+    const displayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true,
+    });
+
+    for (const track of displayStream.getVideoTracks()) {
+      try { track.stop(); } catch { /* ignore */ }
+      displayStream.removeTrack(track);
+    }
+
+    if (displayStream.getAudioTracks().length === 0) {
+      console.warn('[system-audio] getDisplayMedia returned no audio tracks');
+      return null;
+    }
+
+    return displayStream;
+  } catch (err) {
+    console.warn('[system-audio] getDisplayMedia failed:', err?.name || '', err?.message || err);
+    return null;
+  }
+}
+
+async function startCapture() {
+  if (state.status === 'listening' || state.status === 'starting') return;
+  setStatus('starting');
+  clearScoringState();
+
+  // 1. Mic — fail hard if blocked. Without a mic we have nothing to send.
+  //
+  // AEC3 (Chromium's modern echo canceller) is the load-bearing
+  // constraint here when the user is on speakers rather than
+  // headphones: it captures the prospect bleed via the system default
+  // output as the reference signal and subtracts it from the mic
+  // input. Result: channel 1 carries the salesperson's voice only,
+  // and the dual-stream pipeline doesn't have to dedup speakers
+  // post-hoc. Constraints are expressed as `{ ideal: true }` so a
+  // hardware combo that refuses AEC (rare — some Bluetooth / USB
+  // interfaces) still yields a working mic stream rather than an
+  // OverconstrainedError. The legacy `goog*` hints are harmless on
+  // modern Chromium and may help on older versions / odd OS combos.
+  //
+  // The actual AEC state is read back from MediaTrackSettings after
+  // capture (see [audio] mic settings: log below) and surfaced to
+  // the user via the AEC badge in the header. If the browser
+  // reports echoCancellation=false we light the badge red so the
+  // user knows their hardware refused — without this it would be
+  // invisible.
+  // Phase 2: read user-configurable audio constraints from
+  // settingsCache before opening the mic. Defaults are ON so a
+  // first-boot user (or any settings file without `audio.*` keys)
+  // gets the same Chromium-recommended constraints as pre-Phase-2.
+  //
+  // The `!== false` shape lets a missing key (e.g. `audio.aec`
+  // undefined) default to ON, which matches the explicit
+  // `audio.aec: true` default in src/settings.js — a settings file
+  // that only partially populates the audio block doesn't accidentally
+  // disable AEC.
+  //
+  // Caveat: Chromium command-line force-switches in
+  // [src/main.js](src/main.js) lines 72–76 (WebRtcEchoCanceller3 +
+  // the field-trial pin) may override `echoCancellation: false` on
+  // some platforms. The Audio tab's AEC toggle sub-text surfaces this.
+  // A future change could thread the AEC setting through to app-boot
+  // and conditionally apply the switches, but that requires reading
+  // settings before `app.whenReady` (achievable, out of Phase 2 scope).
+  //
+  // Stale device IDs: if `audio.micDeviceId` references a device
+  // that's no longer attached (USB unplug, OS reset), getUserMedia
+  // throws OverconstrainedError. We catch the failure and retry with
+  // an unconstrained device-id so the user gets capture rather than
+  // a hard error.
+  const audioPrefs = settingsCache?.audio || {};
+  const micDeviceId = typeof audioPrefs.micDeviceId === 'string' ? audioPrefs.micDeviceId : '';
+
+  const baseAudioConstraints = {
+    echoCancellation: { ideal: audioPrefs.aec !== false },
+    noiseSuppression: { ideal: audioPrefs.noiseSuppression !== false },
+    autoGainControl: { ideal: audioPrefs.autoGainControl !== false },
+    channelCount: { ideal: 1 },
+    sampleRate: { ideal: 48000 },
+    // Chromium legacy hints — harmless on newer versions, helpful
+    // on older ones / odd hardware combos. Safe to pass alongside
+    // the standard MediaStreamConstraints above. The `goog*` hints
+    // track the same on/off as the standard fields so the platform
+    // sees a consistent intent.
+    googEchoCancellation: { ideal: audioPrefs.aec !== false },
+    googAutoGainControl: { ideal: audioPrefs.autoGainControl !== false },
+    googNoiseSuppression: { ideal: audioPrefs.noiseSuppression !== false },
+    googHighpassFilter: { ideal: true },
+    googTypingNoiseDetection: { ideal: true },
+  };
+
+  let micStream;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: micDeviceId
+        ? { ...baseAudioConstraints, deviceId: { exact: micDeviceId } }
+        : baseAudioConstraints,
+      video: false,
+    });
+  } catch (err) {
+    // Specific fallback for stale device IDs — retry without the
+    // exact deviceId constraint so the OS default mic still works.
+    if (micDeviceId && err?.name === 'OverconstrainedError') {
+      console.warn(
+        '[mic] persisted micDeviceId no longer attached — falling back to OS default mic',
+      );
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: baseAudioConstraints,
+          video: false,
+        });
+      } catch (retryErr) {
+        console.error('[mic] getUserMedia retry failed:', retryErr);
+        showConnectionError('Microphone blocked. Enable mic access in System Settings.');
+        setStatus('idle');
+        return;
+      }
+    } else {
+      console.error('[mic] getUserMedia failed:', err);
+      showConnectionError('Microphone blocked. Enable mic access in System Settings.');
+      setStatus('idle');
+      return;
+    }
+  }
+
+  // Diagnostic: what did the browser actually give us back? AEC and
+  // the other audio constraints are advisory — Chromium can refuse
+  // any of them based on the underlying hardware. Read the settings
+  // immediately so we can confirm the AEC reference signal is being
+  // applied at the OS level, and surface the result via the badge.
+  const micSettings = micStream.getAudioTracks()[0]?.getSettings() || {};
+  console.log('[audio] mic settings:', {
+    echoCancellation: micSettings.echoCancellation,
+    noiseSuppression: micSettings.noiseSuppression,
+    autoGainControl: micSettings.autoGainControl,
+    channelCount: micSettings.channelCount,
+    sampleRate: micSettings.sampleRate,
+    deviceId: micSettings.deviceId?.slice(0, 8),
+  });
+  updateAecBadgeFromSettings(micSettings);
+
+  // 2. System audio loopback — best-effort. Failure shows the
+  //    permission explainer modal but doesn't abort the call.
+  //
+  // Critically, we do NOT request AEC on this stream. The loopback
+  // is already a clean isolated source (the prospect's voice routed
+  // through the system mixer); running AEC on it would over-process
+  // — there's no "echo" of the user's mic to cancel, and AEC's
+  // adaptive filter would chew on phantom references. Keep its
+  // constraints whatever tryOpenSystemAudioStream sets (currently
+  // `audio: true`, plain).
+  const sysStream = await tryOpenSystemAudioStream();
+  state.systemAudioStatus = sysStream ? 'capturing' : 'denied';
+  if (!sysStream) {
+    // Show the explainer modal so the user knows the prospect channel
+    // won't be transcribed and can grant access if they want to.
+    showPermissionModal();
+  } else {
+    // Same diagnostic shape as the mic stream — purely for debugging
+    // the loopback path. echoCancellation is expected to be
+    // undefined / false here because the renderer doesn't request
+    // it on getDisplayMedia.
+    const sysSettings = sysStream.getAudioTracks()[0]?.getSettings() || {};
+    console.log('[audio] sys settings:', {
+      echoCancellation: sysSettings.echoCancellation,
+      noiseSuppression: sysSettings.noiseSuppression,
+      autoGainControl: sysSettings.autoGainControl,
+      channelCount: sysSettings.channelCount,
+      sampleRate: sysSettings.sampleRate,
+      deviceId: sysSettings.deviceId?.slice(0, 8),
+    });
+  }
+
+  // 3. Start backing sessions (Gemini Live + Deepgram in main).
+  // Forward the persisted coach mode BEFORE starting the session so
+  // the pause detector picks up the right state from tick zero.
+  try { await window.gemini.setCoachMode?.(state.coachMode); } catch { /* non-fatal */ }
+  const result = await window.gemini.start();
+  if (!result?.ok) {
+    micStream.getTracks().forEach((t) => t.stop());
+    if (sysStream) sysStream.getTracks().forEach((t) => t.stop());
+    showConnectionError(
+      result?.error === 'missing_api_key'
+        ? 'Missing GEMINI_API_KEY in .env'
+        : 'Connection lost',
+    );
+    setStatus('idle');
+    return;
+  }
+
+  // 4. Shared AudioContext + worklet module.
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const audioContext = new AudioCtx();
+  if (audioContext.state === 'suspended') {
+    try { await audioContext.resume(); } catch { /* ignore */ }
+  }
+
+  try {
+    await audioContext.audioWorklet.addModule(PCM_WORKLET_URL);
+  } catch (err) {
+    console.error('[mic] failed to load PCM worklet:', err);
+    micStream.getTracks().forEach((t) => t.stop());
+    if (sysStream) sysStream.getTracks().forEach((t) => t.stop());
+    await audioContext.close().catch(() => {});
+    await window.gemini.stop();
+    showConnectionError('Audio worklet failed to load');
+    setStatus('idle');
+    return;
+  }
+
+  // 5. Two capture chains.
+  const micChain = buildCaptureChain({
+    stream: micStream,
+    audioContext,
+    sendChunk: (chunk) => window.gemini.sendMicAudio(chunk),
+  });
+
+  let sysChain = null;
+  if (sysStream) {
+    sysChain = buildCaptureChain({
+      stream: sysStream,
+      audioContext,
+      sendChunk: (chunk) => window.gemini.sendSystemAudio(chunk),
+    });
+  }
+
   state.audioContext = audioContext;
-  state.source = source;
-  state.analyser = analyser;
-  state.workletNode = workletNode;
-  state.analyserBuffer = new Uint8Array(analyser.fftSize);
+  state.mic = micChain;
+  state.sys = sysChain || {
+    stream: null,
+    source: null,
+    analyser: null,
+    workletNode: null,
+    analyserBuffer: null,
+    lastActiveAt: 0,
+  };
 
   // Recording timer.
   state.recordingStartedAt = Date.now();
@@ -755,80 +2725,207 @@ async function startCapture() {
   state.rafId = requestAnimationFrame(tickAnalyser);
 }
 
+/**
+ * Tear down one capture chain — disconnect nodes, stop tracks. Safe
+ * to call with a null / partially-initialised chain (some fields may
+ * be missing if construction failed mid-way).
+ */
+function teardownChain(chain) {
+  if (!chain) return;
+  if (chain.workletNode) {
+    try {
+      chain.workletNode.port.onmessage = null;
+      chain.workletNode.disconnect();
+    } catch { /* ignore */ }
+  }
+  if (chain.source) {
+    try { chain.source.disconnect(); } catch { /* ignore */ }
+  }
+  if (chain.stream) {
+    for (const track of chain.stream.getTracks()) {
+      try { track.stop(); } catch { /* ignore */ }
+    }
+  }
+}
+
 async function stopCapture({ keepError = false } = {}) {
   if (state.rafId !== null) {
     cancelAnimationFrame(state.rafId);
     state.rafId = null;
-  }
-  if (state.speakerOffTimer) {
-    clearTimeout(state.speakerOffTimer);
-    state.speakerOffTimer = null;
   }
   if (state.timerInterval) {
     clearInterval(state.timerInterval);
     state.timerInterval = null;
   }
 
-  if (state.workletNode) {
-    try {
-      state.workletNode.port.onmessage = null;
-      state.workletNode.disconnect();
-    } catch { /* ignore */ }
-  }
-  if (state.source) {
-    try { state.source.disconnect(); } catch { /* ignore */ }
-  }
-  if (state.stream) {
-    for (const track of state.stream.getTracks()) track.stop();
-  }
+  teardownChain(state.mic);
+  teardownChain(state.sys);
+
   if (state.audioContext) {
     try { await state.audioContext.close(); } catch { /* ignore */ }
   }
 
-  state.stream = null;
   state.audioContext = null;
-  state.source = null;
-  state.analyser = null;
-  state.workletNode = null;
-  state.analyserBuffer = null;
+  state.mic = {
+    stream: null,
+    source: null,
+    analyser: null,
+    workletNode: null,
+    analyserBuffer: null,
+    lastActiveAt: 0,
+  };
+  state.sys = {
+    stream: null,
+    source: null,
+    analyser: null,
+    workletNode: null,
+    analyserBuffer: null,
+    lastActiveAt: 0,
+  };
   state.recordingStartedAt = null;
-  state.activeSpeaker = null;
+  state.activeSpeakers = { you: false, other: false };
+  state.systemAudioStatus = 'unknown';
 
   renderSpeakers();
   renderTimer();
+  // Drop the AEC badge back to "unknown" once we stop capturing —
+  // the on/off state is only meaningful while a mic stream is live.
+  setAecBadgeState('unknown');
 
   try { await window.gemini.stop(); } catch { /* ignore */ }
 
-  // Commit any in-flight partial transcript so the user keeps the text.
-  if (state.transcript.pending) {
-    state.transcript.committed.push(state.transcript.pending);
-    state.transcript.pending = '';
+  // Commit any in-flight partial transcripts so the user keeps the text.
+  for (const speaker of /** @type {const} */ (['you', 'other'])) {
+    const pending = state.transcript.pendingBySpeaker[speaker];
+    if (pending && pending.trim()) {
+      state.transcript.committed.push({ speaker, text: pending.trim() });
+    }
+    state.transcript.pendingBySpeaker[speaker] = '';
   }
   if (!keepError) state.errorMessage = null;
 
-  renderTranscriptDrawer();
+  renderTranscriptPane();
   setStatus('idle');
 }
 
 /* ── IPC subscriptions ─────────────────────────────────────────────── */
 
-window.gemini.onTranscript(({ text, finished }) => {
-  state.transcript.pending += text;
+window.gemini.onTranscript(({ speaker, text, finished }) => {
+  // main.js normalises both the Deepgram (canonical) and Gemini
+  // (fallback) paths into the same shape:
+  //   - `speaker` is always 'you' or 'other'.
+  //   - `text` is the FULL current segment text (replace-on-interim
+  //     semantics, NOT incremental deltas).
+  //   - `finished=true` means "commit this segment and start a new one".
+  if (speaker !== 'you' && speaker !== 'other') return;
+  if (typeof text !== 'string') return;
+
   if (finished) {
-    if (state.transcript.pending) state.transcript.committed.push(state.transcript.pending);
-    state.transcript.pending = '';
+    const committed = text.trim();
+    if (committed) {
+      // ── Cross-channel dedupe (PROSPECT-biased, mirrors main.js) ───
+      // Bleed almost always flows AI/prospect → mic via speaker
+      // playback, so when the same utterance lands on both channels
+      // PROSPECT is the trusted side. See main.js's "Attribution
+      // bias" doc-block for the full rationale.
+      const other = speaker === 'you' ? 'other' : 'you';
+      const otherEntry = recentRendererCommitBySpeaker[other];
+      const now = Date.now();
+      const isDuplicateOfOtherChannel =
+        Boolean(otherEntry) &&
+        now - otherEntry.ts < RENDERER_CROSS_CHANNEL_WINDOW_MS &&
+        committed.length >= RENDERER_CROSS_CHANNEL_DEDUPE_MIN_CHARS &&
+        isNearIdentical(committed, otherEntry.text);
+
+      if (speaker === 'you' && isDuplicateOfOtherChannel) {
+        // Incoming YOU matches a recent PROSPECT — bleed copy.
+        // Drop it; nothing reaches state.transcript.committed.
+        state.transcript.pendingBySpeaker[speaker] = '';
+        if (DEBUG_TRANSCRIPT) {
+          console.log(
+            '[transcript] you commit → DROP (matched recent PROSPECT)',
+            JSON.stringify(committed.slice(0, 50)),
+          );
+        }
+        noteDedupDrop();
+        renderTranscriptPane();
+        return;
+      }
+
+      if (speaker === 'other' && isDuplicateOfOtherChannel) {
+        // Incoming PROSPECT matches a recent YOU line we already
+        // displayed. Splice out the YOU entry from the committed
+        // list and clear the recent-YOU tracker so the prefix-
+        // extension dedupe below doesn't re-anchor on a removed
+        // entry. Then fall through to the normal PROSPECT commit
+        // flow (push / replace into committed).
+        const removed = findAndRemoveMatchingCommitted(
+          state.transcript.committed,
+          'you',
+          committed,
+        );
+        if (removed) recentRendererCommitBySpeaker.you = null;
+        if (DEBUG_TRANSCRIPT) {
+          console.log(
+            '[transcript] other commit → KEEP, removed prior YOU line:',
+            removed,
+            JSON.stringify(committed.slice(0, 50)),
+          );
+        }
+        noteDedupDrop();
+        // Fall through.
+      } else if (DEBUG_TRANSCRIPT) {
+        console.log(
+          '[transcript]',
+          speaker,
+          'commit → KEEP',
+          JSON.stringify(committed.slice(0, 50)),
+        );
+      }
+
+      recentRendererCommitBySpeaker[speaker] = { text: committed, ts: now };
+
+      // Prefix-extension dedupe (belt-and-braces — mirrors the same
+      // guard in main.js's handleDeepgramTranscript). If two
+      // commit-worthy messages fire back-to-back for the same speaker
+      // and the second's text begins with the first's, REPLACE the
+      // prior entry instead of pushing a duplicate. Bounded lookback
+      // skips over short interjections from the other speaker without
+      // merging into a stale earlier utterance.
+      const list = state.transcript.committed;
+      const maxLookback = 4;
+      const end = Math.max(0, list.length - maxLookback);
+      let lastIdx = -1;
+      for (let i = list.length - 1; i >= end; i--) {
+        if (list[i] && list[i].speaker === speaker) { lastIdx = i; break; }
+      }
+      if (lastIdx >= 0 && committed.startsWith(list[lastIdx].text)) {
+        list[lastIdx] = { speaker, text: committed };
+      } else {
+        list.push({ speaker, text: committed });
+      }
+    }
+    state.transcript.pendingBySpeaker[speaker] = '';
+  } else {
+    state.transcript.pendingBySpeaker[speaker] = text;
   }
-  renderTicker();
-  if (state.transcriptOpen) renderTranscriptDrawer();
+  renderTranscriptPane();
 });
 
 window.gemini.onTurnComplete(() => {
-  if (state.transcript.pending) {
-    state.transcript.committed.push(state.transcript.pending);
-    state.transcript.pending = '';
-    renderTicker();
-    if (state.transcriptOpen) renderTranscriptDrawer();
+  // Flush any in-flight partial for both channels — Gemini's turn
+  // complete fires on its own VAD rhythm, not Deepgram's, so we belt-
+  // and-brace here even when Deepgram owns the transcript.
+  let dirty = false;
+  for (const speaker of /** @type {const} */ (['you', 'other'])) {
+    const pending = state.transcript.pendingBySpeaker[speaker];
+    if (pending && pending.trim()) {
+      state.transcript.committed.push({ speaker, text: pending.trim() });
+      state.transcript.pendingBySpeaker[speaker] = '';
+      dirty = true;
+    }
   }
+  if (dirty) renderTranscriptPane();
 });
 
 window.gemini.onError(({ message }) => {
@@ -841,21 +2938,22 @@ window.gemini.onError(({ message }) => {
   }
 });
 
-window.gemini.onClosed(() => {
-  if (state.status === 'listening' || state.status === 'starting') {
-    showConnectionError('Connection lost');
-    stopCapture({ keepError: true });
-  }
-});
+// (Original window.gemini.onClosed handler was removed here in E2.
+// The replacement lives further down alongside the connection-status
+// subscriber so the soft-degrade decision can read state.connection
+// in the same place that updates it. Adding a second onClosed
+// subscriber would have fired BOTH handlers in registration order,
+// which would call stopCapture() before the soft-degrade branch could
+// short-circuit.)
 
 window.gemini.onScoringFlag(({ id, evidence }) => {
   console.log('[scoring] flag:', id);
   applyFlag({ id, evidence });
 });
 
-window.gemini.onScoringItem(({ itemId, evidence }) => {
-  console.log('[scoring] item:', itemId);
-  applyItemCovered({ itemId, evidence });
+window.gemini.onScoringItemState((payload) => {
+  console.log('[scoring] item-state:', payload.itemId, '→', payload.state);
+  applyItemStateChange(payload);
 });
 
 window.gemini.onScoringField(({ fieldId, value, evidence }) => {
@@ -863,15 +2961,1880 @@ window.gemini.onScoringField(({ fieldId, value, evidence }) => {
   applyFieldCaptured({ fieldId, value, evidence });
 });
 
-window.gemini.onCoachSuggestion(({ itemId, question, rationale }) => {
-  console.log('[coach] suggest:', itemId, '→', question);
+/**
+ * Strategy A / Work-stream C: Stage-2 rollup mirror.
+ *
+ * Fired by main on every Stage-2 roundtrip (success OR fallback-
+ * with-stale). Payload: { quickFix, entries } where `quickFix` is
+ * the rolled-up shape (or null when the sheet is empty) and
+ * `entries` is the snapshot of active factsSheet entries the rollup
+ * was computed from.
+ *
+ * We mirror both into renderer state so the drill-through (breakdown
+ * row click → scroll to anchor quote in the transcript pane) can
+ * look up a fact by id without round-tripping back to main.
+ */
+window.gemini.onScoringQuickFix?.((payload) => {
+  if (!payload || typeof payload !== 'object') return;
+  state.quickFix = payload.quickFix || null;
+  state.quickFixEntries = Array.isArray(payload.entries) ? payload.entries : [];
+  renderQuickFix();
+});
+
+window.gemini.onCoachSuggestion(({ itemId, question, rationale, anchorQuote, kind, suggestionId }) => {
+  console.log('[coach] suggest:', itemId, '→', question, '(kind:', kind || 'next', ')');
+  // Recap finished — drop the in-progress pill the click handler
+  // surfaced. Safe to call even if no pill is currently shown.
+  if (kind === 'recap') hideRecapInProgressPill();
   pushCoachSuggestion({
     itemId: typeof itemId === 'string' ? itemId : null,
     question: typeof question === 'string' ? question : '',
     rationale: typeof rationale === 'string' ? rationale : '',
+    anchorQuote: typeof anchorQuote === 'string' ? anchorQuote : '',
+    kind: typeof kind === 'string' ? kind : 'next',
+    // suggestionId — the canonical id of the history entry registered
+    // in main when this suggestion was pinned. Used by renderCoachSuggestion
+    // to cross-reference state.suggestionHistory and apply the asked/
+    // greened styling on the pinned card the moment mark_question_asked
+    // fires. May be null when the bridge is older than this change or
+    // a future code path emits a suggestion without registering one.
+    suggestionId: typeof suggestionId === 'string' ? suggestionId : null,
     at: Date.now(),
   });
 });
+
+/**
+ * Advanced → Track question state: full per-call suggestion-history
+ * snapshot from main. Replace the local mirror wholesale and re-render
+ * the drawer if it's currently the active pillar.
+ *
+ * Subscribed unconditionally — main only emits when the history
+ * actually mutates, and the renderer's drawer styling is gated on
+ * the trackQuestionState toggle separately.
+ */
+window.gemini.onScoringSuggestionHistory?.((payload) => {
+  if (!Array.isArray(payload)) return;
+  state.suggestionHistory = payload;
+  // Repaint the pinned suggestion card so the asked-flip styling
+  // catches up the moment the coach fires mark_question_asked. The
+  // card's `data-asked` attribute is keyed off the matching
+  // suggestionHistory entry — without this re-render the card stays
+  // un-greened until the next push (which may never come if the rep
+  // doesn't ask for another suggestion).
+  renderCoachSuggestion();
+  if (state.activePillarId === 'logged_questions') {
+    renderRailOverlay();
+  }
+});
+
+/**
+ * Settings change broadcast. Fires whenever main applies a
+ * settings:save (including settings:reset and import:apply, which
+ * route through the same cache and emit the same broadcast). The
+ * renderer initiated saves already get the full shape back via the
+ * save promise, but subscribing here is the canonical path so any
+ * out-of-band settings mutation propagates without extra plumbing.
+ *
+ * We deliberately do NOT re-hydrate the whole form here — that would
+ * clobber any input the user is actively typing into. The Reset /
+ * Import code paths explicitly call applySettingsToForm() after their
+ * IPC completes, which is the correct point for a full visual reset.
+ * Here we only refresh the coach toggles (drives the drawer styling)
+ * and re-render any open drawer that reads them.
+ */
+window.gemini.onSettingsChanged?.((payload) => {
+  if (!payload || typeof payload !== 'object') return;
+  settingsCache = payload;
+  applyCoachToForm(payload?.coach);
+  // V10 hide-AEC-badge applies immediately — settings:changed
+  // broadcasts on every save / reset / import, so the badge visibility
+  // tracks the persisted preference even when the change came from a
+  // path we didn't fire ourselves (e.g. a different window-instance
+  // edit in a future multi-window build, or a wholesale import).
+  applyAecBadgeVisibility(payload?.audio);
+  // Coach toggle flip mid-call also affects the pinned card's
+  // asked-flip styling (gated on trackQuestionState). Repaint so a
+  // toggle change immediately neutralises or re-greens the card.
+  renderCoachSuggestion();
+  if (state.activePillarId === 'logged_questions') {
+    renderRailOverlay();
+  }
+});
+
+window.gemini.onCoachTickStart?.(() => {
+  state.coachThinking = true;
+  renderCoachThinking();
+});
+
+window.gemini.onCoachTickEnd?.(() => {
+  state.coachThinking = false;
+  renderCoachThinking();
+});
+
+/**
+ * Connection-status broadcast subscriber. Fired by main on every
+ * lifecycle transition for either upstream transport — see
+ * setConnectionStatus / broadcastConnectionStatus in src/main.js.
+ *
+ * Payload shape: { deepgram, geminiLive } where each value is one of
+ * the documented enums (see the preload bridge doc-block for the
+ * full list). We mirror the snapshot wholesale onto state.connection
+ * and re-render the pill — cheap because the render is a few DOM
+ * attribute writes plus a label swap.
+ *
+ * Safely subscribed via the optional-chaining pattern so an older
+ * preload bridge without onConnectionStatus doesn't throw.
+ */
+window.gemini.onConnectionStatus?.((payload) => {
+  if (!payload || typeof payload !== 'object') return;
+  if (typeof payload.deepgram === 'string') state.connection.deepgram = payload.deepgram;
+  if (typeof payload.geminiLive === 'string') state.connection.geminiLive = payload.geminiLive;
+  renderConnectionStatus();
+});
+
+/**
+ * E2: decouple gemini:closed from full call teardown.
+ *
+ * Before: any Gemini Live close (including the silence-induced
+ * timeouts that hit ~36 minutes into long calls) called
+ * stopCapture({ keepError: true }) unconditionally — which ended
+ * the call even though Deepgram was still streaming the transcript.
+ * That's the 36-minute symptom in the test-call notes.
+ *
+ * After: the close is treated as a soft-degrade when Deepgram is
+ * healthy (the rest of the call continues; flag detection is paused
+ * until reconnect lands or gives up). Only when BOTH transports are
+ * down do we treat the close as fatal and surface the "Connection
+ * lost" error.
+ *
+ * The connection pill in the header (renderConnectionStatus) reflects
+ * the degraded state, so the rep sees an amber/red pill rather than a
+ * silent loss of flags.
+ */
+window.gemini.onClosed(() => {
+  // Soft-degrade case: Deepgram still streaming, so the call's
+  // canonical transcript path is unaffected. Mark Gemini Live as
+  // 'closed' (Gemini-specific soft-degrade state) and let the
+  // reconnect logic in main do its thing — main will broadcast
+  // 'reconnecting' or 'connected' (or eventually 'down') via the
+  // connection:status IPC.
+  if (state.connection.deepgram === 'connected') {
+    state.connection.geminiLive = 'closed';
+    renderConnectionStatus();
+    return;
+  }
+  // Both transports are down (or Deepgram was never up). Surface the
+  // "Connection lost" error and tear the call down so the rep can
+  // restart. This preserves the legacy behaviour for the genuine
+  // both-sides-down case.
+  if (state.status === 'listening' || state.status === 'starting') {
+    showConnectionError('Connection lost');
+    stopCapture({ keepError: true });
+  }
+});
+
+window.gemini.onSummaryReady?.((payload) => {
+  console.log('[summary] ready');
+  renderSummaryModal(payload);
+  showSummaryModal();
+});
+
+/* ── Coach mode + ask buttons (v2.5 redesign) ─────────────────────── */
+
+/**
+ * Apply the active coach mode to (a) the toggle UI, (b) localStorage,
+ * and (c) main (so the pause detector lights up / dims live). Called
+ * once at startup with the persisted value and again whenever the user
+ * flips the toggle.
+ *
+ * Persistence happens here rather than at the click handler so a
+ * programmatic mode change (e.g. future "respect system focus" hook)
+ * goes through the same single source of truth.
+ */
+function applyCoachMode(mode, { persist = true, notifyMain = true } = {}) {
+  if (!VALID_COACH_MODES.has(mode)) return;
+  state.coachMode = mode;
+  if (persist) persistCoachMode(mode);
+  // Toggle UI reflects the new mode regardless of where the change
+  // came from (click, programmatic, restoration).
+  for (const btn of coachModeBtnEls) {
+    const isActive = btn.dataset.mode === mode;
+    btn.dataset.active = String(isActive);
+    btn.setAttribute('aria-pressed', String(isActive));
+  }
+  if (notifyMain) {
+    // Fire-and-forget; main is tolerant of receiving the same mode
+    // back-to-back (it just stores the value).
+    window.gemini.setCoachMode?.(mode);
+  }
+}
+
+for (const btn of coachModeBtnEls) {
+  btn.addEventListener('click', () => {
+    const mode = btn.dataset.mode;
+    if (mode === state.coachMode) return;
+    applyCoachMode(mode);
+  });
+}
+
+/**
+ * Wire up the transcript-footer ask buttons. Each fires
+ * `window.gemini.askSuggestion(kind)` which lands as a `coach:ask-suggest`
+ * IPC in main; main fans it through to `Coach.requestSuggestion({ kind })`
+ * which queues a one-shot suggestion opportunity for the next tick.
+ *
+ * Recap is on a separate IPC channel (`coach:ask-recap`) because its
+ * payload is empty — recap is always freeform (item_id =
+ * 'freeform.recap'). Same UX otherwise: pulse the button on click and
+ * the suggestion arrives async via `coach:suggestion`.
+ *
+ * Clicking while a suggestion is already pinned is fine — the coach
+ * skips the current pin and queues a new request with the new kind
+ * (per v2.5 spec: "clicking effectively skips + re-asks with the new
+ * kind").
+ */
+for (const btn of askBtnEls) {
+  btn.addEventListener('click', () => {
+    const kind = btn.dataset.kind;
+    if (kind !== 'next' && kind !== 'deeper' && kind !== 'pivot' && kind !== 'recap') return;
+    // Reaching for any of the primary ask buttons cancels an active
+    // cover-queue — the seller is steering somewhere else, so we
+    // silently drop the cycle (no completion banner). Per the v2.5
+    // queue spec: "user can cancel the queue at any time".
+    if (state.coverQueue) clearCoverQueue();
+    // Cheap visual ack — flash the button so the rep sees that their
+    // click registered even if the coach takes a tick to respond.
+    btn.dataset.pulsing = 'true';
+    setTimeout(() => { btn.dataset.pulsing = 'false'; }, 160);
+    if (kind === 'recap') {
+      // Surface a "Recap in progress…" pill so the rep knows the
+      // click registered and the coach is working — even though D7
+      // priority-bypass eliminates queue latency, the provider
+      // roundtrip itself can still be a noticeable wait.
+      showRecapInProgressPill();
+      window.gemini.askRecap?.();
+    } else {
+      window.gemini.askSuggestion?.(kind);
+    }
+  });
+}
+
+/* ── "Recap in progress…" pill (D8) ─────────────────────────────────
+ *
+ * Lives as a child of the Recap button (see the data-kind='recap'
+ * status span in index.html). The pill makes the residual provider-
+ * roundtrip latency visible after D7's priority-bypass eliminates the
+ * in-flight queue wait — so a slow tick reads as "still working" not
+ * "did my click register?".
+ *
+ * Lifecycle:
+ *   - showRecapInProgressPill()       — fired from the Recap click
+ *                                       handler. Reveals the pill and
+ *                                       arms a 15s safety timer.
+ *   - onCoachSuggestion(kind=='recap') — clears the pill the moment
+ *                                       the recap result lands.
+ *   - safety timer (15s)              — clears the pill if the
+ *                                       recap never arrives (network
+ *                                       failure, model error, …) so
+ *                                       it doesn't stick forever.
+ *
+ * Only one in-flight recap at a time — successive clicks reset the
+ * timer rather than stack pills.
+ */
+const RECAP_PILL_SAFETY_MS = 15_000;
+let _recapPillTimer = null;
+function showRecapInProgressPill() {
+  const recapBtn = askBtnEls.find((b) => b.dataset.kind === 'recap');
+  if (!recapBtn) return;
+  const pill = recapBtn.querySelector('.ask-btn__status[data-kind="recap"]');
+  if (!(pill instanceof HTMLElement)) return;
+  pill.textContent = 'Recap in progress…';
+  pill.hidden = false;
+  if (_recapPillTimer) clearTimeout(_recapPillTimer);
+  _recapPillTimer = setTimeout(() => {
+    _recapPillTimer = null;
+    hideRecapInProgressPill();
+  }, RECAP_PILL_SAFETY_MS);
+}
+
+function hideRecapInProgressPill() {
+  if (_recapPillTimer) {
+    clearTimeout(_recapPillTimer);
+    _recapPillTimer = null;
+  }
+  const recapBtn = askBtnEls.find((b) => b.dataset.kind === 'recap');
+  if (!recapBtn) return;
+  const pill = recapBtn.querySelector('.ask-btn__status[data-kind="recap"]');
+  if (!(pill instanceof HTMLElement)) return;
+  pill.hidden = true;
+  pill.textContent = '';
+}
+
+/* ── Settings modal ────────────────────────────────────────────────
+ *
+ * Scope: this scaffold is the foundation a number of upcoming
+ * features depend on (provider abstraction, appearance / theming,
+ * behaviour toggles). It's intentionally a SHELL — only the Setup
+ * tab is interactive; Appearance is a placeholder section that
+ * future work will populate.
+ *
+ * Data flow:
+ *   1. On first open, call window.gemini.settings.load(), which IPC's
+ *      into main → src/settings.js → reads the JSON file at
+ *      userData/settings.json (or seeds defaults).
+ *   2. The form is hydrated from the returned object once on first
+ *      open (cached afterwards so we don't re-hit the IPC on every
+ *      gear click).
+ *   3. Save click gathers the form values into a partial and pushes
+ *      it via window.gemini.settings.save(partial). The handler in
+ *      main deep-merges into the cache, writes the file, and echoes
+ *      back the full updated object so we can re-hydrate.
+ *
+ * Changes apply on the NEXT session — see the comment on
+ * registerIpcHandlers('settings:save', …) in src/main.js. Specifically:
+ *   - The Coach instance reads its `model` at construction time
+ *     (gemini:start handler).
+ *   - generateSummary() reads its `model` at the gemini:stop call.
+ *   - getApiKey() runs at each session start.
+ * Saving mid-call therefore takes effect on the next Start, not on
+ * the in-flight session. That's deliberate.
+ *
+ * Extension points:
+ *   - To add a new tab, add a <button class="settings-modal__tab"
+ *     data-tab="…"> in index.html alongside a matching
+ *     <section data-tab-content="…">. The tab-switch logic picks
+ *     them up via querySelectorAll().
+ *   - To add a new form field, add it to the Setup tab's section,
+ *     add a DOM ref above, and extend applySettingsToForm() +
+ *     saveSettingsFromForm() with the field.
+ */
+
+/** Cached copy of the most recently loaded settings object. Populated
+ *  on first open and refreshed by every save (the IPC handler echoes
+ *  the full post-merge shape back). `null` means the form hasn't
+ *  been hydrated yet — the renderer lazy-loads on first modal open
+ *  to avoid an unnecessary IPC roundtrip at boot.
+ *
+ *  The cached shape also carries `_envAvailability` from the main
+ *  side so the renderer can render the "Using env variable" status
+ *  badge without a second roundtrip. See src/main.js' settings:load
+ *  handler. */
+let settingsCache = null;
+
+/** Per-provider debounce timer + last-flushed-value tracker so we
+ *  don't fire a save roundtrip for every keystroke. The flush fires
+ *  on idle (after IDLE_SAVE_MS without further typing) or on blur. */
+const SETTINGS_IDLE_SAVE_MS = 1000;
+const settingsKeyDebounceTimers = Object.create(null);
+const settingsKeyLastFlushed = Object.create(null);
+
+/** Per-card timers for hiding the Test result message after 3 s. */
+const settingsTestResultTimers = Object.create(null);
+
+/**
+ * Hydrate the entire Providers tab from a settings object. Tolerates
+ * missing keys — the storage layer always returns a fully-populated
+ * v2 shape, but defending against partial / migrating shapes is
+ * cheap. Driven by both initial open and post-save echo refresh.
+ *
+ * Side effects:
+ *   - segmented control reflects defaultProvider
+ *   - each card's key input reflects providers[id].apiKey
+ *   - each card's model select reflects providers[id].defaultModel
+ *   - each card's status badge + Test button label reflect the
+ *     combined Settings-key / env-var availability
+ */
+function applySettingsToForm(settings) {
+  if (!settings) return;
+  const defaultProvider = settings.defaultProvider || 'gemini';
+  setDefaultProviderSelection(defaultProvider);
+
+  const envAvail = (settings._envAvailability && typeof settings._envAvailability === 'object')
+    ? settings._envAvailability
+    : {};
+
+  for (const card of settingsProviderCardEls) {
+    const provider = card.dataset.provider;
+    if (!provider) continue;
+    const config = settings.providers?.[provider] || {};
+    const keyInput = card.querySelector(`[data-provider-key="${provider}"]`);
+    if (keyInput instanceof HTMLInputElement) {
+      const value = typeof config.apiKey === 'string' ? config.apiKey : '';
+      keyInput.value = value;
+      // Reset password-mode whenever we re-hydrate — switching between
+      // settings shouldn't leak a previously-revealed key.
+      keyInput.type = 'password';
+      const eyeBtn = card.querySelector(`[data-eye-for="${provider}"]`);
+      if (eyeBtn instanceof HTMLElement) {
+        eyeBtn.setAttribute('aria-pressed', 'false');
+        eyeBtn.setAttribute('aria-label', 'Show key');
+      }
+      // Track the most recent canonical value so the debounced save
+      // can short-circuit on noise (e.g. focus/blur with no edit).
+      settingsKeyLastFlushed[provider] = value;
+    }
+    const modelSelect = card.querySelector(`[data-provider-model="${provider}"]`);
+    if (modelSelect instanceof HTMLSelectElement) {
+      const wanted = typeof config.defaultModel === 'string' && config.defaultModel.length > 0
+        ? config.defaultModel
+        : modelSelect.options[0]?.value || '';
+      // If the stored value isn't in the option list, prepend an entry
+      // so the select still shows the user's choice instead of
+      // silently coercing to option[0]. Future re-saves persist this.
+      if (wanted && !Array.from(modelSelect.options).some((o) => o.value === wanted)) {
+        const opt = document.createElement('option');
+        opt.value = wanted;
+        opt.textContent = wanted;
+        modelSelect.appendChild(opt);
+      }
+      modelSelect.value = wanted;
+    }
+    refreshProviderStatusBadge(card, settings, envAvail);
+  }
+
+  // Appearance tab — speaker-label tag colours. Form sync + live
+  // preview both happen here so the first modal open re-paints the
+  // pickers correctly and the transcript labels also re-paint if
+  // the user's persisted colours differ from the :root defaults.
+  const tag = settings.appearance?.tagColors || {};
+  const youVal = typeof tag.you === 'string' && tag.you ? tag.you : DEFAULT_TAG_YOU;
+  const otherVal = typeof tag.other === 'string' && tag.other ? tag.other : DEFAULT_TAG_OTHER;
+  if (appearanceColorYouEl instanceof HTMLInputElement) appearanceColorYouEl.value = youVal;
+  if (appearanceColorOtherEl instanceof HTMLInputElement) appearanceColorOtherEl.value = otherVal;
+  applyTagColors({ you: youVal, other: otherVal });
+
+  applyCoachToForm(settings.coach);
+  applyAudioToForm(settings.audio);
+}
+
+/**
+ * Hydrate the Coach tab toggles from a settings object. Mirrors
+ * the value into `state.coach` so the drawer rendering can read
+ * it without an extra lookup, and refreshes the dependent-disabled
+ * state on the auto-reformulate row.
+ *
+ * Renamed from `applyAdvancedToForm` in schema v3. The CSS class
+ * `.advanced-toggle` is intentionally NOT renamed — it's a UI
+ * primitive (a card-shaped checkbox row) and not tied to the tab.
+ *
+ * Tolerates a missing `coach` field (older settings file or a
+ * race during boot) — the deep-merge default fill on the main side
+ * should always provide one, but defending here keeps the renderer
+ * from crashing if it doesn't.
+ */
+function applyCoachToForm(coach) {
+  const next = {
+    trackQuestionState: Boolean(coach?.trackQuestionState),
+    autoReformulate: Boolean(coach?.autoReformulate),
+  };
+  state.coach = next;
+  if (settingsCoachTrackEl instanceof HTMLInputElement) {
+    settingsCoachTrackEl.checked = next.trackQuestionState;
+  }
+  if (settingsCoachAutoReformulateEl instanceof HTMLInputElement) {
+    settingsCoachAutoReformulateEl.checked = next.autoReformulate;
+    settingsCoachAutoReformulateEl.disabled = !next.trackQuestionState;
+    // Mirror the disabled state on the card wrapper so CSS can dim
+    // the whole row, not just the input. Falls back gracefully if
+    // the markup doesn't have the wrapper.
+    const wrap = settingsCoachAutoReformulateEl.closest('.advanced-toggle');
+    if (wrap instanceof HTMLElement) {
+      wrap.dataset.disabled = String(!next.trackQuestionState);
+    }
+  }
+}
+
+/**
+ * Hydrate the Audio tab controls from a settings object. Defaults
+ * are applied at the field level so a settings file missing
+ * `audio.*` (or any individual key) lights up the boot-correct UI:
+ *   - dropdowns: persisted ID if present, otherwise the '' default
+ *     option ("Default (OS / first screen)")
+ *   - constraint toggles: default ON
+ *   - Deepgram select: 'nova-3' default
+ *   - hide-AEC-badge: default OFF (badge visible)
+ *
+ * The badge visibility is applied synchronously here too — it's the
+ * one immediate-apply control on the tab, so hydration + apply share
+ * the same code path (no IPC roundtrip).
+ *
+ * Device dropdowns are NOT populated here — that's the job of
+ * `populateMicDevices()` / `populateSystemAudioSources()`, which run
+ * on first modal open + every Refresh-button click. This helper just
+ * ensures the persisted `<option>` is selected (or, if it isn't yet
+ * an option, gets injected so the user's choice still appears).
+ *
+ * Tolerates a missing / partial `audio` block — every field has a
+ * default and an instanceof guard, so a malformed payload doesn't
+ * crash the form.
+ */
+function applyAudioToForm(audio) {
+  const a = audio || {};
+
+  hydrateAudioSelectValue(audioMicSelectEl, a.micDeviceId || '');
+  hydrateAudioSelectValue(audioSysSourceSelectEl, a.systemAudioSourceId || '');
+
+  if (audioAecEl instanceof HTMLInputElement) {
+    audioAecEl.checked = a.aec !== false;
+  }
+  if (audioNoiseSuppressionEl instanceof HTMLInputElement) {
+    audioNoiseSuppressionEl.checked = a.noiseSuppression !== false;
+  }
+  if (audioAutoGainControlEl instanceof HTMLInputElement) {
+    audioAutoGainControlEl.checked = a.autoGainControl !== false;
+  }
+
+  if (audioDeepgramModelEl instanceof HTMLSelectElement) {
+    const wanted = typeof a.deepgramModel === 'string' && a.deepgramModel.length > 0
+      ? a.deepgramModel
+      : 'nova-3';
+    // If a user imports a settings file with an unrecognised model id
+    // (rolled-out Deepgram tier, typo, etc.), surface it in the
+    // dropdown rather than silently coercing back to nova-3. The
+    // option label is the raw id since we don't know the model's
+    // display name. Future imports of the same id won't double-add
+    // because Array.from().some() guards against duplicates.
+    if (wanted && !Array.from(audioDeepgramModelEl.options).some((o) => o.value === wanted)) {
+      const opt = document.createElement('option');
+      opt.value = wanted;
+      opt.textContent = wanted;
+      audioDeepgramModelEl.appendChild(opt);
+    }
+    audioDeepgramModelEl.value = wanted;
+  }
+
+  if (audioHideAecBadgeEl instanceof HTMLInputElement) {
+    audioHideAecBadgeEl.checked = a.hideAecBadge === true;
+  }
+
+  applyAecBadgeVisibility(a);
+}
+
+/**
+ * Apply the persisted system-audio / mic device id to a select.
+ *
+ * If the persisted id isn't in the option list yet (e.g. the device
+ * dropdown hasn't been populated yet, or the device is currently
+ * unplugged), inject a placeholder `<option>` so the user's choice
+ * still renders in the closed state. The placeholder text reflects
+ * that the device may not be currently available — when
+ * `populateMicDevices()` next runs and finds a live match, that
+ * placeholder is removed and the real label takes over.
+ *
+ * Returning early when the wanted id is '' is intentional — the
+ * default ('') option is always the first `<option>` and any
+ * `select.value = ''` against an empty-value option works without
+ * extra plumbing.
+ */
+function hydrateAudioSelectValue(select, wantedId) {
+  if (!(select instanceof HTMLSelectElement)) return;
+  if (!wantedId) {
+    select.value = '';
+    return;
+  }
+  const exists = Array.from(select.options).some((o) => o.value === wantedId);
+  if (!exists) {
+    const opt = document.createElement('option');
+    opt.value = wantedId;
+    opt.textContent = '(saved — refresh to verify)';
+    opt.dataset.placeholder = 'true';
+    select.appendChild(opt);
+  }
+  select.value = wantedId;
+}
+
+/**
+ * Apply V10 — show / hide the AEC badge in the header. Pure DOM
+ * toggle. Called from:
+ *   - applySettingsToForm() during boot + after Reset / Import
+ *     (drives the badge from the persisted preference).
+ *   - The hide-AEC-badge checkbox's change handler (immediate-apply,
+ *     no waiting for the settings:changed broadcast).
+ *   - The onSettingsChanged subscriber so live-broadcast paths
+ *     (settings:save / :reset / :import from anywhere) also update.
+ *
+ * Defends against the badge element being absent so a future
+ * refactor that removes the badge entirely doesn't crash this path.
+ */
+function applyAecBadgeVisibility(audio) {
+  if (!(aecBadgeEl instanceof HTMLElement)) return;
+  aecBadgeEl.hidden = audio?.hideAecBadge === true;
+}
+
+/**
+ * Push speaker-label tag colours onto :root as inline CSS variables.
+ * Any unspecified slot is left untouched so a single-channel update
+ * (just `you` or just `other`) only repaints the one prefix. Called
+ * from the initial-render path, the colour pickers' `input` events,
+ * and the reset button.
+ */
+function applyTagColors({ you, other }) {
+  const root = document.documentElement;
+  if (you) root.style.setProperty('--speaker-color-you', you);
+  if (other) root.style.setProperty('--speaker-color-other', other);
+}
+
+/** Update the .provider-card__status badge + Test button label for a
+ *  single card based on the current settings + env-var snapshot. */
+function refreshProviderStatusBadge(card, settings, envAvail) {
+  const provider = card.dataset.provider;
+  if (!provider) return;
+  const apiKey = settings?.providers?.[provider]?.apiKey;
+  const hasKey = typeof apiKey === 'string' && apiKey.trim().length > 0;
+  const hasEnv = Boolean(envAvail?.[provider]);
+
+  let status = 'unconfigured';
+  let label = 'Not configured';
+  if (hasKey) {
+    status = 'connected';
+    label = 'Connected';
+  } else if (hasEnv) {
+    status = 'env';
+    label = 'Using env variable';
+  }
+
+  const badge = card.querySelector('.provider-card__status');
+  if (badge instanceof HTMLElement) {
+    badge.dataset.status = status;
+    badge.textContent = label;
+  }
+
+  // Test button reads "Test" once a key is in place (Settings or env),
+  // "Connect" otherwise — the user is being told "you can probe this
+  // connection right now" vs "you need to wire one up first".
+  const testBtn = card.querySelector('.provider-card__test');
+  if (testBtn instanceof HTMLElement) {
+    testBtn.textContent = (hasKey || hasEnv) ? 'Test' : 'Connect';
+  }
+}
+
+/** Sync the segmented control's `data-active` + aria-pressed flags. */
+function setDefaultProviderSelection(providerId) {
+  for (const btn of settingsDefaultProviderBtnEls) {
+    const isActive = btn.dataset.provider === providerId;
+    btn.dataset.active = String(isActive);
+    btn.setAttribute('aria-pressed', String(isActive));
+  }
+}
+
+/**
+ * Lazy hydration: only call settings.load() once. The promise is
+ * awaited inside openSettingsModal() so the form is always populated
+ * before showModal() fires.
+ *
+ * Errors are logged but never thrown — a bad IPC roundtrip should
+ * still open the dialog so the user can save fresh values.
+ */
+async function ensureSettingsLoaded() {
+  if (settingsCache) return settingsCache;
+  try {
+    const fresh = await window.gemini.settings?.load?.();
+    if (fresh && typeof fresh === 'object') {
+      settingsCache = fresh;
+      applySettingsToForm(fresh);
+      return fresh;
+    }
+  } catch (err) {
+    console.warn('[settings] load failed:', err?.message || err);
+  }
+  return null;
+}
+
+/** Select a tab inside the settings modal by id. After Phase 1 of
+ *  the Settings expansion the valid ids are:
+ *    'providers' | 'audio' | 'appearance' | 'coach' | 'general' | 'help'
+ *  Toggles `aria-selected` on the tab buttons and `hidden` on the
+ *  content sections. The function is markup-driven — it queries the
+ *  DOM rather than enforcing the enum here, so future phases can add
+ *  more tabs without editing this code. */
+function selectSettingsTab(tabId) {
+  let matched = false;
+  for (const btn of settingsTabEls) {
+    const isActive = btn.dataset.tab === tabId;
+    btn.setAttribute('aria-selected', String(isActive));
+    if (isActive) matched = true;
+  }
+  if (!matched) return;
+  for (const section of settingsTabContentEls) {
+    const isActive = section.dataset.tabContent === tabId;
+    section.hidden = !isActive;
+  }
+}
+
+async function openSettingsModal() {
+  if (!settingsModalEl) return;
+  await ensureSettingsLoaded();
+  // Audio tab device pickers: hydrate the dropdown contents on first
+  // open. Subsequent opens reuse the populated lists; the Refresh
+  // buttons inside the tab let the user force a re-enumerate without
+  // closing the modal. populateAudioPickers also re-applies the
+  // persisted selection AFTER population, so a freshly-discovered
+  // device id matches up with the saved settings.
+  if (!audioPickersPopulated) {
+    populateAudioPickers().then(() => {
+      // After population the persisted ids should now match real
+      // <option> entries; re-run the form hydrator so any placeholder
+      // "(saved — refresh to verify)" options are replaced with the
+      // real device labels.
+      if (settingsCache?.audio) applyAudioToForm(settingsCache.audio);
+    });
+  }
+  // Apply-hint visibility: paint once on open so a mid-call settings
+  // visit lights up the notice even if no setStatus() transition has
+  // fired between the last hide and the open.
+  refreshAudioApplyHint();
+  selectSettingsTab('providers');
+  try {
+    settingsModalEl.showModal();
+  } catch (err) {
+    // showModal() throws if the dialog is already open. Treat as no-op.
+    console.warn('[settings] showModal failed:', err?.message || err);
+  }
+}
+
+function closeSettingsModal() {
+  if (!settingsModalEl) return;
+  // Force-flush any pending debounced key edits so closing the dialog
+  // mid-typing doesn't drop the user's input. Same protection for the
+  // appearance debounce — colour pickers can fire `input` right before
+  // the user hits Esc.
+  for (const provider of PROVIDER_IDS) flushPendingKeySave(provider);
+  flushAppearanceSave();
+  try { settingsModalEl.close(); } catch { /* not open */ }
+}
+
+/**
+ * Push a partial settings object via the IPC bridge. Refreshes the
+ * cache + form from the echo so any normalisation on the main side
+ * is visible immediately. Best-effort: a failed IPC roundtrip is
+ * logged but doesn't roll the form back — the form IS the user's
+ * intent.
+ */
+async function pushSettingsPartial(partial) {
+  try {
+    const fresh = await window.gemini.settings?.save?.(partial);
+    if (fresh && typeof fresh === 'object') {
+      settingsCache = fresh;
+      // Don't re-render the whole form here — the user may still be
+      // typing in another card. We only need to update the status
+      // badge / test-button label for the provider(s) we just saved.
+      const envAvail = (fresh._envAvailability && typeof fresh._envAvailability === 'object')
+        ? fresh._envAvailability
+        : {};
+      for (const card of settingsProviderCardEls) {
+        refreshProviderStatusBadge(card, fresh, envAvail);
+      }
+      // Sync the segmented control as a belt-and-braces — defaulting
+      // back to whatever main returned (which equals what we sent).
+      if (typeof fresh.defaultProvider === 'string') {
+        setDefaultProviderSelection(fresh.defaultProvider);
+      }
+    }
+  } catch (err) {
+    console.warn('[settings] save failed:', err?.message || err);
+  }
+}
+
+/** Save just the default-provider choice — used by the segmented
+ *  control. Debounced slightly so a rapid click sequence only fires
+ *  the last selection. */
+let defaultProviderSaveTimer = null;
+function queueDefaultProviderSave(providerId) {
+  clearTimeout(defaultProviderSaveTimer);
+  defaultProviderSaveTimer = setTimeout(() => {
+    pushSettingsPartial({ defaultProvider: providerId });
+  }, 250);
+}
+
+/** Save just the per-provider API key. Called by the input's debounced
+ *  save path; updates the local last-flushed tracker so re-blurring
+ *  with the same value doesn't fire another roundtrip. */
+function pushProviderKey(provider, value) {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (settingsKeyLastFlushed[provider] === trimmed) return;
+  settingsKeyLastFlushed[provider] = trimmed;
+  pushSettingsPartial({
+    providers: { [provider]: { apiKey: trimmed } },
+  });
+}
+
+/** Flush any pending debounced key save immediately. Called on blur
+ *  and on modal close. */
+function flushPendingKeySave(provider) {
+  const timer = settingsKeyDebounceTimers[provider];
+  if (!timer) return;
+  clearTimeout(timer);
+  settingsKeyDebounceTimers[provider] = null;
+  const card = settingsProviderCardEls.find((c) => c.dataset.provider === provider);
+  const input = card?.querySelector(`[data-provider-key="${provider}"]`);
+  if (input instanceof HTMLInputElement) {
+    pushProviderKey(provider, input.value);
+  }
+}
+
+/** Save just the per-provider default model — called on `change` of
+ *  the select, which fires on commit (not on every arrow keypress) so
+ *  no debounce needed. */
+function pushProviderModel(provider, model) {
+  pushSettingsPartial({
+    providers: { [provider]: { defaultModel: model } },
+  });
+}
+
+/** Run a connectivity test against a provider. Renders the result
+ *  inline next to the Test button for 3 s. Disables the button during
+ *  the in-flight roundtrip so a quick double-click doesn't fan out. */
+async function runProviderTest(provider) {
+  const card = settingsProviderCardEls.find((c) => c.dataset.provider === provider);
+  if (!card) return;
+  // Flush any pending key save first so the test runs against the
+  // value the user just typed, not the previous flushed value.
+  flushPendingKeySave(provider);
+
+  const testBtn = card.querySelector('.provider-card__test');
+  const resultEl = card.querySelector(`[data-test-result-for="${provider}"]`);
+  if (testBtn instanceof HTMLButtonElement) testBtn.disabled = true;
+  if (resultEl instanceof HTMLElement) {
+    resultEl.hidden = false;
+    delete resultEl.dataset.result;
+    resultEl.textContent = 'Testing…';
+  }
+
+  let result;
+  try {
+    result = await window.gemini.settings?.testProvider?.(provider);
+  } catch (err) {
+    result = { ok: false, message: err?.message || String(err) };
+  }
+
+  if (resultEl instanceof HTMLElement) {
+    if (result?.ok) {
+      resultEl.dataset.result = 'ok';
+      resultEl.textContent = 'Connected';
+    } else {
+      resultEl.dataset.result = 'fail';
+      resultEl.textContent = result?.message || 'Failed';
+    }
+    clearTimeout(settingsTestResultTimers[provider]);
+    settingsTestResultTimers[provider] = setTimeout(() => {
+      resultEl.hidden = true;
+      delete resultEl.dataset.result;
+    }, 3000);
+  }
+  if (testBtn instanceof HTMLButtonElement) testBtn.disabled = false;
+}
+
+/* ── Generic settings autosave helpers (Phase 1 plumbing) ────────────
+ *
+ * These are intentionally additive — the existing bespoke wiring
+ * (provider key debounce, default-provider toggle, appearance pickers,
+ * coach toggles) stays exactly as it was. Phases 2-6 each have several
+ * new controls (sliders, dropdowns, file pickers, custom text areas)
+ * that don't fit cleanly into the existing one-off handlers. Each new
+ * control just needs:
+ *
+ *   attachDebouncedFieldSave(inputEl, 'coach.tickMs');
+ *   attachImmediateFieldSave(selectEl, 'audio.deepgramModel');
+ *
+ * and the persistence + IPC roundtrip is taken care of.
+ *
+ * The dotted field path mirrors the settings schema (`coach.tickMs`,
+ * `audio.micDeviceId`, …). buildSettingsPartial inflates it into the
+ * nested partial that `pushSettingsPartial` already knows how to
+ * deep-merge on the main side. */
+
+/**
+ * Inflate a dotted field path into a nested partial object suitable
+ * for `pushSettingsPartial`. `buildSettingsPartial('coach.tickMs', 1500)`
+ * returns `{ coach: { tickMs: 1500 } }`. Returns null for empty/invalid
+ * paths.
+ */
+function buildSettingsPartial(fieldPath, value) {
+  if (typeof fieldPath !== 'string' || !fieldPath) return null;
+  const segments = fieldPath.split('.').filter(Boolean);
+  if (segments.length === 0) return null;
+  const root = {};
+  let cursor = root;
+  for (let i = 0; i < segments.length - 1; i++) {
+    cursor[segments[i]] = {};
+    cursor = cursor[segments[i]];
+  }
+  cursor[segments[segments.length - 1]] = value;
+  return root;
+}
+
+/**
+ * Read a value from a form input. Default behaviour:
+ *   - checkbox / radio  → input.checked (boolean)
+ *   - number / range    → Number(input.value), or null if not finite
+ *   - everything else   → input.value (string)
+ *
+ * Callers that need a different decode (e.g. a comma-separated list)
+ * pass a `getValue` override to the autosave helper.
+ */
+function readInputValue(input) {
+  if (!(input instanceof HTMLElement)) return null;
+  const type = input.getAttribute('type');
+  if (type === 'checkbox' || type === 'radio') {
+    return /** @type {HTMLInputElement} */ (input).checked === true;
+  }
+  if (type === 'number' || type === 'range') {
+    const n = Number(/** @type {HTMLInputElement} */ (input).value);
+    return Number.isFinite(n) ? n : null;
+  }
+  const v = /** @type {HTMLInputElement} */ (input).value;
+  return typeof v === 'string' ? v : null;
+}
+
+/**
+ * Attach an idle-debounced auto-save to a form control. The save
+ * fires when the user stops interacting for `idleMs`, or immediately
+ * on blur so closing the modal mid-typing still flushes.
+ *
+ * Options:
+ *   idleMs       (1000)        — debounce window
+ *   getValue     (readInputValue) — value extractor
+ *   eventName    ('input')     — DOM event to listen for
+ *   flushOnBlur  (true)        — also flush on blur
+ *
+ * Returns `{ flush }` so the caller can chain it (e.g. modal-close
+ * flush list, similar to flushPendingKeySave).
+ */
+function attachDebouncedFieldSave(input, fieldPath, options = {}) {
+  if (!(input instanceof HTMLElement)) return { flush: () => {} };
+  const {
+    idleMs = 1000,
+    getValue = readInputValue,
+    eventName = 'input',
+    flushOnBlur = true,
+  } = options;
+
+  let timer = null;
+  let pending = null;
+  let hasPending = false;
+
+  function flush() {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (!hasPending) return;
+    const partial = buildSettingsPartial(fieldPath, pending);
+    hasPending = false;
+    pending = null;
+    if (partial) pushSettingsPartial(partial);
+  }
+
+  input.addEventListener(eventName, () => {
+    pending = getValue(input);
+    hasPending = true;
+    if (idleMs <= 0) {
+      flush();
+      return;
+    }
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(flush, idleMs);
+  });
+
+  if (flushOnBlur) {
+    input.addEventListener('blur', flush);
+  }
+
+  return { flush };
+}
+
+/**
+ * Immediate-commit variant. Listens on `change` (which only fires on
+ * commit for selects / color pickers / checkboxes — unlike `input`
+ * which fires continuously) and saves on the same tick. Good for any
+ * control where the user's intent is "I've chosen, save now" rather
+ * than "I'm in the middle of typing".
+ */
+function attachImmediateFieldSave(input, fieldPath, options = {}) {
+  return attachDebouncedFieldSave(input, fieldPath, {
+    ...options,
+    idleMs: 0,
+    eventName: 'change',
+    flushOnBlur: false,
+  });
+}
+
+/**
+ * Open a native Open/Save dialog and return the selected path.
+ * Wraps the `dialog:open` / `dialog:save` IPC exposed via the
+ * preload bridge.
+ *
+ * Args:
+ *   kind         'open' (default) | 'save'
+ *   defaultName  suggested filename (Save only)
+ *   defaultPath  pre-populated path (Open / Save)
+ *   filters      [{ name, extensions: [...] }] for the dialog
+ *   properties   ['openFile' | 'openDirectory' | …] for Open dialogs
+ *
+ * Returns the selected absolute path string, or null if the user
+ * cancelled or the IPC isn't wired (defensive — phases that need this
+ * confirm via window.gemini.dialog before using it).
+ */
+async function pickPathFromDialog({
+  kind = 'open',
+  defaultName,
+  defaultPath,
+  filters,
+  properties,
+} = {}) {
+  const bridge = window.gemini?.dialog;
+  const fn = kind === 'save' ? bridge?.save : bridge?.open;
+  if (typeof fn !== 'function') {
+    console.warn('[settings] dialog bridge not available — caller should check first');
+    return null;
+  }
+  try {
+    const result = await fn({ defaultName, defaultPath, filters, properties });
+    if (!result || result.canceled || !result.filePath) return null;
+    return result.filePath;
+  } catch (err) {
+    console.warn('[settings] dialog pick failed:', err?.message || err);
+    return null;
+  }
+}
+
+/* ── Settings modal event wiring ──────────────────────────────────── */
+
+if (settingsButtonEl) {
+  settingsButtonEl.addEventListener('click', () => {
+    openSettingsModal();
+  });
+}
+
+if (settingsModalCloseEl) {
+  settingsModalCloseEl.addEventListener('click', closeSettingsModal);
+}
+
+// Belt-and-braces: native <dialog>.close() can fire from Esc too. Make
+// sure any pending key edits flush on that path as well, and tear down
+// any orphaned sub-dialogs (reset-confirm / import-preview) so they
+// don't reappear over a closed parent on next open.
+if (settingsModalEl) {
+  settingsModalEl.addEventListener('close', () => {
+    for (const provider of PROVIDER_IDS) flushPendingKeySave(provider);
+    flushAppearanceSave();
+    if (settingsResetConfirmEl instanceof HTMLDialogElement && settingsResetConfirmEl.open) {
+      try { settingsResetConfirmEl.close(); } catch { /* not open */ }
+    }
+    if (settingsImportPreviewEl instanceof HTMLDialogElement && settingsImportPreviewEl.open) {
+      pendingImportJson = null;
+      try { settingsImportPreviewEl.close(); } catch { /* not open */ }
+    }
+  });
+}
+
+// Clear stash on import preview's `close` event so any path (Cancel
+// button, Esc key, programmatic close) leaves no dangling state.
+if (settingsImportPreviewEl instanceof HTMLDialogElement) {
+  settingsImportPreviewEl.addEventListener('close', () => {
+    pendingImportJson = null;
+  });
+}
+
+for (const btn of settingsTabEls) {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    if (tab) selectSettingsTab(tab);
+  });
+}
+
+// Default-provider segmented control. Each click flips the active
+// pill + queues a debounced save. We keep the local highlight optimistic
+// so the UI feels instant even if the IPC roundtrip is in flight.
+for (const btn of settingsDefaultProviderBtnEls) {
+  btn.addEventListener('click', () => {
+    const provider = btn.dataset.provider;
+    if (!provider || !PROVIDER_IDS.includes(provider)) return;
+    setDefaultProviderSelection(provider);
+    queueDefaultProviderSave(provider);
+  });
+}
+
+// Per-card wiring: key input (debounced), eye toggle, Test button,
+// model select.
+for (const card of settingsProviderCardEls) {
+  const provider = card.dataset.provider;
+  if (!provider) continue;
+  const keyInput = card.querySelector(`[data-provider-key="${provider}"]`);
+  if (keyInput instanceof HTMLInputElement) {
+    keyInput.addEventListener('input', () => {
+      clearTimeout(settingsKeyDebounceTimers[provider]);
+      settingsKeyDebounceTimers[provider] = setTimeout(() => {
+        settingsKeyDebounceTimers[provider] = null;
+        pushProviderKey(provider, keyInput.value);
+      }, SETTINGS_IDLE_SAVE_MS);
+    });
+    keyInput.addEventListener('blur', () => {
+      flushPendingKeySave(provider);
+    });
+  }
+
+  const eyeBtn = card.querySelector(`[data-eye-for="${provider}"]`);
+  if (eyeBtn instanceof HTMLElement) {
+    eyeBtn.addEventListener('click', () => {
+      if (!(keyInput instanceof HTMLInputElement)) return;
+      const showing = keyInput.type === 'text';
+      keyInput.type = showing ? 'password' : 'text';
+      eyeBtn.setAttribute('aria-pressed', String(!showing));
+      eyeBtn.setAttribute('aria-label', !showing ? 'Hide key' : 'Show key');
+    });
+  }
+
+  const testBtn = card.querySelector('.provider-card__test');
+  if (testBtn instanceof HTMLElement) {
+    testBtn.addEventListener('click', () => {
+      runProviderTest(provider);
+    });
+  }
+
+  const modelSelect = card.querySelector(`[data-provider-model="${provider}"]`);
+  if (modelSelect instanceof HTMLSelectElement) {
+    modelSelect.addEventListener('change', () => {
+      pushProviderModel(provider, modelSelect.value);
+    });
+  }
+}
+
+/* ── Coach tab wiring ────────────────────────────────────────────────
+ *
+ * Two checkboxes. Both auto-save on change. The auto-reformulate row
+ * is dependent — when track-question-state is OFF, auto-reformulate is
+ * forced off and disabled, because there's no way to detect "asked
+ * vs unasked" without the upstream toggle.
+ *
+ * Local state mirror is updated synchronously before the IPC fires so
+ * the drawer re-renders with the new toggle reflected immediately,
+ * regardless of whether the IPC roundtrip lands later. The
+ * settings:changed broadcast (from main) is a belt-and-braces
+ * second-source — if anything ever modifies settings out-of-band, the
+ * subscriber will pull the fresh shape in. */
+function pushCoachPartial(partial) {
+  pushSettingsPartial({ coach: partial });
+}
+
+if (settingsCoachTrackEl instanceof HTMLInputElement) {
+  settingsCoachTrackEl.addEventListener('change', () => {
+    const next = settingsCoachTrackEl.checked;
+    state.coach = { ...state.coach, trackQuestionState: next };
+    // When tracking turns off, auto-reformulate becomes pointless;
+    // force it off too and update the dependent UI immediately.
+    if (!next) {
+      state.coach.autoReformulate = false;
+      if (settingsCoachAutoReformulateEl instanceof HTMLInputElement) {
+        settingsCoachAutoReformulateEl.checked = false;
+        settingsCoachAutoReformulateEl.disabled = true;
+        const wrap = settingsCoachAutoReformulateEl.closest('.advanced-toggle');
+        if (wrap instanceof HTMLElement) wrap.dataset.disabled = 'true';
+      }
+      pushCoachPartial({ trackQuestionState: false, autoReformulate: false });
+    } else {
+      if (settingsCoachAutoReformulateEl instanceof HTMLInputElement) {
+        settingsCoachAutoReformulateEl.disabled = false;
+        const wrap = settingsCoachAutoReformulateEl.closest('.advanced-toggle');
+        if (wrap instanceof HTMLElement) wrap.dataset.disabled = 'false';
+      }
+      pushCoachPartial({ trackQuestionState: true });
+    }
+    // Re-render the drawer if it's currently open on the logged
+    // pillar so the green-outline styling flips immediately.
+    if (state.activePillarId === 'logged_questions') {
+      renderRailOverlay();
+    }
+  });
+}
+
+if (settingsCoachAutoReformulateEl instanceof HTMLInputElement) {
+  settingsCoachAutoReformulateEl.addEventListener('change', () => {
+    // The disabled attribute prevents this firing when
+    // trackQuestionState is off, but defend anyway in case a future
+    // refactor unwires the disabled state.
+    if (!state.coach.trackQuestionState) {
+      settingsCoachAutoReformulateEl.checked = false;
+      return;
+    }
+    const next = settingsCoachAutoReformulateEl.checked;
+    state.coach = { ...state.coach, autoReformulate: next };
+    pushCoachPartial({ autoReformulate: next });
+  });
+}
+
+/* ── Audio tab wiring (Phase 2) ─────────────────────────────────────
+ *
+ * Seven controls; six save to disk (T1–T5, T14), one applies
+ * immediately (V10). All use the generic autosave helpers from the
+ * Phase 1 foundation — no bespoke debounce / IPC logic per control.
+ *
+ * Apply-policy notes:
+ *   - Capture / STT controls (T1–T5, T14) bake into getUserMedia /
+ *     getDisplayMedia / Deepgram WS at session-open time. Edits mid-
+ *     call don't hot-swap; the apply-hint panel calls this out.
+ *   - V10 (hideAecBadge) toggles the badge synchronously on save —
+ *     pure DOM mutation, no IPC roundtrip needed for the visual.
+ *
+ * Device-enumeration design:
+ *   - Mic devices come from navigator.mediaDevices.enumerateDevices()
+ *     in the renderer. Pre-permission-grant the device labels may be
+ *     empty strings; we surface the deviceId in that case so the
+ *     dropdown isn't blank.
+ *   - System-audio sources come from main via the system:list-audio-
+ *     sources IPC (desktopCapturer). macOS needs Screen Recording
+ *     permission for the list to populate.
+ *
+ * Populators run on:
+ *   - First settings modal open (via openSettingsModal → populate-
+ *     AudioPickers, gated by an "already populated this session"
+ *     flag so reopening the modal doesn't re-enumerate).
+ *   - Every Refresh-button click (forced repopulate).
+ *
+ * The Refresh button is the user's escape hatch when a device is
+ * unplugged / replugged mid-session — they don't need to restart
+ * the app for the dropdown to update. */
+
+const AUDIO_FIELDS = {
+  mic: 'audio.micDeviceId',
+  sysSource: 'audio.systemAudioSourceId',
+  aec: 'audio.aec',
+  ns: 'audio.noiseSuppression',
+  agc: 'audio.autoGainControl',
+  model: 'audio.deepgramModel',
+  hideAecBadge: 'audio.hideAecBadge',
+};
+
+attachImmediateFieldSave(audioMicSelectEl, AUDIO_FIELDS.mic);
+attachImmediateFieldSave(audioSysSourceSelectEl, AUDIO_FIELDS.sysSource);
+attachImmediateFieldSave(audioAecEl, AUDIO_FIELDS.aec);
+attachImmediateFieldSave(audioNoiseSuppressionEl, AUDIO_FIELDS.ns);
+attachImmediateFieldSave(audioAutoGainControlEl, AUDIO_FIELDS.agc);
+attachImmediateFieldSave(audioDeepgramModelEl, AUDIO_FIELDS.model);
+attachImmediateFieldSave(audioHideAecBadgeEl, AUDIO_FIELDS.hideAecBadge);
+
+// V10 hide-AEC-badge — apply visually on every flip BEFORE the IPC
+// roundtrip lands. The autosave helper above persists the value; the
+// listener below mirrors the change to the DOM immediately so the
+// badge disappears / reappears without waiting for the
+// `settings:changed` broadcast.
+if (audioHideAecBadgeEl instanceof HTMLInputElement) {
+  audioHideAecBadgeEl.addEventListener('change', () => {
+    applyAecBadgeVisibility({ hideAecBadge: audioHideAecBadgeEl.checked });
+  });
+}
+
+/** First-open hydration flag. Populators are lazy — there's no point
+ *  enumerating devices on app boot when the user might never open
+ *  the Audio tab. This flag is reset to false by the Refresh buttons
+ *  so a manual refresh forces a re-enumerate even if the cached
+ *  populate already ran. */
+let audioPickersPopulated = false;
+
+/**
+ * Enumerate microphone devices via the browser's
+ * `navigator.mediaDevices.enumerateDevices()` API and populate the
+ * mic dropdown. Preserves the persisted `audio.micDeviceId`
+ * selection if it's still present; if the persisted ID is gone
+ * (e.g. USB mic unplugged), the dropdown falls back to "Default
+ * (OS-selected mic)" and getUserMedia will use the OS default.
+ *
+ * Label privacy: before the user has granted mic permission, the
+ * browser returns empty `label` strings for security. We surface a
+ * fallback "Microphone (deviceId …)" so the dropdown isn't blank.
+ * After permission is granted (or after the first successful
+ * getUserMedia call) the labels populate normally.
+ */
+async function populateMicDevices() {
+  if (!(audioMicSelectEl instanceof HTMLSelectElement)) return;
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    console.warn('[audio] enumerateDevices unavailable; mic picker stays default-only');
+    return;
+  }
+
+  const previousValue = audioMicSelectEl.value;
+  // Save the persisted value too in case the previous-value above
+  // is on a placeholder option that's about to be cleared.
+  const persisted = settingsCache?.audio?.micDeviceId || '';
+
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter((d) => d.kind === 'audioinput');
+
+    // Rebuild option list: first the '' default, then one entry per
+    // mic. Strip any placeholder option injected by
+    // hydrateAudioSelectValue() since we now have real data.
+    audioMicSelectEl.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = 'Default (OS-selected mic)';
+    audioMicSelectEl.appendChild(defaultOpt);
+
+    for (const dev of inputs) {
+      const opt = document.createElement('option');
+      opt.value = dev.deviceId;
+      opt.textContent = dev.label || `Microphone (${dev.deviceId.slice(0, 6) || 'unknown'})`;
+      audioMicSelectEl.appendChild(opt);
+    }
+
+    // Restore selection: prefer the previous (which may equal the
+    // persisted), otherwise fall back to persisted, otherwise default.
+    const wanted = previousValue || persisted || '';
+    const exists = Array.from(audioMicSelectEl.options).some((o) => o.value === wanted);
+    audioMicSelectEl.value = exists ? wanted : '';
+  } catch (err) {
+    console.warn('[audio] mic enumeration failed:', err?.message || err);
+  }
+}
+
+/**
+ * Enumerate desktop audio sources via the main-side IPC and populate
+ * the system-audio dropdown. Same fallback semantics as the mic
+ * picker — a missing persisted ID degrades to the '' default
+ * ("first available screen"), which is the original hardcoded
+ * behaviour, so no regression.
+ *
+ * macOS without Screen Recording perm: the IPC returns an empty
+ * list. We render a single "no sources available" disabled option
+ * to make the empty state explicit; the existing permission
+ * explainer modal handles re-prompting.
+ */
+async function populateSystemAudioSources() {
+  if (!(audioSysSourceSelectEl instanceof HTMLSelectElement)) return;
+  if (typeof window.gemini?.system?.listAudioSources !== 'function') {
+    console.warn('[audio] system.listAudioSources bridge missing; system-audio picker stays default-only');
+    return;
+  }
+
+  const previousValue = audioSysSourceSelectEl.value;
+  const persisted = settingsCache?.audio?.systemAudioSourceId || '';
+
+  try {
+    const result = await window.gemini.system.listAudioSources();
+    const sources = Array.isArray(result?.sources) ? result.sources : [];
+
+    audioSysSourceSelectEl.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = 'Default (first available screen)';
+    audioSysSourceSelectEl.appendChild(defaultOpt);
+
+    if (sources.length === 0) {
+      const emptyOpt = document.createElement('option');
+      emptyOpt.value = '';
+      emptyOpt.textContent = result?.permission === 'granted'
+        ? '— no sources available —'
+        : '— grant Screen Recording to populate —';
+      emptyOpt.disabled = true;
+      audioSysSourceSelectEl.appendChild(emptyOpt);
+    } else {
+      for (const src of sources) {
+        const opt = document.createElement('option');
+        opt.value = src.id;
+        opt.textContent = src.name || src.id;
+        audioSysSourceSelectEl.appendChild(opt);
+      }
+    }
+
+    const wanted = previousValue || persisted || '';
+    const exists = Array.from(audioSysSourceSelectEl.options).some((o) => o.value === wanted);
+    audioSysSourceSelectEl.value = exists ? wanted : '';
+  } catch (err) {
+    console.warn('[audio] system-audio enumeration failed:', err?.message || err);
+  }
+}
+
+/** Convenience: run both populators in parallel. Called on first
+ *  Audio-tab open + on either Refresh button click. */
+async function populateAudioPickers() {
+  audioPickersPopulated = true;
+  await Promise.all([populateMicDevices(), populateSystemAudioSources()]);
+}
+
+if (audioMicRefreshBtnEl) {
+  audioMicRefreshBtnEl.addEventListener('click', () => {
+    populateMicDevices();
+  });
+}
+
+if (audioSysRefreshBtnEl) {
+  audioSysRefreshBtnEl.addEventListener('click', () => {
+    populateSystemAudioSources();
+  });
+}
+
+/**
+ * Show / hide the "Changes apply on next Start" hint based on the
+ * current capture status. Listening + starting both count as
+ * "in-call" because edits made during the startup ramp-up don't
+ * retroactively change the constraints baked into getUserMedia.
+ *
+ * Called from setStatus() so every state transition syncs the hint,
+ * and from openSettingsModal() so opening the modal mid-call paints
+ * the hint correctly even if no transition fired since the modal
+ * was last open.
+ */
+function refreshAudioApplyHint() {
+  if (!(audioApplyHintEl instanceof HTMLElement)) return;
+  const inCall = state.status === 'listening' || state.status === 'starting';
+  audioApplyHintEl.hidden = !inCall;
+}
+
+/* ── Appearance tab wiring ───────────────────────────────────────────
+ *
+ * The two colour pickers fire `input` on every nudge (which is fine —
+ * we apply live-preview synchronously and queue the IPC save behind a
+ * 200 ms idle debounce so a continuous drag through the spectrum only
+ * fires one or two writes at the end). The reset button cancels any
+ * pending debounce and flushes the defaults immediately.
+ *
+ * Both channels are persisted under `appearance.tagColors.{you,other}`
+ * — the main-side deepMerge keeps the unchanged channel intact.
+ */
+const APPEARANCE_IDLE_SAVE_MS = 200;
+let appearanceSaveTimer = null;
+/** Last partial we queued; merged so a fast `you` then `other` nudge
+ *  results in a single roundtrip covering both. */
+let appearancePendingPartial = null;
+
+function queueAppearanceSave(partial) {
+  appearancePendingPartial = { ...(appearancePendingPartial || {}), ...partial };
+  clearTimeout(appearanceSaveTimer);
+  appearanceSaveTimer = setTimeout(() => {
+    const next = appearancePendingPartial;
+    appearancePendingPartial = null;
+    appearanceSaveTimer = null;
+    pushSettingsPartial({ appearance: { tagColors: next } });
+  }, APPEARANCE_IDLE_SAVE_MS);
+}
+
+function flushAppearanceSave() {
+  if (appearanceSaveTimer) {
+    clearTimeout(appearanceSaveTimer);
+    appearanceSaveTimer = null;
+  }
+  const next = appearancePendingPartial;
+  appearancePendingPartial = null;
+  if (!next) return Promise.resolve();
+  // Return the underlying promise so callers (e.g. export) that need
+  // the disk to be up-to-date before they read settings can await.
+  // Existing fire-and-forget callers (closeSettingsModal) simply
+  // ignore the returned value.
+  return pushSettingsPartial({ appearance: { tagColors: next } });
+}
+
+if (appearanceColorYouEl instanceof HTMLInputElement) {
+  appearanceColorYouEl.addEventListener('input', () => {
+    const value = appearanceColorYouEl.value;
+    applyTagColors({ you: value });
+    queueAppearanceSave({ you: value });
+  });
+}
+
+if (appearanceColorOtherEl instanceof HTMLInputElement) {
+  appearanceColorOtherEl.addEventListener('input', () => {
+    const value = appearanceColorOtherEl.value;
+    applyTagColors({ other: value });
+    queueAppearanceSave({ other: value });
+  });
+}
+
+if (appearanceResetBtnEl) {
+  appearanceResetBtnEl.addEventListener('click', () => {
+    if (appearanceColorYouEl instanceof HTMLInputElement) {
+      appearanceColorYouEl.value = DEFAULT_TAG_YOU;
+    }
+    if (appearanceColorOtherEl instanceof HTMLInputElement) {
+      appearanceColorOtherEl.value = DEFAULT_TAG_OTHER;
+    }
+    applyTagColors({ you: DEFAULT_TAG_YOU, other: DEFAULT_TAG_OTHER });
+    // Cancel any in-flight debounce and write defaults eagerly — the
+    // user's intent is "now", not "in 200 ms".
+    clearTimeout(appearanceSaveTimer);
+    appearanceSaveTimer = null;
+    appearancePendingPartial = null;
+    pushSettingsPartial({
+      appearance: { tagColors: { you: DEFAULT_TAG_YOU, other: DEFAULT_TAG_OTHER } },
+    });
+  });
+}
+
+/* ── General → Data subsection wiring (Phase 1) ──────────────────────
+ *
+ * Export / Import / Reset. All three operate on the same settings
+ * cache as the per-tab autosave paths, so any in-flight typing in
+ * another tab will land via its own flush path; this block doesn't
+ * special-case anything beyond closing the parent modal cleanly
+ * after a wholesale change.
+ *
+ * Visual flow:
+ *   Reset  : button → #settingsResetConfirm → IPC → re-hydrate form
+ *   Export : (read inline checkbox) → IPC → dialog.save → toast/error
+ *   Import : button → dialog.open(JSON) → validate IPC → preview modal
+ *            → apply IPC on confirm → re-hydrate form
+ */
+
+/* Single shared filter for both Save (export) and Open (import) — the
+ * canonical extension is .json but we also accept the catch-all so a
+ * user who renamed the file can still open it. */
+const SETTINGS_JSON_FILTERS = [
+  { name: 'JSON', extensions: ['json'] },
+  { name: 'All Files', extensions: ['*'] },
+];
+
+/* Stash the parsed-but-not-yet-applied import payload between the
+ * validate step and the apply step. The renderer is the only place
+ * that knows when the user has confirmed the diff, so the JSON string
+ * needs to live somewhere across the user's interaction. */
+let pendingImportJson = null;
+
+/* ── U22: Reset to defaults ───────────────────────────────────────── */
+
+function openResetConfirm() {
+  if (!(settingsResetConfirmEl instanceof HTMLDialogElement)) return;
+  // Default the checkbox to checked every time the modal opens. The
+  // user's previous choice on a different reset shouldn't bleed across
+  // — preserving keys is the safe default and we want the explicit
+  // affordance every time.
+  if (settingsResetPreserveKeysEl instanceof HTMLInputElement) {
+    settingsResetPreserveKeysEl.checked = true;
+  }
+  try {
+    settingsResetConfirmEl.showModal();
+  } catch (err) {
+    console.warn('[settings:reset] showModal failed:', err?.message || err);
+  }
+}
+
+function closeResetConfirm() {
+  if (!(settingsResetConfirmEl instanceof HTMLDialogElement)) return;
+  try {
+    settingsResetConfirmEl.close();
+  } catch { /* not open */ }
+}
+
+async function doResetSettings() {
+  const preserveKeys = settingsResetPreserveKeysEl instanceof HTMLInputElement
+    ? settingsResetPreserveKeysEl.checked
+    : true;
+  // Cancel any in-flight debounced saves first so they don't land
+  // AFTER the reset and re-introduce stale values. The appearance
+  // debounce is the only one with cross-tab reach today; the rest
+  // (provider keys, coach toggles) write on commit and don't have a
+  // queued state.
+  clearTimeout(appearanceSaveTimer);
+  appearanceSaveTimer = null;
+  appearancePendingPartial = null;
+
+  try {
+    const fresh = await window.gemini.settings?.reset?.({ preserveKeys });
+    if (fresh && typeof fresh === 'object') {
+      settingsCache = fresh;
+      // Full re-hydration is the whole point of Reset — we explicitly
+      // WANT to clobber every input back to its default value.
+      applySettingsToForm(fresh);
+      // Also re-apply the live tag colours since they're driven by
+      // settings.appearance.tagColors and the user just reset them.
+      applyTagColors(fresh.appearance?.tagColors || {
+        you: DEFAULT_TAG_YOU,
+        other: DEFAULT_TAG_OTHER,
+      });
+    }
+  } catch (err) {
+    console.warn('[settings:reset] IPC failed:', err?.message || err);
+  } finally {
+    closeResetConfirm();
+  }
+}
+
+if (settingsResetBtnEl instanceof HTMLButtonElement) {
+  settingsResetBtnEl.addEventListener('click', openResetConfirm);
+}
+if (settingsResetCancelEl instanceof HTMLButtonElement) {
+  settingsResetCancelEl.addEventListener('click', closeResetConfirm);
+}
+if (settingsResetConfirmBtnEl instanceof HTMLButtonElement) {
+  settingsResetConfirmBtnEl.addEventListener('click', doResetSettings);
+}
+
+/* ── U20: Export settings as JSON ─────────────────────────────────── */
+
+async function doExportSettings() {
+  const includeKeys = settingsExportIncludeKeysEl instanceof HTMLInputElement
+    ? settingsExportIncludeKeysEl.checked
+    : false;
+
+  // Flush any pending per-tab debounces so the exported file reflects
+  // exactly what the user sees on screen, not the last-persisted shape
+  // from before they nudged something.
+  for (const provider of PROVIDER_IDS) flushPendingKeySave(provider);
+  await flushAppearanceSave();
+
+  let snapshot;
+  try {
+    snapshot = await window.gemini.settings?.export?.({ includeKeys });
+  } catch (err) {
+    console.warn('[settings:export] serialise failed:', err?.message || err);
+    return;
+  }
+  if (!snapshot || typeof snapshot.json !== 'string') return;
+
+  try {
+    const result = await window.gemini.dialog?.save?.({
+      title: 'Export Two Way Flow settings',
+      content: snapshot.json,
+      defaultName: snapshot.filename,
+      defaultPath: snapshot.filename,
+      filters: SETTINGS_JSON_FILTERS,
+    });
+    if (!result || result.canceled) return;
+    if (result.error) {
+      console.warn('[settings:export] write failed:', result.error);
+    }
+  } catch (err) {
+    console.warn('[settings:export] dialog.save failed:', err?.message || err);
+  }
+}
+
+if (settingsExportBtnEl instanceof HTMLButtonElement) {
+  settingsExportBtnEl.addEventListener('click', doExportSettings);
+}
+
+/* ── U21: Import settings from JSON ───────────────────────────────── */
+
+/**
+ * Render a one-row-per-block diff between the live settings and the
+ * incoming import. Intentionally rough: per-block "Will be updated" /
+ * "Unchanged", not a full JSON diff. The renderer's existing live-
+ * apply means a fuller diff would mostly read as noise — what the
+ * user really wants here is "is this the file I expected, or did I
+ * pick the wrong one?".
+ *
+ * Top-level keys come from a fixed allowlist (the schema's six tabs
+ * + the cross-cutting fields) so a third-party file with extra
+ * properties doesn't pollute the diff. Schema-version-only changes
+ * are surfaced as "Unchanged" because the migration is transparent.
+ */
+function renderImportDiff(incoming) {
+  if (!(settingsImportDiffEl instanceof HTMLElement)) return;
+  settingsImportDiffEl.replaceChildren();
+
+  const current = settingsCache || {};
+  // Order matches the tab order; `defaultProvider` + `models` live
+  // alongside the providers block in the user's mental model.
+  const blocks = [
+    { key: 'defaultProvider', label: 'Default provider' },
+    { key: 'providers', label: 'Providers' },
+    { key: 'models', label: 'Models' },
+    { key: 'audio', label: 'Audio' },
+    { key: 'appearance', label: 'Appearance' },
+    { key: 'coach', label: 'Coach' },
+    { key: 'general', label: 'General' },
+    { key: 'help', label: 'Help' },
+  ];
+
+  for (const { key, label } of blocks) {
+    const row = document.createElement('div');
+    row.className = 'settings-import__diff-row';
+    const changed = JSON.stringify(current[key] ?? null) !== JSON.stringify(incoming[key] ?? null);
+    row.classList.add(changed ? 'settings-import__diff-row--changed' : 'settings-import__diff-row--same');
+
+    const k = document.createElement('span');
+    k.className = 'settings-import__diff-key';
+    k.textContent = label;
+    row.appendChild(k);
+
+    const v = document.createElement('span');
+    v.className = 'settings-import__diff-summary';
+    v.textContent = changed
+      ? summariseBlockChange(key, current[key], incoming[key])
+      : 'Unchanged';
+    row.appendChild(v);
+
+    settingsImportDiffEl.appendChild(row);
+  }
+}
+
+/**
+ * Build a short human-readable summary of what changed within one
+ * top-level block. Just enough detail to give the user confidence the
+ * file is the right one — not a full diff (importing IS a wholesale
+ * replace, so "everything in this block will be replaced" is the
+ * accurate-but-useless ground truth).
+ */
+function summariseBlockChange(key, current, incoming) {
+  if (key === 'providers') {
+    if (!incoming || typeof incoming !== 'object') return 'Will be cleared';
+    const diffs = [];
+    for (const provider of PROVIDER_IDS) {
+      const before = current?.[provider] || {};
+      const after = incoming?.[provider] || {};
+      const keyChange = (before.apiKey || '') !== (after.apiKey || '');
+      const modelChange = (before.defaultModel || '') !== (after.defaultModel || '');
+      if (keyChange || modelChange) {
+        const parts = [];
+        if (keyChange) parts.push(after.apiKey ? 'key set' : 'key cleared');
+        if (modelChange) parts.push(`model → ${after.defaultModel || '(default)'}`);
+        diffs.push(`${provider} (${parts.join(', ')})`);
+      }
+    }
+    return diffs.length > 0 ? diffs.join('; ') : 'Will be updated';
+  }
+  if (key === 'defaultProvider') {
+    return `${current ?? '(none)'} → ${incoming ?? '(none)'}`;
+  }
+  if (key === 'appearance') {
+    const cYou = current?.tagColors?.you;
+    const iYou = incoming?.tagColors?.you;
+    const cOther = current?.tagColors?.other;
+    const iOther = incoming?.tagColors?.other;
+    const parts = [];
+    if (cYou !== iYou) parts.push(`you ${cYou} → ${iYou}`);
+    if (cOther !== iOther) parts.push(`other ${cOther} → ${iOther}`);
+    return parts.length > 0 ? parts.join(', ') : 'Will be updated';
+  }
+  if (key === 'coach') {
+    const tracks = `track ${current?.trackQuestionState ? 'on' : 'off'} → ${incoming?.trackQuestionState ? 'on' : 'off'}`;
+    const auto = `auto-reformulate ${current?.autoReformulate ? 'on' : 'off'} → ${incoming?.autoReformulate ? 'on' : 'off'}`;
+    return `${tracks}; ${auto}`;
+  }
+  return 'Will be updated';
+}
+
+function openImportPreview({ source, error, incoming }) {
+  if (!(settingsImportPreviewEl instanceof HTMLDialogElement)) return;
+  if (settingsImportSourceEl instanceof HTMLElement) {
+    if (source) {
+      settingsImportSourceEl.textContent = `From: ${source}`;
+      settingsImportSourceEl.hidden = false;
+    } else {
+      settingsImportSourceEl.hidden = true;
+    }
+  }
+  if (settingsImportErrorEl instanceof HTMLElement) {
+    if (error) {
+      settingsImportErrorEl.textContent = error;
+      settingsImportErrorEl.hidden = false;
+    } else {
+      settingsImportErrorEl.hidden = true;
+    }
+  }
+  if (settingsImportApplyEl instanceof HTMLButtonElement) {
+    // Hide Apply when the file is invalid — there's nothing safe to
+    // commit. The user can still hit Cancel to dismiss.
+    settingsImportApplyEl.hidden = Boolean(error);
+  }
+  if (incoming && !error) {
+    renderImportDiff(incoming);
+  } else if (settingsImportDiffEl instanceof HTMLElement) {
+    settingsImportDiffEl.replaceChildren();
+  }
+  try {
+    settingsImportPreviewEl.showModal();
+  } catch (err) {
+    console.warn('[settings:import] showModal failed:', err?.message || err);
+  }
+}
+
+function closeImportPreview() {
+  if (!(settingsImportPreviewEl instanceof HTMLDialogElement)) return;
+  pendingImportJson = null;
+  try {
+    settingsImportPreviewEl.close();
+  } catch { /* not open */ }
+}
+
+async function doStartImport() {
+  let openResult;
+  try {
+    openResult = await window.gemini.dialog?.open?.({
+      title: 'Import Two Way Flow settings',
+      filters: SETTINGS_JSON_FILTERS,
+      readAs: 'utf8',
+    });
+  } catch (err) {
+    console.warn('[settings:import] dialog.open failed:', err?.message || err);
+    return;
+  }
+  if (!openResult || openResult.canceled) return;
+  if (openResult.error) {
+    openImportPreview({
+      source: openResult.filePath,
+      error: `Couldn't read that file: ${openResult.error}`,
+    });
+    return;
+  }
+  if (typeof openResult.content !== 'string') {
+    openImportPreview({
+      source: openResult.filePath,
+      error: 'File appears to be empty.',
+    });
+    return;
+  }
+
+  pendingImportJson = openResult.content;
+  let validation;
+  try {
+    validation = await window.gemini.settings?.validateImport?.(openResult.content);
+  } catch (err) {
+    openImportPreview({
+      source: openResult.filePath,
+      error: `Validation failed: ${err?.message || 'unknown error'}`,
+    });
+    pendingImportJson = null;
+    return;
+  }
+  if (!validation?.ok) {
+    openImportPreview({
+      source: openResult.filePath,
+      error: validation?.error || 'Not a valid settings export.',
+    });
+    pendingImportJson = null;
+    return;
+  }
+  openImportPreview({
+    source: openResult.filePath,
+    incoming: validation.normalised,
+  });
+}
+
+async function doApplyImport() {
+  if (typeof pendingImportJson !== 'string' || !pendingImportJson) {
+    closeImportPreview();
+    return;
+  }
+  try {
+    const result = await window.gemini.settings?.applyImport?.(pendingImportJson);
+    if (result?.ok && result.settings) {
+      settingsCache = result.settings;
+      applySettingsToForm(result.settings);
+      applyTagColors(result.settings.appearance?.tagColors || {
+        you: DEFAULT_TAG_YOU,
+        other: DEFAULT_TAG_OTHER,
+      });
+    } else if (result && !result.ok) {
+      // Surface inline — keep the preview open so the user sees why.
+      openImportPreview({
+        error: result.error || 'Import failed.',
+      });
+      return;
+    }
+  } catch (err) {
+    console.warn('[settings:import] applyImport failed:', err?.message || err);
+  } finally {
+    closeImportPreview();
+  }
+}
+
+if (settingsImportBtnEl instanceof HTMLButtonElement) {
+  settingsImportBtnEl.addEventListener('click', doStartImport);
+}
+if (settingsImportCancelEl instanceof HTMLButtonElement) {
+  settingsImportCancelEl.addEventListener('click', closeImportPreview);
+}
+if (settingsImportApplyEl instanceof HTMLButtonElement) {
+  settingsImportApplyEl.addEventListener('click', doApplyImport);
+}
 
 /* ── User input ────────────────────────────────────────────────────── */
 
@@ -884,29 +4847,468 @@ recToggleEl.addEventListener('click', () => {
 });
 
 minButtonEl.addEventListener('click', () => {
-  // Native minimize via the BrowserWindow. We don't have ipcMain wired
-  // for an explicit "minimize", so just blur — designer pass owns the
-  // real minimised-pill state. Keeping this as a no-op placeholder is
-  // worse than wiring window.electron later, but the user explicitly
-  // flagged minimised state as a designer-next item.
-  console.log('[ui] minimise pressed (placeholder)');
+  // Frameless window has no native chrome — drive the OS minimise via
+  // IPC. The user can restore via (a) the menu-bar / system-tray
+  // icon, (b) the macOS dock click, or (c) the Cmd/Ctrl+Shift+H
+  // global shortcut. We deliberately don't pre-empt the call state
+  // here (no auto-stopCapture) — a quick minimise during a live call
+  // shouldn't tear down the session.
+  window.gemini.window.minimize();
 });
 
 closeButtonEl.addEventListener('click', async () => {
   if (state.status === 'listening' || state.status === 'starting') {
     await stopCapture();
   }
-  window.close();
+  // Single-window overlay-tool semantics: closing the window fully
+  // quits the app (main's `window-all-closed` handler is what
+  // actually fires `app.quit()`). The IPC route is preferred over
+  // the browser-side `window.close()` because the renderer doesn't
+  // always have the privilege to close itself (depends on how the
+  // window was instantiated), and IPC gives us a single observable
+  // point where teardown ordering is enforced in main.
+  await window.gemini.window.close();
 });
 
-transcriptToggleEl.addEventListener('click', () => {
-  state.transcriptOpen = !state.transcriptOpen;
-  // Hide the body + footer behind the drawer; the drawer is absolutely
-  // positioned over them already, but visually-hiding the body avoids
-  // the rail showing through if the drawer ever becomes translucent.
-  if (bodyEl) bodyEl.style.visibility = state.transcriptOpen ? 'hidden' : 'visible';
-  if (footerEl) footerEl.style.opacity = state.transcriptOpen ? '0.5' : '1';
-  renderTranscriptDrawer();
+/* ── Permission modal (Phase 4) ────────────────────────────────────── */
+
+/**
+ * Show the macOS Screen Recording explainer modal. Called when the
+ * renderer's getDisplayMedia request fails (permission denied, no
+ * sources available, etc.). The user can:
+ *   - Grant access     → re-try getDisplayMedia (which may surface the
+ *                        OS prompt, or no-op if already denied).
+ *   - Open System Settings → deep link into the Privacy pane.
+ *   - Continue with mic only → dismiss; the call already started with
+ *                              just the mic chain.
+ */
+function showPermissionModal() {
+  if (!permissionModalEl) return;
+  try {
+    permissionModalEl.showModal();
+  } catch (err) {
+    // Calling showModal() on an already-open dialog throws. Ignore.
+    console.warn('[permission] showModal failed:', err?.message || err);
+  }
+}
+
+function closePermissionModal() {
+  if (!permissionModalEl) return;
+  try {
+    permissionModalEl.close();
+  } catch { /* not open */ }
+}
+
+if (permissionRetryBtnEl) {
+  permissionRetryBtnEl.addEventListener('click', async () => {
+    closePermissionModal();
+    // Retrying only makes sense while a call is being set up or
+    // already running. Either way the user has just OK'd the
+    // explainer and presumably granted the perm. We try once; if it
+    // still fails the user can re-open the modal on the next Start.
+    if (state.status !== 'listening' && state.status !== 'starting') {
+      console.warn('[permission] grant-access clicked while idle; nothing to retry');
+      return;
+    }
+    const sysStream = await tryOpenSystemAudioStream();
+    if (!sysStream || !state.audioContext) {
+      state.systemAudioStatus = 'denied';
+      showPermissionModal();
+      return;
+    }
+    // Attach the new sys chain to the live AudioContext.
+    state.sys = buildCaptureChain({
+      stream: sysStream,
+      audioContext: state.audioContext,
+      sendChunk: (chunk) => window.gemini.sendSystemAudio(chunk),
+    });
+    state.systemAudioStatus = 'capturing';
+    console.log('[permission] system audio capture started after manual grant');
+  });
+}
+
+if (permissionContinueBtnEl) {
+  permissionContinueBtnEl.addEventListener('click', () => {
+    state.systemAudioStatus = 'mic-only';
+    closePermissionModal();
+  });
+}
+
+if (permissionOpenSettingsBtnEl) {
+  permissionOpenSettingsBtnEl.addEventListener('click', async () => {
+    try {
+      await window.gemini.openScreenRecordingSettings?.();
+    } catch (err) {
+      console.warn('[permission] failed to open settings:', err?.message || err);
+    }
+  });
+}
+
+/* ── Summary modal (Phase 5) ───────────────────────────────────────── */
+
+function showSummaryModal() {
+  if (!summaryModalEl) return;
+  try {
+    summaryModalEl.showModal();
+  } catch (err) {
+    console.warn('[summary] showModal failed:', err?.message || err);
+  }
+}
+
+function closeSummaryModal() {
+  if (!summaryModalEl) return;
+  try {
+    summaryModalEl.close();
+  } catch { /* not open */ }
+}
+
+function selectSummaryTab(tab) {
+  if (!summaryPanelEls[tab]) return;
+  state.summary.activeTab = tab;
+  for (const btn of summaryTabEls) {
+    const isActive = btn.dataset.tab === tab;
+    btn.dataset.active = String(isActive);
+    btn.setAttribute('aria-selected', String(isActive));
+  }
+  for (const [key, panel] of Object.entries(summaryPanelEls)) {
+    panel.dataset.active = String(key === tab);
+    panel.hidden = key !== tab;
+  }
+}
+
+/**
+ * Populate the summary modal panels from a `summary:ready` payload.
+ * The payload shape matches what src/summary.js's generateSummary()
+ * returns: { scorecard, factsTable, transcript, debrief, durationMs,
+ * asJSON, asMarkdown }.
+ */
+function renderSummaryModal(payload) {
+  if (!payload) return;
+  state.summary.payload = payload;
+
+  // Duration badge in the header.
+  if (summaryDurationEl) {
+    if (payload.durationMs > 0) {
+      summaryDurationEl.hidden = false;
+      summaryDurationEl.textContent = formatTimer(payload.durationMs);
+    } else {
+      summaryDurationEl.hidden = true;
+    }
+  }
+
+  renderSummaryScorecard(payload.scorecard || {});
+  renderSummaryFacts(payload.factsTable || {});
+  renderSummaryTranscript(payload.transcript || '');
+  renderSummaryDebrief(payload.debrief || {});
+
+  // Default to the scorecard tab whenever we surface a new payload —
+  // we want the user to see the top-line outcome first.
+  selectSummaryTab('scorecard');
+}
+
+function renderSummaryScorecard(scorecard) {
+  const panel = summaryPanelEls.scorecard;
+  if (!panel) return;
+  const rows = Object.values(scorecard);
+  if (rows.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'summary-panel__empty';
+    empty.textContent = 'No scorecard available.';
+    panel.replaceChildren(empty);
+    return;
+  }
+
+  const children = [];
+  for (const row of rows) {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'scorecard__row';
+
+    const nameWrap = document.createElement('div');
+    nameWrap.className = 'scorecard__name';
+
+    const nameLabel = document.createElement('span');
+    nameLabel.className = 'scorecard__name-label';
+    nameLabel.textContent = row.name;
+    nameWrap.appendChild(nameLabel);
+
+    const meta = document.createElement('span');
+    meta.className = 'scorecard__name-meta';
+    meta.textContent = `${row.covered}/${row.total} covered · ${row.inProgress} in progress · ${row.logged} logged`;
+    nameWrap.appendChild(meta);
+
+    rowEl.appendChild(nameWrap);
+
+    const barWrap = document.createElement('div');
+    barWrap.className = 'scorecard__bar';
+
+    const track = document.createElement('div');
+    track.className = 'scorecard__bar-track';
+    const fill = document.createElement('div');
+    fill.className = 'scorecard__bar-fill';
+    fill.style.setProperty('--pct', String(Math.max(0, Math.min(1, (row.percent || 0) / 100))));
+    track.appendChild(fill);
+    barWrap.appendChild(track);
+
+    const pct = document.createElement('span');
+    pct.className = 'scorecard__bar-pct';
+    pct.textContent = `${row.percent || 0}%`;
+    barWrap.appendChild(pct);
+
+    rowEl.appendChild(barWrap);
+    children.push(rowEl);
+  }
+  panel.replaceChildren(...children);
+}
+
+function renderSummaryFacts(factsTable) {
+  const panel = summaryPanelEls.facts;
+  if (!panel) return;
+  const groupNames = Object.keys(factsTable);
+  if (groupNames.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'summary-panel__empty';
+    empty.textContent = 'No facts were captured during this call.';
+    panel.replaceChildren(empty);
+    return;
+  }
+
+  const children = [];
+  for (const groupName of groupNames) {
+    const group = factsTable[groupName];
+    const section = document.createElement('section');
+    section.className = 'facts-group';
+
+    const heading = document.createElement('h3');
+    heading.className = 'facts-group__heading';
+    heading.textContent = group.name;
+    section.appendChild(heading);
+
+    for (const field of group.fields) {
+      const row = document.createElement('div');
+      row.className = 'facts-row';
+
+      const label = document.createElement('span');
+      label.className = 'facts-row__label';
+      label.textContent = field.label;
+      row.appendChild(label);
+
+      const value = document.createElement('span');
+      value.className = 'facts-row__value';
+      value.textContent = field.value;
+      row.appendChild(value);
+
+      section.appendChild(row);
+    }
+    children.push(section);
+  }
+  panel.replaceChildren(...children);
+}
+
+function renderSummaryTranscript(transcript) {
+  const panel = summaryPanelEls.transcript;
+  if (!panel) return;
+  if (!transcript) {
+    const empty = document.createElement('p');
+    empty.className = 'summary-panel__empty';
+    empty.textContent = 'No transcript was captured.';
+    panel.replaceChildren(empty);
+    return;
+  }
+
+  const children = [];
+  // The transcript string from summary.js is "Speaker: text" per line,
+  // with the prefixes "You: " / "Prospect: " (mandated by the
+  // pendingTranscriptBySpeaker commit path in main.js). Parse it back
+  // into typed lines so we can colour the prefix without re-baking it.
+  const lines = transcript.split('\n');
+  for (const raw of lines) {
+    if (!raw) continue;
+    let speaker = null;
+    let text = raw;
+    if (raw.startsWith('You: ')) {
+      speaker = 'you';
+      text = raw.slice('You: '.length);
+    } else if (raw.startsWith('Prospect: ')) {
+      speaker = 'other';
+      text = raw.slice('Prospect: '.length);
+    }
+    const p = document.createElement('p');
+    p.className = 'summary-transcript__line';
+    if (speaker) p.dataset.speaker = speaker;
+    p.textContent = text;
+    children.push(p);
+  }
+  panel.replaceChildren(...children);
+}
+
+function renderSummaryDebrief(debrief) {
+  const panel = summaryPanelEls.debrief;
+  if (!panel) return;
+
+  const wentWell = debrief.wentWell || '';
+  const missed = debrief.missed || '';
+  const improvements = (debrief.improvements || []).filter(Boolean);
+
+  if (!wentWell && !missed && improvements.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'summary-panel__empty';
+    empty.textContent = 'Debrief unavailable.';
+    panel.replaceChildren(empty);
+    return;
+  }
+
+  const children = [];
+
+  if (wentWell) {
+    const sec = document.createElement('section');
+    sec.className = 'debrief__section';
+    const h = document.createElement('h3');
+    h.className = 'debrief__heading';
+    h.textContent = 'What went well';
+    const p = document.createElement('p');
+    p.className = 'debrief__text';
+    p.textContent = wentWell;
+    sec.appendChild(h);
+    sec.appendChild(p);
+    children.push(sec);
+  }
+
+  if (missed) {
+    const sec = document.createElement('section');
+    sec.className = 'debrief__section';
+    const h = document.createElement('h3');
+    h.className = 'debrief__heading';
+    h.textContent = 'What was missed';
+    const p = document.createElement('p');
+    p.className = 'debrief__text';
+    p.textContent = missed;
+    sec.appendChild(h);
+    sec.appendChild(p);
+    children.push(sec);
+  }
+
+  if (improvements.length > 0) {
+    const sec = document.createElement('section');
+    sec.className = 'debrief__section';
+    const h = document.createElement('h3');
+    h.className = 'debrief__heading';
+    h.textContent = 'Top 3 improvements';
+    const ul = document.createElement('ul');
+    ul.className = 'debrief__list';
+    for (const imp of improvements) {
+      const li = document.createElement('li');
+      li.textContent = imp;
+      ul.appendChild(li);
+    }
+    sec.appendChild(h);
+    sec.appendChild(ul);
+    children.push(sec);
+  }
+
+  panel.replaceChildren(...children);
+}
+
+function flashSummaryToast(message) {
+  if (!summaryToastEl) return;
+  summaryToastEl.textContent = message;
+  summaryToastEl.hidden = false;
+  // Auto-clear after a few seconds so the footer doesn't keep yelling
+  // "Copied!" forever.
+  clearTimeout(flashSummaryToast._timer);
+  flashSummaryToast._timer = setTimeout(() => {
+    summaryToastEl.hidden = true;
+    summaryToastEl.textContent = '';
+  }, 2500);
+}
+
+/**
+ * Copy a string to the OS clipboard. Tries Electron's native
+ * clipboard module first (via the `clipboard:write` IPC) because
+ * it bypasses the renderer's permission system entirely — the
+ * browser API was previously blocked by main.js's permission
+ * handler, causing the Copy buttons to silently fail with a
+ * "Copy failed" toast.
+ *
+ * Falls back to `navigator.clipboard.writeText` if the IPC bridge
+ * is missing (e.g. an old preload before this feature shipped) so
+ * the code is forward-compatible. Returns `true` on success, `false`
+ * on failure (which lights up the "Copy failed" toast).
+ */
+async function copyToClipboard(text) {
+  if (typeof text !== 'string' || text.length === 0) return false;
+
+  const native = window.gemini?.clipboard?.writeText;
+  if (typeof native === 'function') {
+    try {
+      const result = await native(text);
+      if (result?.ok) return true;
+      console.warn('[summary] native clipboard write failed:', result?.error);
+    } catch (err) {
+      console.warn('[summary] native clipboard IPC threw:', err?.message || err);
+    }
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (err) {
+    console.warn('[summary] clipboard fallback failed:', err?.message || err);
+    return false;
+  }
+}
+
+for (const btn of summaryTabEls) {
+  btn.addEventListener('click', () => selectSummaryTab(btn.dataset.tab));
+}
+
+if (summaryCopyJsonEl) {
+  summaryCopyJsonEl.addEventListener('click', async () => {
+    const payload = state.summary.payload;
+    if (!payload?.asJSON) return;
+    const ok = await copyToClipboard(payload.asJSON);
+    flashSummaryToast(ok ? 'JSON copied to clipboard.' : 'Copy failed.');
+  });
+}
+
+if (summaryCopyMdEl) {
+  summaryCopyMdEl.addEventListener('click', async () => {
+    const payload = state.summary.payload;
+    if (!payload?.asMarkdown) return;
+    const ok = await copyToClipboard(payload.asMarkdown);
+    flashSummaryToast(ok ? 'Markdown copied to clipboard.' : 'Copy failed.');
+  });
+}
+
+if (summarySaveEl) {
+  summarySaveEl.addEventListener('click', async () => {
+    const payload = state.summary.payload;
+    if (!payload) return;
+    // Default to Markdown — it's the friendlier export for sharing.
+    const result = await window.gemini.saveSummary?.({
+      format: 'markdown',
+      content: payload.asMarkdown,
+    });
+    if (result?.ok) {
+      flashSummaryToast('Saved.');
+    } else if (result?.error === 'cancelled') {
+      // No-op; user dismissed the dialog.
+    } else if (result?.error) {
+      flashSummaryToast(`Save failed: ${result.error}`);
+    }
+  });
+}
+
+if (summaryCloseEl) summaryCloseEl.addEventListener('click', closeSummaryModal);
+if (summaryCloseXEl) summaryCloseXEl.addEventListener('click', closeSummaryModal);
+
+// Click on the rail overlay's backdrop (i.e. anywhere outside the
+// panel) closes the overlay. The panel itself doesn't propagate clicks
+// because they hit the panel's children — but we still defensively
+// check that the click landed on the overlay root, not the panel.
+railOverlayEl.addEventListener('click', (e) => {
+  if (e.target === railOverlayEl) {
+    closePillarOverlay();
+  }
 });
 
 document.addEventListener('keydown', (e) => {
@@ -914,26 +5316,26 @@ document.addEventListener('keydown', (e) => {
   const target = e.target;
   if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
 
+  // Don't interfere with modal dialogs — the native <dialog> element
+  // handles Esc itself, and we don't want Enter to accidentally fire
+  // Start while a modal is open.
+  if (permissionModalEl?.open || summaryModalEl?.open || settingsModalEl?.open) return;
+
   if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
     e.preventDefault();
     recToggleEl.click();
     return;
   }
   if (e.key === 'Escape') {
-    if (state.transcriptOpen) {
-      transcriptToggleEl.click();
-      return;
-    }
-    if (state.selectedPillarId !== DEFAULT_PILLAR_ID) {
-      selectPillar(DEFAULT_PILLAR_ID);
+    if (state.activePillarId !== null) {
+      e.preventDefault();
+      closePillarOverlay();
     }
     return;
   }
 
-  // Coach history navigation. Ignored when the drawer is open so the
-  // seller can scroll the transcript with arrows there if a future
-  // version supports it.
-  if (state.transcriptOpen) return;
+  // Coach history navigation. ← walks back through previous suggestions;
+  // → walks forward, or asks the coach for a fresh one at the live edge.
   if (e.key === 'ArrowLeft') {
     if (state.coachIndex > 0) {
       e.preventDefault();
@@ -949,9 +5351,16 @@ document.addEventListener('keydown', (e) => {
       renderCoachSuggestion();
     } else if (state.coachHistory.length > 0) {
       e.preventDefault();
-      // At the live edge — ask the coach for a fresh suggestion. The
-      // new suggestion arrives asynchronously via onCoachSuggestion.
-      window.gemini.skipCoachSuggestion?.();
+      // At the live edge — route through the same advance logic as
+      // the inline Skip pill so cover-queue cycling stays consistent
+      // across the two skip paths.
+      if (state.coverQueue) {
+        advanceCoverQueue();
+      } else {
+        // Ask the coach for a fresh suggestion. The new suggestion
+        // arrives asynchronously via onCoachSuggestion.
+        window.gemini.skipCoachSuggestion?.();
+      }
     }
     return;
   }
@@ -965,11 +5374,31 @@ window.addEventListener('beforeunload', () => {
 
 /* ── Initial render ─────────────────────────────────────────────────── */
 
+// Apply the persisted coach mode to the toggle UI on startup. We
+// don't notify main yet — main has its own default ('signalled') and
+// will pick up the persisted value when the rep hits Start (see
+// startCapture → setCoachMode). Notifying earlier risks a race with
+// session teardown when reloading during dev.
+applyCoachMode(state.coachMode, { persist: false, notifyMain: false });
+
 renderTimer();
 renderSpeakers();
 renderRail();
-renderActivePillar();
+renderRailOverlay();
 renderCaptured();
-renderTicker();
+renderQuickFix();
+renderTranscriptPane();
 renderCoachSuggestion();
-renderTranscriptDrawer();
+renderCoachThinking();
+renderConnectionStatus();
+// Badge starts in "unknown" — the mic-capture path will flip it to
+// "on" / "off" the moment getUserMedia hands back a stream.
+setAecBadgeState('unknown');
+
+// Eagerly load persisted settings at boot so the user's custom
+// speaker-label tag colours are in effect from the first frame (the
+// :root CSS defaults cover the "no persisted value yet" case so
+// there's no flash even on the slow path). `ensureSettingsLoaded`
+// is idempotent — the same cache feeds the modal's lazy open path
+// without a second IPC roundtrip.
+ensureSettingsLoaded();

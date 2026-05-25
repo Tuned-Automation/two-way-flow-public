@@ -1,9 +1,94 @@
-import 'dotenv/config';
-import { app, BrowserWindow, globalShortcut, ipcMain, Menu, screen, session, systemPreferences } from 'electron';
+import dotenv from 'dotenv';
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  desktopCapturer,
+  dialog,
+  globalShortcut,
+  ipcMain,
+  Menu,
+  nativeImage,
+  screen,
+  session,
+  shell,
+  systemPreferences,
+  Tray,
+} from 'electron';
 import path from 'node:path';
+import { writeFile, readFile } from 'node:fs/promises';
 import started from 'electron-squirrel-startup';
+
+/* ────────────────────────────────────────────────────────────────────
+ * .env discovery — dev vs packaged
+ *
+ * In `npm start` dev mode the process cwd IS the project folder, so a
+ * bare `dotenv.config()` finds `.env` there. In a packaged macOS .app
+ * the cwd is `/` (Launchpad / Spotlight launches from root), so the
+ * same call silently no-ops and the GEMINI_API_KEY / DEEPGRAM_API_KEY
+ * env-var fallback in settings.js's getApiKey() never resolves —
+ * which surfaces as "Missing Gemini API key" in the renderer toast.
+ *
+ * Fix: try multiple paths, in priority order:
+ *   1. cwd (`process.cwd()/.env`)               — dev workflow
+ *   2. resourcesPath (`Contents/Resources/.env`) — packaged build
+ *      (the file is bundled via forge.config.js's `extraResource`;
+ *      see the comment there for the bundling decision + the personal-
+ *      use security implication)
+ *   3. userData (`<userData>/.env`)              — user-supplied
+ *      override that survives reinstalls and doesn't require rebuild;
+ *      handy for adding ANTHROPIC_API_KEY / OPENAI_API_KEY without a
+ *      Settings → Providers UI write
+ *
+ * `override: false` (after the cwd load) means a value already set by
+ * dev mode wins over a stale packaged value. This matters because
+ * `extraResource` bakes WHATEVER .env existed at build time into the
+ * bundle, and we want a developer iterating on a fresh .env in cwd to
+ * still see their latest values after `npm run make`.
+ *
+ * userData is queried inside a try/catch because `app.getPath` can be
+ * unsafe to call before the Electron `app` is ready on some versions —
+ * Electron 42 is fine pre-ready but the guard costs nothing.
+ * ──────────────────────────────────────────────────────────────────── */
+dotenv.config();
+function loadPackagedEnv() {
+  /** @type {string[]} */
+  const candidates = [];
+  if (process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, '.env'));
+  }
+  try {
+    candidates.push(path.join(app.getPath('userData'), '.env'));
+  } catch {
+    // app not ready yet — userData candidate gets retried after whenReady
+  }
+  for (const p of candidates) {
+    dotenv.config({ path: p, override: false });
+  }
+}
+loadPackagedEnv();
 import { GeminiSession } from './gemini-session.js';
+import { DeepgramSession } from './deepgram-session.js';
 import { Coach } from './coach.js';
+import { generateSummary } from './summary.js';
+import { createQuickFixRoller } from './quick-fix.js';
+import {
+  loadSettings,
+  saveSettings,
+  resetSettings,
+  exportSettingsAsJSON,
+  validateImportedSettings,
+  applyImportedSettings,
+  getApiKey,
+  getModelFor,
+  getDefaultProvider,
+  getDefaultModelForProvider,
+  getProviderStatus,
+  getProviderEnvAvailability,
+  getCoach,
+  getAudio,
+} from './settings.js';
+import { getProvider } from './providers/index.js';
 
 if (started) {
   app.quit();
@@ -16,59 +101,1139 @@ if (!gotTheLock) {
   app.quit();
 }
 
+/* ── Chromium command-line switches ────────────────────────────────────
+ *
+ * MUST be set before app.whenReady() resolves. After that point the
+ * command-line argv has already been parsed by the renderer process(es)
+ * and these will be silently ignored.
+ *
+ * Why these matter:
+ *   - WebRtcEchoCanceller3 is Chromium's modern (AEC3) echo canceller.
+ *     It's the default in current Chromium but old/embedded versions
+ *     may fall back to AEC2 or disable AEC entirely depending on
+ *     platform heuristics. We force-enable AEC3 because our use case
+ *     (speakerphone → mic loopback during a discovery call) is
+ *     exactly what AEC3 is engineered for.
+ *   - The WebRTC field-trial pin is belt-and-braces: even when the
+ *     feature flag is on, the field-trial layer can override per
+ *     experiment cohort. Pinning the trial to /Enabled/ makes the
+ *     canceller deterministic regardless of cohort.
+ *
+ * No effect on the system-audio loopback (getDisplayMedia path) —
+ * those tracks bypass AEC by design because they're already clean
+ * isolated sources.
+ *
+ * Phase 2 interaction with settings.audio.aec:
+ *   The renderer's startCapture() reads `settings.audio.aec` and
+ *   passes `echoCancellation: { ideal: <value> }` to getUserMedia.
+ *   These switches sit ABOVE that constraint — when AEC3 is force-
+ *   enabled here, Chromium may still honour the renderer's
+ *   `echoCancellation: false` on a per-track basis, but on some
+ *   platforms the switches override and AEC stays on. The Audio
+ *   tab's AEC toggle sub-text surfaces this caveat to the user.
+ *   To make the user's "AEC off" setting authoritative, this block
+ *   would need to read settings.audio.aec at app boot and skip the
+ *   switches when false — achievable, but the read has to happen
+ *   before app.whenReady() resolves, which means hoisting
+ *   loadSettings() ahead of all the other imports. Out of Phase 2
+ *   scope; tracked as a future improvement.
+ */
+app.commandLine.appendSwitch('enable-features', 'WebRtcEchoCanceller3');
+app.commandLine.appendSwitch(
+  'force-fieldtrials',
+  'WebRTC-Audio-EchoCanceller3/Enabled/',
+);
+
 const WINDOW_WIDTH = 720;
 const WINDOW_HEIGHT = 440;
 const EDGE_MARGIN = 20;
 
 /**
- * Single in-flight Gemini Live session + its sibling text-coach session.
- * The overlay only ever captures from one mic at a time, so we keep both
- * as module-level singletons instead of per-window state.
+ * Single in-flight Gemini Live session + its sibling text-coach session
+ * + the Deepgram dual-channel STT session. The overlay only ever
+ * captures from one mic at a time, so we keep them all as module-level
+ * singletons instead of per-window state.
  *
  * Extension point: when adding multi-call support, key these by
  * webContents.id and route IPC events back to the correct sender.
  */
 let liveSession = null;
 let coachSession = null;
+let deepgramSession = null;
 let mainWindowRef = null;
+let sessionStartedAt = 0;
+
+/**
+ * Stage-2 quick-fix roller (Strategy A / Work-stream C).
+ *
+ * Lazily created on the first `record_meeting_fact` of a session (see
+ * the onMeetingFact callback in gemini:start). The roller owns its
+ * own debounce timer and the last-good-rollup state — keeping it as a
+ * module-level singleton mirrors the other per-call instances
+ * (liveSession / coachSession / deepgramSession) and gives
+ * teardownSession a single handle to cancel the pending timer.
+ *
+ * Cleared in teardownSession after `cancelPendingRollup()` so a
+ * stale roller from a previous session can't fire against a fresh
+ * coachContext.factsSheet — the factory is cheap to re-construct
+ * because all configuration lives on settings.
+ */
+let quickFixRoller = null;
+
+/**
+ * Module-level reference to the menu-bar / system-tray icon. Held here
+ * (rather than scoped inside whenReady()) for two reasons:
+ *
+ *   1. Tray on macOS/Linux is garbage-collected if it falls out of
+ *      scope, which silently removes the icon a few seconds after
+ *      launch. Keeping a strong reference at module top is the
+ *      idiomatic workaround.
+ *   2. `before-quit` needs to explicitly `destroy()` it on Windows
+ *      so the icon isn't left in the notification area until the
+ *      next hover.
+ *
+ * Constructed once in `createTray()` during `app.whenReady()`. Never
+ * re-created — the same Tray persists for the app's lifetime even if
+ * the BrowserWindow is closed and re-opened.
+ */
+let tray = null;
+
+let deepgramReconnectAttempts = 0;
+const MAX_DEEPGRAM_RECONNECTS = 3;
+
+/* ── Gemini Live reconnect plumbing (E3) ────────────────────────────
+ *
+ * Mirrors the Deepgram reconnect pattern above. Gemini Live's job in
+ * this app is flag detection (record_flag → live_signals pillar) plus
+ * fallback transcription when Deepgram is unavailable. Flag detection
+ * is the only capability Deepgram doesn't cover, so when the Live
+ * WebSocket drops we attempt a small number of reconnects before
+ * giving up — without reconnect, the rest of the call has no live
+ * flag detection (which is the UX symptom of the 36-minute drop in
+ * the test call).
+ *
+ * The Live drop is NOT fatal to the call: E2's decoupling in the
+ * renderer keeps the call going on Deepgram alone. The reconnect is
+ * a "try to recover flag detection" attempt, not a "keep the call
+ * alive" attempt.
+ *
+ * Cap of 3 attempts × 2 s backoff is intentionally identical to the
+ * Deepgram reconnect — same UX expectation ("a few seconds of
+ * degraded signals, then either back or definitively down"). No
+ * history replay on reconnect; the live model rebuilds state from
+ * the next few seconds of audio.
+ */
+let geminiReconnectAttempts = 0;
+const MAX_GEMINI_RECONNECTS = 3;
+
+/* ── Connection-status state (E4 / E5) ──────────────────────────────
+ *
+ * Mirror of the upstream transport health, broadcast to the renderer
+ * via the connection:status IPC. Each lifecycle handler
+ * (open / close / reconnect-start / reconnect-success / give-up)
+ * mutates the matching slot and calls broadcastConnectionStatus,
+ * which fires the IPC with the full snapshot. The renderer rolls the
+ * two slots up into one worst-of pill.
+ *
+ * State values
+ *   deepgram   — 'connected' | 'reconnecting' | 'down'
+ *   geminiLive — 'connected' | 'reconnecting' | 'down' | 'closed'
+ *                The 'closed' value is Gemini-Live-specific
+ *                soft-degrade: Deepgram is still canonical so the
+ *                call continues, but flag detection is unavailable
+ *                until reconnect succeeds.
+ *
+ * Reset to 'down' on every fresh session start (so a previous
+ * session's status doesn't leak into the new call's pill).
+ */
+const connectionState = {
+  /** @type {'connected'|'reconnecting'|'down'} */
+  deepgram: 'down',
+  /** @type {'connected'|'reconnecting'|'down'|'closed'} */
+  geminiLive: 'down',
+};
 
 /**
  * Rolling state the coach reads each tick. Lives in main (not the
  * renderer) so the coach has zero-IPC access to it. The renderer mirrors
- * the same scoring state via `scoring:item` / `scoring:field` events,
- * but main is the source of truth for the coach's context.
+ * the same scoring state via `scoring:item-state` / `scoring:field`
+ * events, but main is the source of truth for the coach's context.
  *
  * Reset on every `gemini:start` so a fresh call doesn't inherit stale
  * coverage.
  */
 const coachContext = {
-  /** @type {string[]} */
-  transcriptLines: [],     // committed turns, oldest first
-  pendingTranscript: '',   // current in-flight partial
-  coveredItemIds: new Set(),
+  /** @type {string[]} Committed turns prefixed with "You: " or "Prospect: ", oldest first. */
+  transcriptLines: [],
+
+  /**
+   * Current in-flight partials, keyed by speaker. With Deepgram active
+   * (Phase 4) both channels can have a partial in flight simultaneously
+   * — one for the salesperson mic, one for the system-audio loopback —
+   * so we can't share a single buffer.
+   *
+   * Each partial is REPLACED (not appended) on every interim message
+   * because Deepgram's interim_results give us the full current segment
+   * text each time. On `finished=true` the partial is committed to
+   * `transcriptLines` with the correct speaker prefix and the buffer
+   * is reset.
+   *
+   * When Deepgram isn't running (no API key), the legacy Gemini
+   * inputTranscription path normalises into this same buffer under the
+   * `you` key — see handleGeminiTranscript() for the accumulation path.
+   *
+   * @type {{ you: string, other: string }}
+   */
+  pendingTranscriptBySpeaker: { you: '', other: '' },
+
+  /**
+   * 4-state item lifecycle. Map<itemId, { state, evidence, confidence, at }>.
+   *   state — 'in_progress' | 'covered' | 'logged'
+   *   evidence — short quote from the transcript
+   *   confidence — 0..100, set by the coach
+   *   at — Date.now() when this state was last set; the auto-log
+   *     timer in maybeAutoLogStaleItems() uses this to demote
+   *     in_progress items to logged after AUTO_LOG_MS of silence.
+   */
+  itemStates: new Map(),
+
   /** @type {Record<string, { value: string, at: number }>} */
   capturedFields: {},
+
+  /**
+   * Structured monetary facts (Strategy A / Work-stream C).
+   *
+   * Populated by the coach via the `record_meeting_fact` tool. Each
+   * entry is a discrete quantitative fact (current spend, pain cost,
+   * time cost, etc.) with the raw amount, unit, period, and an anchor
+   * quote that lets the renderer drill back to the moment in the
+   * transcript where the number was stated.
+   *
+   * `entries` is the input to the Stage-2 quick-fix worker (see
+   * src/quick-fix.js). The worker rolls active entries (those NOT
+   * superseded by a newer one) up into a single annualised USD
+   * opportunity that lives on `quickFix`.
+   *
+   * Entry shape:
+   *   {
+   *     id: string,            // `${kind}__${Date.now()}` (stable per call)
+   *     kind: string,          // 'current_spend' | 'pain_cost' | …
+   *     amount: number,
+   *     unit: 'usd' | 'hours' | 'people' | 'percent',
+   *     period: 'one_time' | 'weekly' | 'monthly' | 'quarterly' | 'annual',
+   *     basis: string,
+   *     quote: string,         // ≤120 chars anchor quote
+   *     recordedAt: number,
+   *     supersedes: string | null,
+   *   }
+   *
+   * `quickFix` shape: null until the first successful rollup, then
+   *   {
+   *     headlineUsdAnnual: number,
+   *     breakdown: Array<{ label, amountUsdAnnual, source, notes }>,
+   *     assumptions: string[],
+   *     confidence: 'low' | 'medium' | 'high',
+   *     currency: 'USD',
+   *     updatedAt: number,
+   *     stale: boolean,        // true while Stage-2 is retrying after validation failure
+   *     error: boolean,        // true after ERROR_THRESHOLD consecutive failures
+   *   }
+   *
+   * Reset on every fresh session (resetCoachContext below).
+   */
+  factsSheet: {
+    entries: [],
+    quickFix: null,
+  },
+
+  /**
+   * Per-suggestion history (Advanced → Track question state).
+   *
+   * Map<suggestionId, {
+   *   id: string,            // `${itemId}__${Date.now()}` (stable; survives reformulation)
+   *   itemId: string,        // rubric item id (or 'freeform.*')
+   *   questionText: string,  // the spoken question the coach pinned
+   *   kind: string,          // 'next' | 'deeper' | 'pivot' | 'pause' | 'recap' | 'targeted' | 'reformulate'
+   *   pinnedAt: number,
+   *   asked: boolean,        // flipped by the coach via mark_question_asked
+   *   askedAt: number | null,
+   *   evidence: string | null,
+   *   replaced: boolean,     // true when a newer suggestion took the pin
+   * }>
+   *
+   * Populated unconditionally — the toggle gates whether the coach
+   * receives the PENDING SUGGESTIONS block, not whether main tracks
+   * history. Cheap to keep around (a few dozen entries per call) and
+   * keeps the renderer's drawer rendering consistent regardless of
+   * when the toggle flips.
+   *
+   * Reset on every session (resetCoachContext) so a new call starts
+   * with a clean slate.
+   */
+  suggestionHistory: new Map(),
 };
 
 const COACH_TRANSCRIPT_WINDOW_LINES = 40; // cap context size
 const COACH_RECENT_TURNS = 3;
 
+/* Auto-log heuristic: any item that's been sitting in `in_progress`
+ * for longer than this without a confirming `covered` update gets
+ * demoted to `logged` automatically. The hand-tuned value is a guess
+ * — re-tune once we have real call data. */
+const AUTO_LOG_MS = 30_000;
+const AUTO_LOG_CHECK_INTERVAL_MS = 5_000;
+
+let autoLogTimer = null;
+
+/* ── Coach mode + pause detection (v2.5 redesign) ──────────────────────
+ *
+ * Coach mode is a per-session setting forwarded from the renderer (with
+ * a localStorage default of 'signalled'). It controls whether the
+ * pause-detection nudge is active:
+ *
+ *   'signalled' (default) — the coach NEVER auto-suggests. Suggestions
+ *                           only come from the rep's explicit asks
+ *                           (Suggest / Deeper / Pivot) or a skip.
+ *   'automated'           — same as signalled, PLUS the pause detector
+ *                           fires a `kind: 'pause'` request whenever
+ *                           the transcript has been silent on both
+ *                           channels for PAUSE_THRESHOLD_MS and there's
+ *                           no currently-pinned suggestion.
+ *
+ * The mode is held here in main rather than on the Coach instance
+ * because main owns the canonical transcript stream timing — the
+ * pause detector keys off `lastTranscriptAt`, which is updated
+ * in-line by handleDeepgramTranscript / handleGeminiTranscript.
+ */
+let coachMode = 'signalled';
+
+/** Timestamp of the most recent transcript activity from either
+ *  speaker — committed line OR interim partial. The pause detector
+ *  compares Date.now() against this to decide whether enough silence
+ *  has elapsed to warrant a nudge. Reset to Date.now() at session
+ *  start so the first 6s of warm-up isn't treated as a pause. */
+let lastTranscriptAt = 0;
+
+/** One-shot guard: set to true once a pause-triggered suggestion has
+ *  fired for the current silence; cleared by `markTranscriptActivity`
+ *  on the next transcript activity so subsequent pauses can still
+ *  fire. Without this we'd nudge once a second during a long quiet
+ *  stretch. */
+let pendingPauseFired = false;
+
+let pauseCheckTimer = null;
+
+/** Silence threshold for the Automated-mode pause detector. */
+const PAUSE_THRESHOLD_MS = 6_000;
+const PAUSE_CHECK_INTERVAL_MS = 1_000;
+
+/**
+ * One-shot timer that fires the coach's opening "kickstart" question
+ * shortly after a fresh session starts. The goal is to remove the
+ * "what do I ask first?" cognitive load — within ~10s of the user
+ * clicking Start, the coach surfaces a strong opening prompt
+ * (typically an agenda-confirm / "what brings us together today"
+ * since `opening_agenda.*` items are the highest-priority uncovered
+ * pillar at call start) unless it has already done so on its own.
+ *
+ * Lifecycle:
+ *   - Armed in `gemini:start` once liveSession.open() succeeds.
+ *   - Cancelled in `teardownSession()` so a fast Start → Stop →
+ *     Start cycle never leaves a zombie timer that would fire
+ *     against a torn-down or replaced coachSession.
+ */
+let kickstartTimer = null;
+const KICKSTART_DELAY_MS = 10_000;
+
+/**
+ * Advanced → Auto-reformulate: re-fire 10s after a pinned suggestion
+ * that the seller hasn't asked. Lives at module scope so the IPC
+ * handlers (skip / boost / ask) can cancel it from outside the
+ * onSuggestion callback.
+ *
+ * Lifecycle:
+ *   - Armed in onSuggestion when both `trackQuestionState` and
+ *     `autoReformulate` are on. Replaces any previous timer (so
+ *     each fresh pin resets the 10s clock).
+ *   - Cleared explicitly when the seller manually skips / boosts /
+ *     asks via the IPC handlers — the seller's intent overrides the
+ *     auto-reformulate window.
+ *   - Cleared in teardownSession() + resetCoachContext() so a
+ *     timer from a previous call can't fire against a torn-down
+ *     coach session.
+ *
+ * Spec: 10s. Calibrated so the rep has time to actually ask the
+ * pinned suggestion at a natural pause, but not so long that an
+ * abandoned question lingers across a whole topic shift.
+ */
+let reformulateTimer = null;
+const REFORMULATE_DELAY_MS = 10_000;
+
+/**
+ * Id of the currently-pinned suggestion entry in `coachContext.suggestionHistory`,
+ * or null when no suggestion is pinned. Set in the `onSuggestion` callback
+ * whenever a new suggestion takes the pin slot. The previously-pinned
+ * entry (if any) gets its `replaced: true` flag flipped at the same
+ * time so the renderer can distinguish "this was the active suggestion
+ * but a newer one replaced it" from "this is the active suggestion".
+ *
+ * Cleared on session teardown via `resetCoachContext()`.
+ */
+let currentPinnedSuggestionId = null;
+
 function resetCoachContext() {
   coachContext.transcriptLines = [];
-  coachContext.pendingTranscript = '';
-  coachContext.coveredItemIds = new Set();
+  coachContext.pendingTranscriptBySpeaker = { you: '', other: '' };
+  coachContext.itemStates = new Map();
   coachContext.capturedFields = {};
+  coachContext.suggestionHistory = new Map();
+  // Wipe the Strategy A facts sheet so the new call starts with an
+  // empty rollup. The Stage-2 worker's debounce timer is cancelled
+  // by teardownSession (which fires before resetCoachContext on a
+  // fresh start) so a late roll-up can't land against the new
+  // session's empty entries.
+  coachContext.factsSheet = { entries: [], quickFix: null };
+  currentPinnedSuggestionId = null;
+  // Treat the session start as "fresh transcript activity" so the
+  // pause detector doesn't immediately trip on an empty buffer.
+  lastTranscriptAt = Date.now();
+  pendingPauseFired = false;
+  // Drop any cross-channel dedupe entries from a previous session —
+  // the 3 s window normally protects us across restart latency, but a
+  // very fast re-Start could otherwise let a stale "you" commit drop
+  // a legitimate opening line on the new call.
+  recentCommitBySpeaker.you = null;
+  recentCommitBySpeaker.other = null;
+  deepgramReconnectAttempts = 0;
+  geminiReconnectAttempts = 0;
+  // Reset connection-status state so a previous session's "down"
+  // doesn't leak into the new session's header pill. The broadcast
+  // fires the empty state to the renderer, which renders 'down/down'
+  // until the new sessions report 'connected'.
+  setConnectionStatus('deepgram', 'down');
+  setConnectionStatus('geminiLive', 'down');
+  // Cancel any in-flight auto-reformulate window from the previous
+  // session so it can't fire against a torn-down or replaced
+  // coachSession.
+  if (reformulateTimer) {
+    clearTimeout(reformulateTimer);
+    reformulateTimer = null;
+  }
 }
+
+/**
+ * Attempt to reopen a new DeepgramSession after an unexpected close.
+ * Capped at MAX_DEEPGRAM_RECONNECTS attempts per call; resets to 0
+ * on success or on a fresh gemini:start (via resetCoachContext).
+ *
+ * The user experience is intentionally seamless: no error banner is
+ * shown unless we exhaust all retries. A brief transcription gap is
+ * acceptable — coach context is unaffected because no new lines can
+ * arrive during the gap, not because we lost existing context.
+ *
+ * Call-active check: both liveSession AND coachSession being null
+ * means teardownSession() has already run (user pressed Stop, or an
+ * earlier fatal error cleaned up). In that case we skip silently.
+ */
+async function reconnectDeepgram() {
+  if (deepgramReconnectAttempts >= MAX_DEEPGRAM_RECONNECTS) {
+    console.error('[deepgram] max reconnects reached — giving up');
+    send('gemini:error', { message: 'Transcription connection lost after multiple retries.' });
+    setConnectionStatus('deepgram', 'down');
+    return;
+  }
+  deepgramReconnectAttempts++;
+  console.log(`[deepgram] reconnecting (attempt ${deepgramReconnectAttempts})…`);
+  setConnectionStatus('deepgram', 'reconnecting');
+  await new Promise((r) => setTimeout(r, 2000));
+  if (!liveSession && !coachSession) {
+    console.log('[deepgram] call already ended — skipping reconnect');
+    return;
+  }
+  // Commit any in-flight partial that landed JUST before Deepgram
+  // dropped, so the new session's first interim_results message can't
+  // overwrite it. The Deepgram client buffers `text` on every interim
+  // and replaces (not appends) on the next one, so without this flush
+  // we'd silently lose whatever the rep / prospect was mid-sentence
+  // saying at the exact moment the WebSocket closed.
+  flushPendingTranscripts();
+  try {
+    const key = process.env.DEEPGRAM_API_KEY;
+    // Re-read settings on reconnect so a model change made while the
+    // call was in flight takes effect on the next WS open. Settings
+    // changes don't hot-swap an existing connection but a reconnect
+    // is the cheapest natural boundary to refresh on.
+    const newSession = new DeepgramSession({
+      apiKey: key,
+      model: getAudio().deepgramModel,
+      onTranscript: handleDeepgramTranscript,
+      onError: (message) => {
+        console.warn('[deepgram] error after reconnect:', message);
+      },
+      onClose: () => {
+        console.warn('[deepgram] connection closed after reconnect');
+        reconnectDeepgram();
+      },
+    });
+    await newSession.open();
+    deepgramSession = newSession;
+    deepgramReconnectAttempts = 0;
+    console.log('[deepgram] reconnected successfully');
+    setConnectionStatus('deepgram', 'connected');
+  } catch (err) {
+    console.error('[deepgram] reconnect failed:', err?.message || err);
+    reconnectDeepgram();
+  }
+}
+
+/**
+ * Open (or re-open) the Gemini Live session. Factored out of the
+ * gemini:start handler so the reconnect path (reconnectGeminiLive
+ * below) can re-use the same construction + handler wiring.
+ *
+ * The session's role in this app is narrow: it's the sole producer of
+ * the red/green coaching flags (record_flag → live_signals pillar)
+ * and the fallback transcription path when Deepgram is unavailable.
+ * Closures captured here always check `liveSession === created` before
+ * mutating the singleton, so a stale handler from an earlier session
+ * can't clobber a newer one.
+ *
+ * `onClose` fires `reconnectGeminiLive()` on every close — the
+ * reconnect helper's attempt-cap is the gate that decides whether to
+ * keep trying or give up.
+ */
+async function openGeminiLiveSession({ apiKey }) {
+  const created = new GeminiSession({
+    apiKey,
+    onTranscript: handleGeminiTranscript,
+    onTurnComplete: handleTurnComplete,
+    onFlag: (payload) => {
+      console.log('[scoring] flag:', payload.id, '—', payload.evidence);
+      send('scoring:flag', payload);
+    },
+    onError: (message) => {
+      console.error('[gemini] session error:', message);
+      send('gemini:error', { message });
+      // The session is already in 'closed' state; clear our reference.
+      // We deliberately don't trigger reconnect from onError — the
+      // session's _fail path always calls onClose() too (via the
+      // session.close() in _fail), and that's where the reconnect
+      // decision lives. Doing it in both would double-fire.
+      if (liveSession === created) liveSession = null;
+    },
+    onClose: (reason) => {
+      console.log('[gemini] session closed:', reason);
+      send('gemini:closed', { reason });
+      if (liveSession === created) liveSession = null;
+      // Trigger reconnect attempt. The renderer's E2 handler treats
+      // this as a soft degrade while Deepgram is canonical, so the
+      // call doesn't end — but live flag detection stops until the
+      // reconnect lands. Capped at MAX_GEMINI_RECONNECTS attempts.
+      reconnectGeminiLive({ apiKey });
+    },
+  });
+  await created.open();
+  liveSession = created;
+  setConnectionStatus('geminiLive', 'connected');
+  return created;
+}
+
+/**
+ * Attempt to re-open a fresh Gemini Live session after an unexpected
+ * close. Mirrors `reconnectDeepgram` — 3 attempts, 2 s backoff, no
+ * history replay (the live model rebuilds state from the next few
+ * seconds of audio, which is faster and more reliable than trying to
+ * carry session context across a WebSocket break).
+ *
+ * Gating:
+ *   - Stop once the call is over (`!liveSession && !coachSession` means
+ *     teardownSession() has already run; the previous session's
+ *     close handler may still be firing this late).
+ *   - Stop after MAX_GEMINI_RECONNECTS attempts; the renderer's pill
+ *     surfaces 'down' so the rep knows live flag detection is
+ *     unavailable for the rest of the call. The transcript path is
+ *     unaffected because Deepgram is canonical.
+ *
+ * Why we reconnect at all (per the E1 verification): flag detection
+ * is the only Gemini-Live-only capability. Transcripts are fallback
+ * only. So reconnect is purely a "try to bring back live flag
+ * detection" attempt — not a "keep the call alive" attempt (E2
+ * handles call survival in the renderer).
+ */
+async function reconnectGeminiLive({ apiKey }) {
+  if (geminiReconnectAttempts >= MAX_GEMINI_RECONNECTS) {
+    console.error('[gemini] max reconnects reached — giving up on flag detection for this call');
+    setConnectionStatus('geminiLive', 'down');
+    return;
+  }
+  geminiReconnectAttempts++;
+  console.log(`[gemini] reconnecting (attempt ${geminiReconnectAttempts})…`);
+  setConnectionStatus('geminiLive', 'reconnecting');
+  await new Promise((r) => setTimeout(r, 2000));
+  // If the call ended during the backoff, drop the reconnect. We
+  // check both sessions because teardownSession nulls them in order
+  // and a race could leave either one non-null briefly.
+  if (!liveSession && !coachSession) {
+    console.log('[gemini] call already ended — skipping reconnect');
+    return;
+  }
+  // A previous reconnect attempt may have already opened a new
+  // session; if liveSession is non-null we're done.
+  if (liveSession) {
+    console.log('[gemini] session already re-opened — skipping reconnect');
+    geminiReconnectAttempts = 0;
+    setConnectionStatus('geminiLive', 'connected');
+    return;
+  }
+  try {
+    await openGeminiLiveSession({ apiKey });
+    geminiReconnectAttempts = 0;
+    console.log('[gemini] reconnected successfully');
+  } catch (err) {
+    console.error('[gemini] reconnect failed:', err?.message || err);
+    // openGeminiLiveSession's onClose handler will fire reconnect
+    // again — but it only fires if the session actually opened then
+    // closed. If openGeminiLiveSession threw before opening, we need
+    // to retry here to keep the cycle going.
+    reconnectGeminiLive({ apiKey });
+  }
+}
+
+/**
+ * Called from the transcript handlers whenever new text arrives (either
+ * an interim partial or a committed line, from either speaker). Two
+ * jobs: bump `lastTranscriptAt` so the pause detector sees freshness,
+ * and clear the one-shot `pendingPauseFired` guard so the next silence
+ * can fire its own nudge.
+ */
+function markTranscriptActivity() {
+  lastTranscriptAt = Date.now();
+  pendingPauseFired = false;
+}
+
+/**
+ * Periodic check (Automated mode only). Fires a `kind: 'pause'`
+ * suggestion request when:
+ *   - coach mode is 'automated' AND
+ *   - a coach session is running AND
+ *   - no suggestion is currently pinned AND
+ *   - ≥ PAUSE_THRESHOLD_MS has elapsed since the last transcript
+ *     activity AND
+ *   - we haven't already fired a pause-nudge for this silence
+ *
+ * The "pinned suggestion" check is delegated to the Coach instance
+ * (`hasPinnedSuggestion`) so the rep doesn't get a new suggestion
+ * dropped on top of one they haven't acted on yet.
+ */
+function maybeFirePauseNudge() {
+  if (coachMode !== 'automated') return;
+  if (!coachSession) return;
+  if (pendingPauseFired) return;
+  if (coachSession.hasPinnedSuggestion?.()) return;
+  if (lastTranscriptAt === 0) return;
+  const elapsed = Date.now() - lastTranscriptAt;
+  if (elapsed < PAUSE_THRESHOLD_MS) return;
+  pendingPauseFired = true;
+  console.log('[coach] pause nudge fired (silence =', elapsed, 'ms)');
+  coachSession.requestSuggestion({ kind: 'pause' });
+}
+
+function speakerPrefix(speaker) {
+  return speaker === 'you' ? 'You: ' : 'Prospect: ';
+}
+
+/**
+ * Walk `transcriptLines` backwards looking for the most recent committed
+ * line spoken by `speaker`. Returns the array index or -1 if none found
+ * within the lookback window.
+ *
+ * Why a bounded lookback: this is used by the prefix-extension dedupe
+ * below. Deepgram (with the speech_final gating fix in deepgram-session)
+ * should only commit once per utterance — but if VAD fires two
+ * `speech_final`s back-to-back on a continuation, we'd see two adjacent
+ * lines for the same speaker where the second's text starts with the
+ * first's text. The dedupe target is therefore always very recent; we
+ * only need to skip over a small number of other-speaker interjections
+ * ("uh-huh", "right") that may have landed in between. A wider scan
+ * would risk merging into a stale earlier utterance.
+ */
+function findLastLineBySpeaker(lines, speaker, maxLookback = 4) {
+  const prefix = speakerPrefix(speaker);
+  const start = lines.length - 1;
+  const end = Math.max(0, start - maxLookback + 1);
+  for (let i = start; i >= end; i--) {
+    if (typeof lines[i] === 'string' && lines[i].startsWith(prefix)) return i;
+  }
+  return -1;
+}
+
+/**
+ * Walk `transcriptLines` backwards and splice out the most recent line
+ * for `speaker` whose text is near-identical to `committed`. Used by
+ * the cross-channel dedupe when a PROSPECT commit matches a YOU line
+ * that already landed — the bias is to keep PROSPECT, so the
+ * pre-existing YOU line is yanked.
+ *
+ * Bounded lookback for the same reason as findLastLineBySpeaker: the
+ * duplicate is always very recent, and a wider scan risks eating an
+ * unrelated earlier turn.
+ *
+ * Returns true iff a line was removed.
+ */
+function findAndRemoveMatchingLine(lines, speaker, committed, maxLookback = 4) {
+  const prefix = speakerPrefix(speaker);
+  const start = lines.length - 1;
+  const end = Math.max(0, start - maxLookback + 1);
+  for (let i = start; i >= end; i--) {
+    const line = lines[i];
+    if (typeof line !== 'string') continue;
+    if (!line.startsWith(prefix)) continue;
+    const text = line.slice(prefix.length);
+    if (isNearIdentical(text, committed)) {
+      lines.splice(i, 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ── Cross-channel duplicate suppression ───────────────────────────────
+ *
+ * The IPC routing (sendMicAudio → channel 1, sendSystemAudio → channel
+ * 2) is clean, so the two Deepgram channels carry physically separate
+ * audio streams. Despite that, the user is seeing every utterance
+ * transcribed on BOTH channels — once labelled YOU and once labelled
+ * PROSPECT — with character-identical text. The likely physical paths:
+ *
+ *   - Mic picking up the prospect's voice from the user's speakers
+ *     even with AEC3 (open-air room, low headroom).
+ *   - User's own voice being routed back through the system-audio
+ *     loopback (Zoom Original Sound, sidetone/monitor, BlackHole or
+ *     Loopback virtual device, etc.).
+ *
+ * We don't try to fix this at the audio layer — instead we suppress
+ * the visible symptom by tracking the most recent committed line per
+ * speaker and removing same-window commits on the OTHER channel when
+ * the text is near-identical.
+ *
+ * ── Attribution bias: always keep PROSPECT, drop YOU ────────────────
+ *
+ * Cross-channel duplicates almost always come from one source: the AI
+ * / prospect voice playing through the user's speakers and bleeding
+ * into their mic. The loopback (PROSPECT channel) captures it cleanly
+ * from the OS audio mixer; the mic (YOU channel) captures the same
+ * content as acoustic echo. The "first to finalize" heuristic is
+ * unreliable because finalisation timing depends on Deepgram's VAD
+ * per stream, not the actual order the audio arrived. Defaulting to
+ * "keep PROSPECT" is correct in the common case (speakerphone bleed)
+ * and only wrong in the rare case where the user's own voice is
+ * routed back through system audio (Zoom monitor mode, sidetone,
+ * virtual loopback devices) — that's a setup quirk we surface
+ * separately, not the default.
+ *
+ * Tuning:
+ *   - WINDOW_MS = 5 s: mic and loopback can finalize on different
+ *     VAD timings; 3 s was too tight when one channel was noticeably
+ *     later than the other.
+ *   - MIN_CHARS = 3: short fragments ("Look.", "But", "Honestly,")
+ *     are the most common form the bleed takes when the AI voice is
+ *     broken up by the speech-final VAD. The length-aware logic in
+ *     `isNearIdentical` keeps unrelated short strings ("yes" vs
+ *     "yeah") from colliding by requiring exact normalised match on
+ *     anything ≤ 12 chars.
+ */
+const CROSS_CHANNEL_WINDOW_MS = 5000;
+const CROSS_CHANNEL_DEDUPE_MIN_CHARS = 3;
+
+/**
+ * Recent transcript commits, keyed by speaker, used to suppress
+ * cross-channel duplicates. When the prospect (or rep) speaks and that
+ * audio bleeds onto the other channel via speaker echo or sidetone,
+ * Deepgram transcribes it on both channels with near-identical text.
+ *
+ * Both directions are checked, but the resolution rule is biased: see
+ * the "Attribution bias" block above. We do NOT rely on "first to
+ * arrive wins" — Deepgram's per-stream VAD makes that ordering
+ * unreliable when one channel's audio is delayed by acoustic bleed.
+ *
+ * Entry: { text: string, ts: number }. We only need the most recent
+ * commit per speaker — older entries fall out of the window naturally.
+ *
+ * @type {{ you: { text: string, ts: number } | null, other: { text: string, ts: number } | null }}
+ */
+const recentCommitBySpeaker = { you: null, other: null };
+
+/** Lowercase + strip non-alphanumerics + collapse whitespace. The
+ *  goal is to make "So you're basically looking to..." and "so you're
+ *  basically looking to" hash to the same canonical form so ASR
+ *  capitalisation / punctuation drift between channels doesn't defeat
+ *  the dedupe. */
+function normaliseForMatch(s) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+/**
+ * Length-aware near-identity check for cross-channel dedup.
+ *
+ *   - Exact match on the normalised strings always wins — that's the
+ *     common case for the bleed pattern this is targeting ("Look." vs
+ *     "Look.", "Hello there" vs "Hello there").
+ *   - For short normalised strings (≤ shortLen chars), exact match is
+ *     the ONLY way to dedupe. Substring containment and token Jaccard
+ *     are meaningless on 1–2 token strings and would catch unrelated
+ *     content like "yes" vs "yeah" or "but" vs "buttons".
+ *   - For longer strings, fall through to the original substring +
+ *     Jaccard checks, which absorb one channel catching a slightly
+ *     longer tail / head or a single ASR substitution.
+ *
+ * Deliberately NOT full Levenshtein — these run on every commit and
+ * Jaccard is O(n) once tokenised. The conservative thresholds (and
+ * the MIN_CHARS gate at the call site) are the safety net against
+ * false-positive drops.
+ */
+function isNearIdentical(a, b) {
+  const na = normaliseForMatch(a);
+  const nb = normaliseForMatch(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  // For short strings (≤12 normalised chars), require exact match only.
+  // The Jaccard token check is meaningless on 1–2 token strings and
+  // would catch unrelated content like "yes" vs "yeah".
+  const shortLen = 12;
+  if (na.length <= shortLen || nb.length <= shortLen) return false;
+  if (na.length >= nb.length && na.includes(nb)) return true;
+  if (nb.length >= na.length && nb.includes(na)) return true;
+  const ta = new Set(na.split(/\s+/));
+  const tb = new Set(nb.split(/\s+/));
+  let intersection = 0;
+  for (const w of ta) if (tb.has(w)) intersection++;
+  const union = ta.size + tb.size - intersection;
+  return union > 0 && intersection / union >= 0.85;
+}
+
+/**
+ * Diagnostic logging gate for the transcript pipeline. Off by default
+ * because it fires on every Deepgram commit; flip to `true` when
+ * debugging the cross-channel dedupe or the prefix-extension dedupe
+ * to see a one-line summary per commit (speaker, kind, KEEP/DROP, and
+ * a 50-char preview of the text).
+ */
+const DEBUG_TRANSCRIPT = false;
 
 function buildCoachContextSnapshot() {
   const lines = coachContext.transcriptLines.slice(-COACH_TRANSCRIPT_WINDOW_LINES);
-  if (coachContext.pendingTranscript) lines.push(coachContext.pendingTranscript);
+
+  // Append any in-flight partials so the coach can react to a turn the
+  // moment it starts rather than waiting for the final commit. Each
+  // pending segment is prefixed by speaker so the model can tell who
+  // is mid-sentence.
+  for (const speaker of /** @type {const} */ (['you', 'other'])) {
+    const pending = coachContext.pendingTranscriptBySpeaker[speaker];
+    if (pending) lines.push(speakerPrefix(speaker) + pending);
+  }
+
+  // Materialise the Map as a plain object for the coach prompt builder.
+  /** @type {Record<string, { state: string, evidence?: string, confidence?: number, at?: number }>} */
+  const itemStates = {};
+  for (const [id, s] of coachContext.itemStates) itemStates[id] = s;
+
   return {
     transcriptWindow: lines.join('\n'),
-    coveredItemIds: [...coachContext.coveredItemIds],
+    itemStates,
     capturedFields: coachContext.capturedFields,
     recentSellerTurns: coachContext.transcriptLines.slice(-COACH_RECENT_TURNS),
+    // Recap-specific window: "everything since the rep last asked a
+    // tracked question". Computed at snapshot time so the Coach can
+    // pull it for kind:'recap' ticks without having to know how the
+    // suggestion history is stored. See getRecapWindow() doc-block
+    // for fallback semantics when no question has been asked yet.
+    recapWindow: getRecapWindow(),
   };
+}
+
+/**
+ * Build the transcript slice the coach should use for a Recap-kind
+ * suggestion.
+ *
+ * Test-call finding 5: the previous Recap behaviour used the standard
+ * trailing 40-line window, which on long calls drifted further and
+ * further from the "since the last question landed" boundary the rep
+ * actually wanted to recap from. The fix is to remember where the
+ * transcript was at each asked event (stamped onto the history entry
+ * by applyMarkAsked → `transcriptIndexAtAsk`) and slice from there.
+ *
+ * Fallback semantics:
+ *   - If no asked entry has been stamped yet (e.g. early call, or the
+ *     rep is in signalled mode and hasn't asked anything tracked), we
+ *     fall back to the same trailing window the standard tick uses
+ *     (`COACH_TRANSCRIPT_WINDOW_LINES`) so a recap requested in the
+ *     first beat of the call still has something useful to summarise.
+ *   - If the stamp exists but is ≥ transcriptLines.length (race: the
+ *     stamp landed but the transcript hasn't grown since), the slice
+ *     would be empty; we degrade to the trailing window for the same
+ *     reason.
+ *
+ * Return shape: `{ lines: string[], sinceAskedAt: number | null }`.
+ * `sinceAskedAt` is the askedAt timestamp of the entry we sliced from
+ * (null when we fell back). The coach prompt can format this as a
+ * human-readable duration if we ever surface "Recap covers the last
+ * 2:14" to the rep.
+ *
+ * Walked newest-first across `suggestionHistory.values()` and bails on
+ * the first `asked === true` we find. Map insertion order is preserved
+ * across reformulates / replacements so the latest-asked entry is
+ * structurally the latest in the iteration order.
+ */
+function getRecapWindow() {
+  let latestAsked = null;
+  for (const entry of coachContext.suggestionHistory.values()) {
+    if (entry?.asked && typeof entry.transcriptIndexAtAsk === 'number') {
+      // Each newer asked entry wins because Map iteration is insertion-
+      // order — and registerSuggestion always inserts at the end, so
+      // the last asked entry we see in the walk IS the most recent.
+      latestAsked = entry;
+    }
+  }
+  const total = coachContext.transcriptLines.length;
+  if (latestAsked && latestAsked.transcriptIndexAtAsk < total) {
+    return {
+      lines: coachContext.transcriptLines.slice(latestAsked.transcriptIndexAtAsk),
+      sinceAskedAt: latestAsked.askedAt,
+    };
+  }
+  // Fallback to the standard trailing window so a recap requested
+  // before any question has been asked still has context.
+  return {
+    lines: coachContext.transcriptLines.slice(-COACH_TRANSCRIPT_WINDOW_LINES),
+    sinceAskedAt: null,
+  };
+}
+
+/**
+ * Run periodically (every AUTO_LOG_CHECK_INTERVAL_MS) while a session
+ * is active. Demotes any item in `in_progress` whose last `at` is
+ * older than AUTO_LOG_MS to `logged` and forwards the transition to
+ * the renderer. Coach context's itemStates is the source of truth, so
+ * we update it in place and emit the same `scoring:item-state` event
+ * the model emits to keep the renderer in sync.
+ */
+function maybeAutoLogStaleItems() {
+  if (!coachSession) return;
+  const cutoff = Date.now() - AUTO_LOG_MS;
+  for (const [itemId, entry] of coachContext.itemStates) {
+    if (entry?.state !== 'in_progress') continue;
+    if ((entry.at ?? 0) > cutoff) continue;
+    const updated = {
+      state: 'logged',
+      evidence: entry.evidence || '',
+      confidence: entry.confidence ?? 0,
+      at: Date.now(),
+      // Tag the source so the renderer / future debugging knows this
+      // wasn't a model-driven transition.
+      source: 'auto_log_timeout',
+    };
+    coachContext.itemStates.set(itemId, updated);
+    console.log('[coach] auto-logged stale item:', itemId);
+    send('scoring:item-state', {
+      itemId,
+      state: updated.state,
+      evidence: updated.evidence,
+      confidence: updated.confidence,
+      source: updated.source,
+    });
+  }
+}
+
+/* ── Suggestion history (Advanced → Track question state) ────────────
+ *
+ * The Coach reports each new pinned suggestion via `onSuggestion`.
+ * We keep a per-call history of every pin so:
+ *   (a) the model can validate against it via `mark_question_asked`,
+ *   (b) the renderer can surface asked / replaced annotations under
+ *       the `logged_questions` synthetic pillar,
+ *   (c) the 10s auto-reformulate timer has something to read.
+ *
+ * Entries are added by `registerSuggestion`, flipped to `asked: true`
+ * by `applyMarkAsked` (model-driven), and flipped to `replaced: true`
+ * by `registerSuggestion` itself whenever a new pin lands on top of
+ * an existing one.
+ *
+ * Renderer sync: every mutation runs through `broadcastSuggestionHistory`,
+ * which sends the full serialised list on `scoring:suggestion-history`.
+ * Cheap — the history rarely exceeds a few dozen entries per call. */
+
+/** Generate a stable id for a new suggestion entry. We use crypto.randomUUID
+ *  when available (Electron always has it in main) for guaranteed
+ *  uniqueness across reformulations that fire within the same millisecond,
+ *  falling back to a `${itemId}__${ms}__${counter}` shape so two distinct
+ *  test environments can both keep working. */
+let _suggestionIdCounter = 0;
+function generateSuggestionId(itemId) {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  _suggestionIdCounter += 1;
+  return `${itemId || 'sug'}__${Date.now()}__${_suggestionIdCounter}`;
+}
+
+/** Serialise the history Map into a plain array (oldest first) for
+ *  IPC transport — Map is not structured-clone friendly across the
+ *  contextIsolation boundary. */
+function serialiseSuggestionHistory() {
+  return Array.from(coachContext.suggestionHistory.values()).map((entry) => ({
+    id: entry.id,
+    itemId: entry.itemId,
+    questionText: entry.questionText,
+    kind: entry.kind,
+    pinnedAt: entry.pinnedAt,
+    asked: entry.asked,
+    askedAt: entry.askedAt,
+    evidence: entry.evidence,
+    replaced: entry.replaced,
+  }));
+}
+
+/** Push the current history to the renderer. Called after every
+ *  mutation. The renderer treats the payload as the full snapshot —
+ *  it just replaces state.suggestionHistory wholesale. */
+function broadcastSuggestionHistory() {
+  send('scoring:suggestion-history', serialiseSuggestionHistory());
+}
+
+/**
+ * Register a freshly-pinned suggestion in history. Called from the
+ * `onSuggestion` callback before the IPC fan-out to the renderer.
+ * Any previously-pinned (still-unresolved) entry has `replaced: true`
+ * flipped — the old wording is still visible in the drawer but is
+ * no longer the active suggestion.
+ *
+ * Returns the new entry id so the caller can stash it as the
+ * current pin.
+ */
+function registerSuggestion({ itemId, questionText, kind }) {
+  // Flip the previously-pinned entry to `replaced` so the renderer
+  // knows the old wording is no longer active. `currentPinnedSuggestionId`
+  // gets overwritten below.
+  if (currentPinnedSuggestionId) {
+    const prev = coachContext.suggestionHistory.get(currentPinnedSuggestionId);
+    if (prev && !prev.asked) {
+      prev.replaced = true;
+    }
+  }
+  const id = generateSuggestionId(itemId);
+  const entry = {
+    id,
+    itemId: typeof itemId === 'string' ? itemId : '',
+    questionText: typeof questionText === 'string' ? questionText : '',
+    kind: typeof kind === 'string' ? kind : 'next',
+    pinnedAt: Date.now(),
+    asked: false,
+    askedAt: null,
+    evidence: null,
+    replaced: false,
+  };
+  coachContext.suggestionHistory.set(id, entry);
+  currentPinnedSuggestionId = id;
+  return id;
+}
+
+/**
+ * Flip a history entry to `asked: true` based on a model-driven
+ * `mark_question_asked` call. Tolerant of unknown ids — a model that
+ * hallucinates an id (or references one from a previous session
+ * after a fast restart) is a no-op rather than an error.
+ *
+ * Also cancels the auto-reformulate timer if the asked entry is the
+ * currently-pinned one — there's no point rephrasing a question the
+ * seller has already asked.
+ */
+function applyMarkAsked({ suggestionId, evidence }) {
+  const entry = coachContext.suggestionHistory.get(suggestionId);
+  if (!entry) {
+    console.warn('[coach] mark_question_asked for unknown id:', suggestionId);
+    return false;
+  }
+  if (entry.asked) return false;
+  entry.asked = true;
+  entry.askedAt = Date.now();
+  entry.evidence = typeof evidence === 'string' ? evidence : '';
+  // Stamp the transcript index at the moment the question was
+  // observed-as-asked. getRecapWindow() reads this to slice the
+  // transcript so the next Recap covers ONLY the conversation that
+  // happened SINCE the rep last asked a tracked question — which is
+  // the "where did the prospect land?" window the rep actually
+  // wants to recap. Without this stamp the recap would always re-read
+  // the same trailing 40 lines, which is the v2 behaviour we're
+  // tightening here (Test-call note 5).
+  //
+  // Using `length` (not `length - 1`) so the slice is "everything
+  // from this point forward, exclusive of the question turn itself".
+  // The seller's question gets included naturally as the first line
+  // of the recap window the next time it fires.
+  entry.transcriptIndexAtAsk = coachContext.transcriptLines.length;
+  if (currentPinnedSuggestionId === suggestionId && reformulateTimer) {
+    clearTimeout(reformulateTimer);
+    reformulateTimer = null;
+  }
+  console.log('[coach] question asked:', suggestionId, '—', entry.evidence);
+  return true;
+}
+
+/**
+ * Arm the 10s auto-reformulate timer for the currently-pinned
+ * suggestion. Called from `onSuggestion` after a new pin lands.
+ * Reads the live Advanced settings each time so flipping the toggle
+ * mid-call takes effect immediately without restarting the session
+ * (the next pin sees the new value).
+ *
+ * Both toggles must be true — `autoReformulate` alone is useless
+ * without `trackQuestionState` because the timer's "still pinned and
+ * not yet asked?" check needs the asked-detection signal.
+ */
+function armReformulateTimer(suggestionId) {
+  if (reformulateTimer) {
+    clearTimeout(reformulateTimer);
+    reformulateTimer = null;
+  }
+  const coach = getCoach();
+  if (!coach?.trackQuestionState || !coach?.autoReformulate) return;
+  // Gated on coachMode === 'automated' so signalled mode never auto-
+  // refires a reformulation the rep didn't ask for. The drawer-level
+  // toggles (trackQuestionState / autoReformulate) STILL matter — they
+  // control whether tracking happens at all — but signalled mode adds a
+  // hard upper bound on automatic coach activity. Test-call note 5
+  // surfaced the leak: signalled mode was still firing reformulates
+  // every 10s of an unasked pin.
+  if (coachMode !== 'automated') return;
+  reformulateTimer = setTimeout(() => {
+    reformulateTimer = null;
+    if (!coachSession) return;
+    // Re-validate: the pin may have rotated, the entry may have
+    // been asked, or the seller may have skipped between arm and
+    // fire. Bail in any of those cases.
+    if (suggestionId !== currentPinnedSuggestionId) return;
+    const entry = coachContext.suggestionHistory.get(suggestionId);
+    if (!entry || entry.asked || entry.replaced) return;
+    // Final live toggle check — the user may have flipped it off
+    // during the 10s window. Re-check coachMode too in case it
+    // flipped from automated → signalled during the window.
+    const live = getCoach();
+    if (!live?.trackQuestionState || !live?.autoReformulate) return;
+    if (coachMode !== 'automated') return;
+    console.log('[coach] auto-reformulating pinned suggestion:', entry.itemId);
+    coachSession.requestSuggestion({ kind: 'reformulate', itemId: entry.itemId });
+  }, REFORMULATE_DELAY_MS);
+}
+
+/** Drop the auto-reformulate timer without firing. Called from the
+ *  seller-driven IPC handlers (skip / boost / ask) because the
+ *  seller's intent overrides the auto-reformulate window. The next
+ *  suggestion that lands will arm a fresh 10s clock. */
+function cancelReformulateTimer() {
+  if (reformulateTimer) {
+    clearTimeout(reformulateTimer);
+    reformulateTimer = null;
+  }
 }
 
 const createWindow = () => {
@@ -112,13 +1277,186 @@ const createWindow = () => {
   return mainWindow;
 };
 
+/**
+ * Bring the overlay window forward from any state. Used by:
+ *   - The Tray's `click` handler (menu-bar / system-tray icon).
+ *   - The Tray's "Open Two Way Flow" context-menu item.
+ *   - `app.on('activate')` (macOS dock-icon click).
+ *   - The `second-instance` handler (already inlined separately).
+ *
+ * Handles three start states:
+ *   - Window destroyed (e.g. user closed it but app stayed alive via
+ *     a future "minimise to tray" workflow) — re-create.
+ *   - Window minimised — `restore()` first so `.show()` lifts it back
+ *     to its previous bounds rather than leaving it in the dock /
+ *     taskbar.
+ *   - Window hidden (via the Cmd/Ctrl+Shift+H global shortcut) —
+ *     `show()` un-hides it.
+ *
+ * `focus()` is called last so keyboard input lands in the renderer
+ * straight away.
+ */
+function showAndFocusMainWindow() {
+  let w = mainWindowRef;
+  if (!w || w.isDestroyed()) {
+    w = createWindow();
+  }
+  if (w.isMinimized()) w.restore();
+  w.show();
+  w.focus();
+}
+
+/**
+ * Build the tray icon. Lookup order:
+ *
+ *   1. `assets/tray-icon.png` at the app root — the recommended path
+ *      for shipping a real branded icon. macOS convention is a 22×22
+ *      black-on-transparent PNG marked as a template image (so it
+ *      auto-tints to match light/dark menu bar); Windows / Linux
+ *      prefer a 16×16 coloured PNG.
+ *   2. On macOS only — fall back to the system's built-in
+ *      `NSImageNameTouchBarAudioInputTemplate` (mic glyph). Fits a
+ *      voice-AI overlay and is guaranteed to be visible even without
+ *      a shipped asset.
+ *   3. Final fallback — `nativeImage.createEmpty()`. The Tray still
+ *      constructs (so the rest of the app boots) but the icon is
+ *      invisible. We `console.warn` so the user sees the hint to
+ *      drop a real PNG into assets/.
+ *
+ * TODO(designer): drop a branded `assets/tray-icon.png` here. The
+ * file is picked up automatically on next launch — no code change
+ * required.
+ */
+function buildTrayIcon() {
+  const userIconPath = path.join(app.getAppPath(), 'assets', 'tray-icon.png');
+  const fileImg = nativeImage.createFromPath(userIconPath);
+  if (fileImg && !fileImg.isEmpty()) {
+    if (process.platform === 'darwin') fileImg.setTemplateImage(true);
+    return fileImg;
+  }
+
+  if (process.platform === 'darwin') {
+    try {
+      const named = nativeImage.createFromNamedImage(
+        'NSImageNameTouchBarAudioInputTemplate',
+      );
+      if (named && !named.isEmpty()) return named;
+    } catch (err) {
+      // createFromNamedImage isn't strictly typed by Electron — guard
+      // a future rename / removal so it can't crash the tray boot.
+      console.warn('[tray] createFromNamedImage failed:', err?.message || err);
+    }
+  }
+
+  console.warn(
+    '[tray] no icon at assets/tray-icon.png — registering with an empty image. ' +
+    'Drop a 22×22 (macOS) or 16×16 (Win/Linux) PNG there to make the tray visible.',
+  );
+  return nativeImage.createEmpty();
+}
+
+/**
+ * Register the menu-bar / system-tray entry. Idempotent — a second
+ * call after the tray already exists is a no-op so a future hot-
+ * reload of whenReady() can't stack duplicate icons.
+ *
+ * Click semantics differ slightly by platform but we treat them
+ * uniformly: any single-click on the tray icon brings the overlay
+ * forward. macOS users typically expect right-click for the context
+ * menu (handled by `setContextMenu`); Windows / Linux users get the
+ * same menu via right-click and the icon is also clickable for the
+ * quick open.
+ */
+function createTray() {
+  if (tray) return tray;
+  const icon = buildTrayIcon();
+  try {
+    tray = new Tray(icon);
+  } catch (err) {
+    // Some Linux desktops (no system tray protocol) throw here. Log
+    // and bail so the rest of the app boots — the in-app header
+    // buttons and global shortcut still cover window control.
+    console.warn('[tray] failed to construct Tray:', err?.message || err);
+    tray = null;
+    return null;
+  }
+  tray.setToolTip('Two Way Flow');
+  tray.setContextMenu(Menu.buildFromTemplate([
+    {
+      label: 'Open Two Way Flow',
+      click: () => showAndFocusMainWindow(),
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit Two Way Flow',
+      click: () => app.quit(),
+    },
+  ]));
+  tray.on('click', () => showAndFocusMainWindow());
+  return tray;
+}
+
 function send(channel, payload) {
   const w = mainWindowRef;
   if (!w || w.isDestroyed()) return;
   w.webContents.send(channel, payload);
 }
 
+/**
+ * Mutate `connectionState[transport]` and broadcast the full snapshot
+ * to the renderer. Centralised so every lifecycle handler updates one
+ * way — the renderer rolls the two slots up into a single pill, and
+ * we want the broadcast to fire on every transition (including
+ * 'connected' → 'connected' no-ops, which keep the tooltip's "last
+ * checked" timestamp accurate if we add that later).
+ *
+ * Safe to call before the renderer is ready — `send()` is a no-op
+ * when the BrowserWindow is gone.
+ */
+function setConnectionStatus(transport, status) {
+  if (transport !== 'deepgram' && transport !== 'geminiLive') return;
+  connectionState[transport] = status;
+  send('connection:status', {
+    deepgram: connectionState.deepgram,
+    geminiLive: connectionState.geminiLive,
+  });
+}
+
 async function teardownSession() {
+  // Flush in-flight partial transcripts BEFORE we tear anything down.
+  // Without this, the grey interim text the user was watching at the
+  // moment of Stop never lands in coachContext.transcriptLines — the
+  // renderer flushes its own mirror in stopCapture() but the summary
+  // path reads main's snapshot, not the renderer's. See
+  // flushPendingTranscripts() for the full reasoning + edge cases.
+  flushPendingTranscripts();
+
+  if (autoLogTimer) {
+    clearInterval(autoLogTimer);
+    autoLogTimer = null;
+  }
+  if (pauseCheckTimer) {
+    clearInterval(pauseCheckTimer);
+    pauseCheckTimer = null;
+  }
+  if (kickstartTimer) {
+    clearTimeout(kickstartTimer);
+    kickstartTimer = null;
+  }
+  if (reformulateTimer) {
+    clearTimeout(reformulateTimer);
+    reformulateTimer = null;
+  }
+  // Cancel any in-flight Stage-2 debounce so a late roll-up can't fire
+  // against the about-to-be-reset factsSheet. The roller is rebuilt on
+  // the next session's first record_meeting_fact — keeping it null
+  // here ensures we don't carry the last session's lastGoodRollup
+  // forward into a fresh call.
+  if (quickFixRoller) {
+    try { quickFixRoller.cancelPendingRollup(); } catch { /* ignore */ }
+    quickFixRoller = null;
+  }
+
   const c = coachSession;
   coachSession = null;
   if (c) {
@@ -134,47 +1472,461 @@ async function teardownSession() {
       /* ignore */
     }
   }
+
+  const d = deepgramSession;
+  deepgramSession = null;
+  if (d) {
+    try {
+      await d.close();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Reset connection-status snapshot so the renderer's pill goes back
+  // to a neutral "both down" state — both transports are closed by
+  // construction here. The broadcast also keeps any subscriber in
+  // lockstep with the source-of-truth so a stale 'connected' value
+  // can't linger into the next session start.
+  setConnectionStatus('deepgram', 'down');
+  setConnectionStatus('geminiLive', 'down');
 }
 
 /**
- * Handle a transcript chunk from the live session.
+ * Handle a transcript message from the Deepgram session. This is the
+ * canonical transcript path in v2 — Deepgram's dual-channel STT gives
+ * us per-speaker attribution (channel 1 → 'you', channel 2 → 'other')
+ * which the legacy Gemini inputTranscription can't provide.
  *
- * Behaviour:
- *   - Forward to the renderer untouched (it owns the ticker / drawer view).
- *   - Mirror into coachContext: append to `pendingTranscript`, commit a
- *     line on `finished: true`. The coach reads from this buffer.
+ * Buffering semantics:
+ *   - Deepgram's `interim_results=true` mode sends the FULL current
+ *     segment text on every interim message, not incremental deltas.
+ *     We REPLACE `pendingTranscriptBySpeaker[speaker]` with the new
+ *     text rather than appending.
+ *   - On `finished=true` we commit the buffer to `transcriptLines`
+ *     with the speaker prefix (the contract `src/summary.js` requires)
+ *     and clear the pending slot for that speaker.
+ *   - Each speaker has its own pending slot so simultaneous mid-turn
+ *     speech on both channels doesn't get mixed.
  *
- * The coach's tick is independent of this function — it'll pick up any
- * committed lines on its next interval.
+ * The renderer also receives the same `{ speaker, text, finished }`
+ * payload via the `gemini:transcript` channel so the transcript pane
+ * stays in sync.
  */
-function handleTranscript(payload) {
-  send('gemini:transcript', payload);
-  const text = typeof payload?.text === 'string' ? payload.text : '';
-  if (!text) return;
-  coachContext.pendingTranscript += text;
-  if (payload?.finished) {
-    const committed = coachContext.pendingTranscript.trim();
-    if (committed) coachContext.transcriptLines.push(committed);
-    coachContext.pendingTranscript = '';
+function handleDeepgramTranscript({ speaker, text, finished }) {
+  if (speaker !== 'you' && speaker !== 'other') return;
+  if (typeof text !== 'string') return;
+
+  coachContext.pendingTranscriptBySpeaker[speaker] = text;
+
+  send('gemini:transcript', { speaker, text, finished: Boolean(finished) });
+
+  if (finished) {
+    const committed = coachContext.pendingTranscriptBySpeaker[speaker].trim();
+    coachContext.pendingTranscriptBySpeaker[speaker] = '';
+    if (committed) {
+      // ── Cross-channel dedupe (PROSPECT-biased) ─────────────────────
+      // Runs FIRST so the prefix-extension path below only ever sees
+      // the lines we're keeping. The resolution rule is asymmetric:
+      // see the "Attribution bias" doc-block at module top — bleed
+      // almost always flows AI/prospect → mic, so when both channels
+      // carry the same content we keep PROSPECT and drop YOU.
+      const other = speaker === 'you' ? 'other' : 'you';
+      const otherEntry = recentCommitBySpeaker[other];
+      const now = Date.now();
+      const isDuplicateOfOtherChannel =
+        Boolean(otherEntry) &&
+        now - otherEntry.ts < CROSS_CHANNEL_WINDOW_MS &&
+        committed.length >= CROSS_CHANNEL_DEDUPE_MIN_CHARS &&
+        isNearIdentical(committed, otherEntry.text);
+
+      if (speaker === 'you' && isDuplicateOfOtherChannel) {
+        // Incoming YOU matches a recent PROSPECT commit — this is
+        // (almost certainly) the bleed copy of what the prospect just
+        // said. Drop it before it reaches transcriptLines OR the
+        // renderer. The pause-detector clock still ticks because the
+        // audio activity itself is real.
+        if (DEBUG_TRANSCRIPT) {
+          console.log(
+            '[transcript] you commit → DROP (matched recent PROSPECT)',
+            JSON.stringify(committed.slice(0, 50)),
+          );
+        }
+        markTranscriptActivity();
+        return;
+      }
+
+      if (speaker === 'other' && isDuplicateOfOtherChannel) {
+        // Incoming PROSPECT matches a recent YOU commit. PROSPECT is
+        // the trusted side, so the YOU line already in transcriptLines
+        // is the bleed copy we want to retract. Splice it out, clear
+        // the recent-YOU tracker so the prefix-extension path
+        // downstream doesn't re-anchor on a line we just removed,
+        // then fall through to the normal PROSPECT commit flow.
+        const removed = findAndRemoveMatchingLine(
+          coachContext.transcriptLines,
+          'you',
+          committed,
+        );
+        if (removed) recentCommitBySpeaker.you = null;
+        if (DEBUG_TRANSCRIPT) {
+          console.log(
+            '[transcript] other commit → KEEP, removed prior YOU line:',
+            removed,
+            JSON.stringify(committed.slice(0, 50)),
+          );
+        }
+        // Fall through.
+      } else if (DEBUG_TRANSCRIPT) {
+        console.log(
+          '[transcript]',
+          speaker,
+          'commit → KEEP',
+          JSON.stringify(committed.slice(0, 50)),
+        );
+      }
+
+      recentCommitBySpeaker[speaker] = { text: committed, ts: now };
+
+      // Prefix-extension dedupe (belt-and-braces). The primary fix lives
+      // in deepgram-session.js (only commit on `speech_final`), but if
+      // VAD ever emits two `speech_final`s back-to-back on a continuing
+      // utterance the second commit would otherwise produce a duplicate
+      // line whose text contains the first as a prefix. Detect that
+      // case and REPLACE the prior line instead of pushing.
+      const lines = coachContext.transcriptLines;
+      const lastIdx = findLastLineBySpeaker(lines, speaker);
+      const newLine = speakerPrefix(speaker) + committed;
+      if (lastIdx >= 0 && newLine.startsWith(lines[lastIdx])) {
+        lines[lastIdx] = newLine;
+      } else {
+        lines.push(newLine);
+      }
+    }
   }
+
+  // Any text (interim or committed, either speaker) counts as activity
+  // for the pause detector — we only want to nudge when both channels
+  // have genuinely gone quiet.
+  if (text || finished) markTranscriptActivity();
+}
+
+/**
+ * Legacy Gemini inputTranscription handler. Two roles:
+ *
+ *   1. When Deepgram is active (the common case), this is a NO-OP.
+ *      Deepgram owns the canonical transcript stream and is the only
+ *      source that gets appended to `coachContext.transcriptLines`
+ *      and forwarded to the renderer. Gemini's transcripts would
+ *      otherwise duplicate the salesperson's voice in both the pane
+ *      and the coach context (since Gemini Live only sees the mic
+ *      channel — channel 1).
+ *
+ *   2. When Deepgram is NOT running (e.g. DEEPGRAM_API_KEY missing),
+ *      this is the fallback. We accumulate Gemini's incremental
+ *      deltas into the 'you' pending buffer, forward the running
+ *      segment to the renderer as `speaker: 'you'`, and commit on
+ *      finished. The renderer treats this exactly the same as the
+ *      Deepgram path because we normalise the payload shape.
+ *
+ * Gemini Live is still configured with `inputAudioTranscription: {}`
+ * because the live model may use it internally for its own context —
+ * we just don't surface the result downstream when Deepgram is the
+ * canonical source.
+ */
+function handleGeminiTranscript(payload) {
+  if (deepgramSession) return;
+
+  const text = typeof payload?.text === 'string' ? payload.text : '';
+  const finished = Boolean(payload?.finished);
+  if (!text && !finished) return;
+
+  if (text) coachContext.pendingTranscriptBySpeaker.you += text;
+  const segment = coachContext.pendingTranscriptBySpeaker.you;
+
+  send('gemini:transcript', { speaker: 'you', text: segment, finished });
+
+  if (finished) {
+    const committed = segment.trim();
+    coachContext.pendingTranscriptBySpeaker.you = '';
+    if (committed) coachContext.transcriptLines.push(speakerPrefix('you') + committed);
+  }
+
+  // Mirror the Deepgram path's pause-detector bookkeeping so the
+  // detector still works when Deepgram isn't running.
+  markTranscriptActivity();
 }
 
 function handleTurnComplete() {
   send('gemini:turn-complete', null);
-  const pending = coachContext.pendingTranscript.trim();
-  if (pending) {
-    coachContext.transcriptLines.push(pending);
-    coachContext.pendingTranscript = '';
+  // Belt-and-braces: flush any in-flight partials for BOTH speakers via
+  // the shared helper. With Deepgram active this is normally a no-op
+  // because Deepgram commits on its own `finished` events; the helper's
+  // prefix-extension check absorbs the rare case where Gemini's
+  // turnComplete fires between a Deepgram interim and its commit and
+  // we'd otherwise drop the in-flight YOU partial.
+  flushPendingTranscripts();
+}
+
+/**
+ * Commit any in-flight partial transcripts into `coachContext.transcriptLines`.
+ *
+ * Used as a "commit the best version of what we heard" moment at two
+ * boundaries where the pending buffer would otherwise be wiped:
+ *
+ *   1. `teardownSession()` — the user pressed Stop (or an error closed
+ *      the call). Without this flush, the grey interim text the user
+ *      was watching never lands in `coachContext.transcriptLines` and
+ *      so is missing from the post-call summary path. The renderer
+ *      already flushes its own mirror in `stopCapture()`, but main is
+ *      the source of truth for the summary, so a renderer-only flush
+ *      isn't enough.
+ *
+ *   2. `reconnectDeepgram()` — Deepgram dropped and we're about to
+ *      open a fresh session. Without this flush, the next session's
+ *      first interim REPLACES the old (now-orphaned) pending text and
+ *      the partial we were sitting on at drop-time vanishes silently.
+ *
+ *   3. `handleTurnComplete()` — Gemini Live's turn-complete fires on
+ *      its own VAD rhythm, which doesn't necessarily line up with
+ *      Deepgram's commit cadence. Flushing here makes the legacy and
+ *      Deepgram paths share one commit code path.
+ *
+ * Per-speaker handling mirrors the prefix-extension logic in
+ * `handleDeepgramTranscript` so we don't push a duplicate line when
+ * the pending text is itself the start of a line we just committed.
+ *
+ * We deliberately SKIP the cross-channel PROSPECT-bias dedup here.
+ * That dedup exists to handle live acoustic bleed where both channels
+ * carry the same content within a few hundred milliseconds — at
+ * end-of-call or pre-reconnect we'd rather keep a duplicate-ish line
+ * than silently drop transcript text. This is a "commit what we have"
+ * moment, not a "decide which channel was canonical" moment.
+ */
+function flushPendingTranscripts() {
+  for (const speaker of /** @type {const} */ (['you', 'other'])) {
+    const pending = coachContext.pendingTranscriptBySpeaker[speaker].trim();
+    if (!pending) continue;
+    coachContext.pendingTranscriptBySpeaker[speaker] = '';
+    const lines = coachContext.transcriptLines;
+    const lastIdx = findLastLineBySpeaker(lines, speaker);
+    const newLine = speakerPrefix(speaker) + pending;
+    if (lastIdx >= 0 && newLine.startsWith(lines[lastIdx])) {
+      lines[lastIdx] = newLine;
+    } else {
+      lines.push(newLine);
+    }
   }
 }
 
 function registerIpcHandlers() {
+  /**
+   * Settings IPC. Both handlers return the FULL current settings
+   * object so the renderer can re-hydrate its form without a second
+   * roundtrip. See src/settings.js for the storage / fallback rules.
+   *
+   * Changes take effect on the NEXT session — the live Coach / Gemini
+   * Live sessions read their model + key at start time and don't
+   * re-read them mid-call. That's intentional: swapping the model on
+   * an in-flight session would invalidate the rolling transcript
+   * context. The user just needs to Stop + Start to apply.
+   */
+  /**
+   * Load the full settings object. The response also includes an
+   * `_envAvailability` snapshot keyed by provider so the renderer's
+   * status badges can render the "Using env variable" pill without a
+   * second IPC roundtrip. The underscore prefix flags it as a
+   * read-only piggyback — saveSettings() ignores it.
+   */
+  ipcMain.handle('settings:load', () => {
+    const settings = loadSettings();
+    return { ...settings, _envAvailability: getProviderEnvAvailability() };
+  });
+  ipcMain.handle('settings:save', (_event, partial) => {
+    // Strip the renderer's piggyback fields (anything starting with `_`)
+    // so they can't accidentally end up persisted. This is belt-and-
+    // brace: the renderer doesn't send them today, but a future
+    // wholesale re-save of the loaded object would otherwise pollute
+    // the file.
+    const cleaned = partial && typeof partial === 'object'
+      ? Object.fromEntries(Object.entries(partial).filter(([k]) => !k.startsWith('_')))
+      : partial;
+    const next = saveSettings(cleaned);
+    const payload = { ...next, _envAvailability: getProviderEnvAvailability() };
+    // Broadcast a `settings:changed` event so renderer subscribers
+    // outside the save initiator (e.g. the drawer-rendering code
+    // reading settings.coach.trackQuestionState) can re-pull the
+    // fresh values without an explicit roundtrip.
+    //
+    // Main itself doesn't subscribe — its plumbing reads settings
+    // live via getCoach() / loadSettings() each tick, so an
+    // in-process listener would be redundant. Single-direction
+    // broadcast keeps the contract simple.
+    send('settings:changed', payload);
+    return payload;
+  });
+
+  /**
+   * Run a cheap connectivity probe against a provider. Returns
+   * { ok, message? } so the renderer can render an inline pass/fail
+   * status next to the Test button. Uses whichever key + model the
+   * user has configured for that provider (Settings → env fallback).
+   *
+   * Bound to the testConnection() method on the provider class —
+   * each provider implements its own minimal ping. Safe to call
+   * concurrently per provider; the renderer debounces clicks on its
+   * side via a per-card "in flight" flag.
+   */
+  ipcMain.handle('settings:test-provider', async (_event, provider) => {
+    try {
+      if (typeof provider !== 'string' || !provider) {
+        return { ok: false, message: 'Invalid provider id.' };
+      }
+      const apiKey = getApiKey(provider);
+      if (!apiKey) {
+        return { ok: false, message: 'No API key configured.' };
+      }
+      const inst = getProvider(provider, {
+        apiKey,
+        model: getDefaultModelForProvider(provider),
+      });
+      const result = await inst.testConnection();
+      return result;
+    } catch (err) {
+      return { ok: false, message: err?.message || String(err) };
+    }
+  });
+
+  /**
+   * Returns the current provider-status snapshot for the renderer's
+   * Settings → Providers tab. Returned shape:
+   *   {
+   *     defaultProvider: 'gemini'|'anthropic'|'openai',
+   *     providers: { [id]: { status: 'connected'|'env'|'unconfigured' } },
+   *   }
+   * The renderer also has the full settings via settings:load, so
+   * this is only used after a save where the badge needs to refresh
+   * without re-hydrating the form.
+   */
+  ipcMain.handle('settings:provider-status', () => {
+    const out = {};
+    for (const id of ['gemini', 'anthropic', 'openai']) {
+      out[id] = { status: getProviderStatus(id) };
+    }
+    return {
+      defaultProvider: getDefaultProvider(),
+      providers: out,
+    };
+  });
+
+  /* ── Settings → General → Data subsection (Phase 1) ───────────────
+   *
+   * Reset / Export / Import handlers. All three operate on the same
+   * settings cache as :load / :save, broadcast `settings:changed`
+   * after a successful mutation (so the renderer's existing listener
+   * picks up the new values), and route file I/O through the generic
+   * dialog handlers above so the dialog chrome is consistent. */
+
+  /**
+   * Reset every setting back to defaults. The renderer surfaces a
+   * confirmation modal before invoking this — we don't double-confirm
+   * here, so any caller (including future automation) gets exactly
+   * one wipe with one IPC call.
+   *
+   * The `preserveKeys` flag (default true) keeps the configured
+   * provider API keys across the reset; that's the high-value default
+   * because keys are the only setting users meaningfully lose work
+   * over.
+   */
+  ipcMain.handle('settings:reset', (_event, options) => {
+    const preserveKeys = options?.preserveKeys !== false;
+    const fresh = resetSettings({ preserveKeys });
+    const payload = { ...fresh, _envAvailability: getProviderEnvAvailability() };
+    // Same broadcast contract as settings:save — subscribers can't tell
+    // the difference, which is intentional. A reset IS a wholesale
+    // save; the only special-casing is on the renderer's own button-
+    // click code path that calls applySettingsToForm() after this
+    // resolves.
+    send('settings:changed', payload);
+    return payload;
+  });
+
+  /**
+   * Serialise the current settings for export. Returns the JSON
+   * string + a recommended filename + a flag echoing whether the
+   * payload includes API keys (so the renderer can label the saved
+   * file accurately).
+   *
+   * No file write yet — the renderer chains this with a `dialog:save`
+   * call so the user gets the standard "where do you want to save?"
+   * Save dialog rather than an Electron-internal path.
+   */
+  ipcMain.handle('settings:export', (_event, options) => {
+    const includeKeys = options?.includeKeys === true;
+    return exportSettingsAsJSON({ includeKeys });
+  });
+
+  /**
+   * Validate a JSON string as importable settings WITHOUT applying
+   * it. The renderer calls this from the Import preview modal — it
+   * shows the diff, gets user confirmation, and then calls
+   * `settings:apply-import` to commit.
+   *
+   * Returns:
+   *   { ok: true, normalised }  — parsed + migrated, ready to apply
+   *   { ok: false, error }      — human-readable failure reason
+   */
+  ipcMain.handle('settings:validate-import', (_event, json) => {
+    if (typeof json !== 'string') {
+      return { ok: false, error: 'Import payload must be a JSON string.' };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(json);
+    } catch (err) {
+      return { ok: false, error: `Invalid JSON: ${err?.message || 'parse failed'}` };
+    }
+    return validateImportedSettings(parsed);
+  });
+
+  /**
+   * Commit a previously-validated import. The renderer is expected
+   * to have run `settings:validate-import` first and shown the diff
+   * preview — passing an unvalidated object still works (the helper
+   * re-validates internally) but the standard flow is validate-then-
+   * apply.
+   *
+   * On success, broadcasts `settings:changed` so any subscribers
+   * outside the renderer's initiating tab pick up the new shape.
+   */
+  ipcMain.handle('settings:apply-import', (_event, json) => {
+    if (typeof json !== 'string') {
+      return { ok: false, error: 'Import payload must be a JSON string.' };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(json);
+    } catch (err) {
+      return { ok: false, error: `Invalid JSON: ${err?.message || 'parse failed'}` };
+    }
+    const result = applyImportedSettings(parsed);
+    if (!result.ok) return result;
+    const payload = { ...result.settings, _envAvailability: getProviderEnvAvailability() };
+    send('settings:changed', payload);
+    return { ok: true, settings: payload };
+  });
+
   ipcMain.handle('gemini:start', async () => {
-    const apiKey = process.env.GEMINI_API_KEY;
+    // Resolve the Gemini key via the Settings module — Settings → Setup
+    // takes precedence over the process env (the env value is the
+    // fallback). See src/settings.js getApiKey() for the lookup rule.
+    const apiKey = getApiKey('gemini');
     if (!apiKey) {
       // Treat missing key the same as a connection error from the renderer's
-      // perspective so it lands in the "Connection lost" UI path.
-      send('gemini:error', { message: 'GEMINI_API_KEY missing in .env' });
+      // perspective so it lands in the "Connection lost" UI path. The
+      // message mentions both surfaces so the user knows where to set
+      // the key.
+      send('gemini:error', { message: 'Missing Gemini API key — set one in Settings → Providers or via GEMINI_API_KEY in .env.' });
       return { ok: false, error: 'missing_api_key' };
     }
 
@@ -182,51 +1934,139 @@ function registerIpcHandlers() {
     // tear it down before opening a new one.
     await teardownSession();
     resetCoachContext();
+    sessionStartedAt = Date.now();
 
-    const next = new GeminiSession({
-      apiKey,
-      onTranscript: handleTranscript,
-      onTurnComplete: handleTurnComplete,
-      onFlag: (payload) => {
-        console.log('[scoring] flag:', payload.id, '—', payload.evidence);
-        send('scoring:flag', payload);
-      },
-      onError: (message) => {
-        console.error('[gemini] session error:', message);
-        send('gemini:error', { message });
-        // The session is already in 'closed' state; clear our reference.
-        if (liveSession === next) liveSession = null;
-      },
-      onClose: (reason) => {
-        console.log('[gemini] session closed:', reason);
-        send('gemini:closed', { reason });
-        if (liveSession === next) liveSession = null;
-      },
-    });
+    // ── Deepgram first ──────────────────────────────────────────────
+    // Open the dual-channel STT session BEFORE Gemini Live so that by
+    // the time the renderer starts streaming PCM, both consumers are
+    // ready. Failure to open Deepgram is non-fatal: we log and carry
+    // on; Gemini's inputTranscription fallback fills in for the 'you'
+    // channel and the renderer just won't see a separate 'other'
+    // stream until the user provisions a key.
+    const deepgramKey = process.env.DEEPGRAM_API_KEY;
+    if (deepgramKey) {
+      // Read the model fresh at session start so the latest Audio-tab
+      // selection takes effect on this call. Phase 2 plumbs this onto
+      // settings.audio.deepgramModel via the renderer's autosave; main
+      // never holds a cached copy because the read is cheap (sync
+      // file read) and the source-of-truth lives in settings.json.
+      const dg = new DeepgramSession({
+        apiKey: deepgramKey,
+        model: getAudio().deepgramModel,
+        onTranscript: handleDeepgramTranscript,
+        onError: (message) => {
+          console.warn('[deepgram] error:', message);
+          if (deepgramSession === dg) deepgramSession = null;
+        },
+        onClose: (reason) => {
+          console.log('[deepgram] connection closed:', reason);
+          if (deepgramSession === dg) deepgramSession = null;
+          reconnectDeepgram();
+        },
+      });
+      try {
+        await dg.open();
+        deepgramSession = dg;
+        console.log('[deepgram] session opened');
+        setConnectionStatus('deepgram', 'connected');
+      } catch (err) {
+        console.warn('[deepgram] failed to open session:', err?.message || err);
+        deepgramSession = null;
+        setConnectionStatus('deepgram', 'down');
+      }
+    } else {
+      console.warn('[deepgram] DEEPGRAM_API_KEY missing in .env — speaker attribution disabled, falling back to Gemini inputTranscription for the mic channel only.');
+      // No Deepgram configured — surface as 'down' so the pill reflects
+      // the mic-only degraded state. The renderer can show "Mic only"
+      // in the tooltip if we want to differentiate "not configured"
+      // from "dropped" later; for now both read as 'down'.
+      setConnectionStatus('deepgram', 'down');
+    }
 
     try {
-      await next.open();
-      liveSession = next;
+      await openGeminiLiveSession({ apiKey });
       console.log('[gemini] session opened');
       send('gemini:opened', null);
     } catch (err) {
       const message = err?.message || 'Failed to open Gemini session';
       console.error('[gemini] failed to open session:', err);
       send('gemini:error', { message });
+      setConnectionStatus('geminiLive', 'down');
       return { ok: false, error: message };
     }
 
     // Spin up the text coach alongside the live session. The coach reads
     // coachContext on its own schedule and emits the structured scoring
     // events the renderer expects.
+    //
+    // Provider routing (v2 settings schema)
+    //   The coach's provider is whichever the user has selected as
+    //   `defaultProvider` in Settings → Providers. The matching
+    //   per-provider API key + defaultModel are pulled via the helpers
+    //   below — getApiKey() falls back to the matching env var if the
+    //   Settings slot is empty, so .env-only users still work.
+    //
+    //   A missing key for the routed provider is non-fatal here: the
+    //   Coach throws on construction if the key is empty, but the
+    //   try/catch above the Coach instantiation surfaces that to the
+    //   renderer via the existing `gemini:error` path.
+    const coachProviderName = getDefaultProvider();
+    const coachApiKey = getApiKey(coachProviderName);
+    if (!coachApiKey) {
+      // Tell the user which provider needs a key — we don't tear down
+      // the live session because the audio/transcription pipeline can
+      // run without the coach. The renderer surfaces this as a
+      // non-fatal warning.
+      send('gemini:error', {
+        message: `Missing API key for ${coachProviderName} — open Settings to configure.`,
+      });
+      return { ok: true };
+    }
+    const coachProvider = getProvider(coachProviderName, {
+      apiKey: coachApiKey,
+      model: getDefaultModelForProvider(coachProviderName),
+    });
     coachSession = new Coach({
-      apiKey,
+      provider: coachProvider,
       getContext: buildCoachContextSnapshot,
-      onItemCovered: (payload) => {
-        if (coachContext.coveredItemIds.has(payload.itemId)) return;
-        coachContext.coveredItemIds.add(payload.itemId);
-        console.log('[coach] item:', payload.itemId, '—', payload.evidence);
-        send('scoring:item', payload);
+      onItemStateChange: (payload) => {
+        // Idempotent guard: if the state we just received is identical
+        // to what's already stored (same state from the same source on
+        // the same evidence) skip the update. This avoids re-rendering
+        // the renderer for every redundant tick.
+        const prev = coachContext.itemStates.get(payload.itemId);
+        if (prev?.state === payload.state && prev?.evidence === payload.evidence) {
+          return;
+        }
+        // Once an item is `covered` it's terminal; ignore subsequent
+        // transitions to a "lower" state. The model is told this in
+        // the system prompt but we belt-and-brace it here.
+        if (prev?.state === 'covered' && payload.state !== 'covered') {
+          return;
+        }
+        coachContext.itemStates.set(payload.itemId, {
+          state: payload.state,
+          evidence: payload.evidence,
+          confidence: payload.confidence,
+          at: Date.now(),
+          source: 'model',
+        });
+        console.log(
+          '[coach] item:',
+          payload.itemId,
+          '→',
+          payload.state,
+          `(conf ${payload.confidence})`,
+          '—',
+          payload.evidence,
+        );
+        send('scoring:item-state', {
+          itemId: payload.itemId,
+          state: payload.state,
+          evidence: payload.evidence,
+          confidence: payload.confidence,
+          source: 'model',
+        });
       },
       onFieldCaptured: (payload) => {
         coachContext.capturedFields[payload.fieldId] = {
@@ -243,48 +2083,737 @@ function registerIpcHandlers() {
         );
         send('scoring:field', payload);
       },
+      onMeetingFact: (payload) => {
+        // Strategy A: append a structured fact to the sheet and
+        // arm the Stage-2 debouncer. Sheet entry id is stable per
+        // call so the renderer's drill-through can reference it
+        // even if the model re-emits a similar fact later.
+        const id = `${payload.kind}__${Date.now()}__${coachContext.factsSheet.entries.length}`;
+        const entry = {
+          id,
+          kind: payload.kind,
+          amount: payload.amount,
+          unit: payload.unit,
+          period: payload.period,
+          basis: payload.basis,
+          quote: payload.anchorQuote,
+          recordedAt: Date.now(),
+          supersedes: typeof payload.supersedesId === 'string' && payload.supersedesId
+            ? payload.supersedesId
+            : null,
+        };
+        coachContext.factsSheet.entries.push(entry);
+        console.log(
+          '[coach] fact:',
+          entry.id,
+          '·',
+          entry.amount,
+          entry.unit,
+          entry.period,
+          '—',
+          entry.basis,
+        );
+        // Lazy-construct the roller on first fact. Capturing
+        // coachContext.factsSheet.entries by reference through the
+        // getter means a reset that swaps `entries` for a new array
+        // wouldn't be seen — but resetCoachContext keeps the
+        // factsSheet object identity and only mutates `entries` in
+        // place, so the reference stays valid across resets. We
+        // also rebuild the roller on every fresh session in
+        // teardownSession to be safe.
+        if (!quickFixRoller) {
+          quickFixRoller = createQuickFixRoller({
+            getEntries: () => coachContext.factsSheet.entries,
+            onRollup: (rollup, activeEntries) => {
+              coachContext.factsSheet.quickFix = rollup;
+              // Mirror the active entries onto the IPC payload so
+              // the renderer can build its drill-through index
+              // without having to mirror the whole factsSheet in
+              // local state. activeEntries excludes superseded
+              // ones — only the rows the rollup actually counted.
+              send('scoring:quick-fix', { quickFix: rollup, entries: activeEntries });
+            },
+            onError: (message) => {
+              console.warn('[quick-fix] worker error:', message);
+            },
+          });
+        }
+        quickFixRoller.schedule();
+      },
       onSuggestion: (payload) => {
-        console.log('[coach] suggest:', payload.itemId, '→', payload.question);
-        send('coach:suggestion', payload);
+        console.log(
+          '[coach] suggest:',
+          payload.itemId,
+          '→',
+          payload.question,
+          '[kind:',
+          payload.kind || 'next',
+          ', anchor:',
+          payload.anchorQuote ? `"${payload.anchorQuote.slice(0, 48)}…"` : '(none)',
+          ']',
+        );
+        // Register the suggestion in history BEFORE the renderer IPC
+        // so the broadcast that follows already carries the new
+        // entry. The id is purely internal — the renderer keys off
+        // it for asked/replaced rendering, the model keys off it
+        // via the PENDING SUGGESTIONS block.
+        registerSuggestion({
+          itemId: payload.itemId,
+          questionText: payload.question,
+          kind: payload.kind,
+        });
+        // Arm the auto-reformulate timer for this pin. The function
+        // itself bails when the Advanced toggles are off.
+        armReformulateTimer(currentPinnedSuggestionId);
+        broadcastSuggestionHistory();
+        // Pass through the anchorQuote + kind so the renderer can
+        // surface "responding to: …" under the suggestion card and
+        // optionally style the card differently per ask kind.
+        //
+        // suggestionId is the freshly-registered history id (set on
+        // `currentPinnedSuggestionId` by registerSuggestion above).
+        // The renderer mirrors it onto the coachHistory entry and
+        // uses it to cross-reference `state.suggestionHistory` for
+        // the asked-flip styling on the pinned card. One source of
+        // truth — no fuzzy text matching.
+        send('coach:suggestion', { ...payload, suggestionId: currentPinnedSuggestionId });
+      },
+      onQuestionAsked: ({ suggestionId, evidence }) => {
+        const changed = applyMarkAsked({ suggestionId, evidence });
+        if (changed) broadcastSuggestionHistory();
+      },
+      getSuggestionContext: () => {
+        // The Coach asks for this on every tick — return an empty
+        // list when the toggle is off so the mark_question_asked
+        // tool stays out of the declarations and the PENDING
+        // SUGGESTIONS block doesn't appear in the prompt.
+        const coach = getCoach();
+        if (!coach?.trackQuestionState) return [];
+        const out = [];
+        for (const entry of coachContext.suggestionHistory.values()) {
+          if (entry.asked) continue;
+          if (entry.replaced) continue;
+          out.push({
+            id: entry.id,
+            itemId: entry.itemId,
+            questionText: entry.questionText,
+          });
+        }
+        return out;
       },
       onError: (message) => {
         // Coach errors are non-fatal — log only, don't surface to UI.
         console.warn('[coach] error:', message);
       },
+      // Lifecycle hooks — fired once per actual API roundtrip so the
+      // renderer can show a "thinking" indicator.
+      onTickStart: () => send('coach:tick-start', null),
+      onTickEnd: () => send('coach:tick-end', null),
     });
     coachSession.start();
+
+    // Start the periodic auto-log sweep. Each tick (every ~5s) demotes
+    // stale `in_progress` items to `logged` per maybeAutoLogStaleItems.
+    if (autoLogTimer) clearInterval(autoLogTimer);
+    autoLogTimer = setInterval(maybeAutoLogStaleItems, AUTO_LOG_CHECK_INTERVAL_MS);
+
+    // Start the pause detector. It's a no-op while coachMode is
+    // 'signalled'; flipping the renderer toggle to 'automated' (via
+    // coach:set-mode) lights it up live without restarting the
+    // session.
+    if (pauseCheckTimer) clearInterval(pauseCheckTimer);
+    pauseCheckTimer = setInterval(maybeFirePauseNudge, PAUSE_CHECK_INTERVAL_MS);
+
+    // Kickstart: 10s after a clean session start, if the coach hasn't
+    // already pinned a suggestion (e.g. because the rep asked
+    // manually inside the first 10s), surface a `next`-kind opening
+    // question. The rubric's `opening_agenda.*` items are the
+    // highest-priority uncovered candidates at this point so the
+    // model naturally lands on an agenda / "what brings us together
+    // today" prompt. Cancelled by teardownSession() on Stop.
+    //
+    // Gated on coachMode === 'automated' so signalled mode is TRULY
+    // silent — the rep gets a suggestion only when they click one of
+    // the Suggest / Deeper / Pivot / Recap buttons. Test-call note 5
+    // surfaced this leak: even in signalled mode the 10s kickstart was
+    // firing and surfacing an opening question the rep hadn't asked for.
+    if (kickstartTimer) clearTimeout(kickstartTimer);
+    if (coachMode === 'automated') {
+      kickstartTimer = setTimeout(() => {
+        kickstartTimer = null;
+        if (!coachSession) return;
+        if (coachSession.hasPinnedSuggestion?.()) return;
+        console.log('[kickstart] firing opening question');
+        coachSession.requestSuggestion({ kind: 'next' });
+      }, KICKSTART_DELAY_MS);
+    }
 
     return { ok: true };
   });
 
   ipcMain.handle('gemini:stop', async () => {
+    // Snapshot the duration before teardown clears sessionStartedAt.
+    const durationMs = sessionStartedAt > 0 ? Date.now() - sessionStartedAt : 0;
+    sessionStartedAt = 0;
+
     await teardownSession();
+
+    // Kick off the post-call summary asynchronously. The Gemini Flash
+    // debrief call inside generateSummary() can take several seconds,
+    // and we don't want to block the renderer's Stop button on it.
+    // The renderer subscribes to `summary:ready` and shows the modal
+    // whenever the payload arrives.
+    //
+    // Snapshot the context fields by value/reference at call time so a
+    // late-arriving session reset (unlikely but possible if the user
+    // immediately re-starts) doesn't blow the data away.
+    const snapshot = {
+      transcriptLines: [...coachContext.transcriptLines],
+      itemStates: new Map(coachContext.itemStates),
+      capturedFields: { ...coachContext.capturedFields },
+      durationMs,
+    };
+
+    // Summary stays on Gemini for now (its structured-output debrief
+    // call uses Gemini's responseSchema feature). If the Gemini key
+    // is missing we still kick off generateSummary with `provider:
+    // null` — it returns a transcript-only summary so the user
+    // doesn't lose the call data just because the debrief can't run.
+    const summaryApiKey = getApiKey('gemini');
+    const summaryProvider = summaryApiKey
+      ? getProvider('gemini', {
+          apiKey: summaryApiKey,
+          model: getModelFor('summary'),
+        })
+      : null;
+
+    generateSummary({
+      provider: summaryProvider,
+      coachContext: snapshot,
+    })
+      .then((summary) => {
+        send('summary:ready', summary);
+      })
+      .catch((err) => {
+        console.warn('[summary] generation threw:', err?.message || err);
+        send('summary:ready', {
+          scorecard: {},
+          factsTable: {},
+          transcript: snapshot.transcriptLines.join('\n'),
+          debrief: { wentWell: '', missed: '', improvements: ['', '', ''] },
+          durationMs,
+          asJSON: '{}',
+          asMarkdown: '# Discovery Call Summary\n\n_Summary generation failed._',
+        });
+      });
+
     return { ok: true };
   });
 
-  // Renderer asks the coach for a fresh suggestion (seller pressed → at
-  // the live edge of suggestion history). Cheap call — the coach handles
-  // its own in-flight guard, so this is safe to fire repeatedly.
+  /* ── Generic dialog plumbing (dialog:open / dialog:save) ──────────
+   *
+   * Phase 1 of the Settings expansion factors out the dialog work so
+   * `summary:save` and the new `settings:export` / `settings:import`
+   * IPCs share one code path. Future per-setting file pickers (e.g.
+   * Phase 5's transcript-autosave-folder picker) consume these via
+   * the autosave helpers in renderer.js — no new IPC channel required.
+   *
+   * Both helpers accept a base set of dialog options + an optional
+   * I/O step (`content` for save, `readAs` for open). If the I/O step
+   * is omitted the handlers return just the chosen path, letting the
+   * renderer do the read/write itself or store the path in settings. */
+  async function showSaveDialogAndMaybeWrite({
+    content,
+    title,
+    defaultName,
+    defaultPath,
+    filters,
+  } = {}) {
+    const win = mainWindowRef;
+    const result = await dialog.showSaveDialog(
+      win && !win.isDestroyed() ? win : null,
+      {
+        title: title || 'Save',
+        defaultPath: defaultPath || defaultName || '',
+        filters: filters || [{ name: 'All Files', extensions: ['*'] }],
+      },
+    );
+    if (result.canceled || !result.filePath) {
+      return { canceled: true, filePath: null };
+    }
+    if (typeof content === 'string') {
+      try {
+        await writeFile(result.filePath, content, 'utf8');
+        return { canceled: false, filePath: result.filePath, wrote: true };
+      } catch (err) {
+        console.error('[dialog:save] write failed:', err?.message || err);
+        return {
+          canceled: false,
+          filePath: result.filePath,
+          wrote: false,
+          error: err?.message || 'write_failed',
+        };
+      }
+    }
+    return { canceled: false, filePath: result.filePath };
+  }
+
+  async function showOpenDialogAndMaybeRead({
+    title,
+    defaultPath,
+    filters,
+    properties,
+    readAs,
+  } = {}) {
+    const win = mainWindowRef;
+    const result = await dialog.showOpenDialog(
+      win && !win.isDestroyed() ? win : null,
+      {
+        title: title || 'Open',
+        defaultPath: defaultPath || '',
+        filters: filters || [{ name: 'All Files', extensions: ['*'] }],
+        properties: properties || ['openFile'],
+      },
+    );
+    const filePath = Array.isArray(result.filePaths) ? result.filePaths[0] : null;
+    if (result.canceled || !filePath) {
+      return { canceled: true, filePath: null };
+    }
+    if (readAs === 'utf8') {
+      try {
+        const fileContent = await readFile(filePath, 'utf8');
+        return { canceled: false, filePath, content: fileContent };
+      } catch (err) {
+        console.error('[dialog:open] read failed:', err?.message || err);
+        return {
+          canceled: false,
+          filePath,
+          content: null,
+          error: err?.message || 'read_failed',
+        };
+      }
+    }
+    return { canceled: false, filePath };
+  }
+
+  ipcMain.handle('dialog:save', (_event, args) =>
+    showSaveDialogAndMaybeWrite(args || {}),
+  );
+  ipcMain.handle('dialog:open', (_event, args) =>
+    showOpenDialogAndMaybeRead(args || {}),
+  );
+
+  /**
+   * Bulletproof clipboard write — uses Electron's native `clipboard`
+   * module instead of the renderer's `navigator.clipboard.writeText`.
+   *
+   * Why both:
+   *   - The browser API is the obvious first choice but it's gated by
+   *     the `clipboard-sanitized-write` permission and Electron's
+   *     setPermissionRequestHandler default-denies anything we don't
+   *     explicitly allow. We DO allow it (see app.whenReady's
+   *     permission handler) but a future tighten-up could regress
+   *     that quietly.
+   *   - This IPC bypasses the browser permission system entirely.
+   *     The call-summary modal's Copy buttons use this path so they
+   *     keep working even if the renderer's permission grant flakes.
+   *
+   * Returns { ok: true } on success or { ok: false, error } on a
+   * thrown native write. The renderer surfaces the result via the
+   * footer toast ("Copied" vs "Copy failed").
+   */
+  ipcMain.handle('clipboard:write', (_event, payload) => {
+    const text = typeof payload?.text === 'string' ? payload.text : '';
+    if (!text) return { ok: false, error: 'empty_text' };
+    try {
+      clipboard.writeText(text);
+      return { ok: true };
+    } catch (err) {
+      console.warn('[clipboard:write] failed:', err?.message || err);
+      return { ok: false, error: err?.message || 'write_failed' };
+    }
+  });
+
+  /**
+   * Save a summary payload to disk via the native Save dialog.
+   * `format` is informational — we use it to pick the default
+   * extension and write the content verbatim. The renderer is
+   * responsible for choosing which serialisation it wants saved.
+   *
+   * Routed through the generic showSaveDialogAndMaybeWrite helper so
+   * the dialog + write code path is shared with settings:export and
+   * any future "save to disk" IPC.
+   */
+  ipcMain.handle('summary:save', async (_event, payload) => {
+    const format = payload?.format === 'markdown' ? 'markdown' : 'json';
+    const content = typeof payload?.content === 'string' ? payload.content : '';
+    if (!content) return { ok: false, error: 'empty_content' };
+
+    const defaultExt = format === 'markdown' ? 'md' : 'json';
+    const defaultName = `discovery-summary-${new Date().toISOString().replace(/[:.]/g, '-')}.${defaultExt}`;
+    const filters = format === 'markdown'
+      ? [{ name: 'Markdown', extensions: ['md'] }, { name: 'All Files', extensions: ['*'] }]
+      : [{ name: 'JSON', extensions: ['json'] }, { name: 'All Files', extensions: ['*'] }];
+
+    const result = await showSaveDialogAndMaybeWrite({
+      title: 'Save call summary',
+      content,
+      defaultName,
+      defaultPath: defaultName,
+      filters,
+    });
+
+    if (result.canceled) return { ok: false, error: 'cancelled' };
+    if (result.error) return { ok: false, error: result.error };
+    return { ok: true, filePath: result.filePath };
+  });
+
+  /**
+   * Open the macOS Screen Recording privacy pane so the user can grant
+   * the permission required for `getDisplayMedia` system audio
+   * loopback. No-op on non-darwin platforms — Linux + Windows don't
+   * gate `getDisplayMedia` behind a separate Screen Recording perm.
+   */
+  ipcMain.handle('system:open-screen-recording-settings', async () => {
+    if (process.platform !== 'darwin') return { ok: false, error: 'not_darwin' };
+    try {
+      await shell.openExternal(
+        'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture',
+      );
+      return { ok: true };
+    } catch (err) {
+      console.warn('[system] failed to open screen-recording settings:', err);
+      return { ok: false, error: err?.message || 'open_failed' };
+    }
+  });
+
+  /**
+   * Returns the current macOS Screen Recording permission status so
+   * the renderer can decide whether to show the explainer modal up
+   * front. Possible values: 'not-determined' | 'granted' | 'denied' |
+   * 'restricted' | 'unknown' (the last is returned on non-darwin
+   * platforms so the renderer can short-circuit the prompt flow).
+   */
+  ipcMain.handle('system:screen-recording-status', () => {
+    if (process.platform !== 'darwin') return 'unknown';
+    try {
+      return systemPreferences.getMediaAccessStatus('screen');
+    } catch (err) {
+      console.warn('[system] failed to read screen status:', err);
+      return 'unknown';
+    }
+  });
+
+  /**
+   * Enumerate desktop audio sources (screens + windows) so the
+   * renderer's Audio tab can offer a system-audio picker. Returns
+   * [{ id, name }] — we strip the thumbnail dataUrl because
+   * desktopCapturer encodes a full PNG per source and the dropdown
+   * doesn't render previews. `fetchWindowIcons: false` further
+   * trims payload size.
+   *
+   * Sources are filtered to whatever desktopCapturer returns for the
+   * 'screen' + 'window' types; the renderer surfaces the persisted
+   * `audio.systemAudioSourceId` as the selected entry if it's still
+   * present, otherwise the dropdown falls back to "Default (first
+   * available screen)" — matching today's hardcoded `sources[0]`
+   * behaviour.
+   *
+   * On macOS we early-return an empty list when Screen Recording
+   * permission isn't granted — the source list would be empty
+   * anyway and the existing explainer modal handles the prompt.
+   */
+  ipcMain.handle('system:list-audio-sources', async () => {
+    if (process.platform === 'darwin') {
+      try {
+        const status = systemPreferences.getMediaAccessStatus('screen');
+        if (status !== 'granted') return { sources: [], permission: status };
+      } catch (err) {
+        console.warn('[system] permission probe failed:', err?.message || err);
+      }
+    }
+    try {
+      const raw = await desktopCapturer.getSources({
+        types: ['screen', 'window'],
+        fetchWindowIcons: false,
+      });
+      const sources = (raw || []).map((s) => ({
+        id: s.id,
+        name: s.name || s.id,
+      }));
+      return { sources, permission: 'granted' };
+    } catch (err) {
+      console.warn('[system] list-audio-sources failed:', err?.message || err);
+      return { sources: [], permission: 'unknown', error: err?.message || 'list_failed' };
+    }
+  });
+
+  /* ── Window chrome controls (frameless overlay) ────────────────────
+   *
+   * The overlay is `frame: false` so the visible —/× buttons in the
+   * in-HTML header have NO native chrome to fall back on — every
+   * action goes through one of these IPC channels.
+   *
+   * Semantics:
+   *   window:minimize — proper minimize to the OS taskbar / dock so
+   *                     the user can recall the overlay via the
+   *                     standard restore gesture (dock-click on
+   *                     macOS, taskbar on Win/Linux) OR the Tray
+   *                     icon registered above.
+   *   window:close    — close the window. main's `window-all-closed`
+   *                     handler then triggers `app.quit()` for ALL
+   *                     platforms (overlay-tool semantics — not the
+   *                     default macOS "keep app alive in dock"
+   *                     behaviour). The header's × button uses this.
+   *   window:quit     — short-circuit straight to `app.quit()`. Used
+   *                     by future code paths that want to exit
+   *                     without going through a window close (e.g.
+   *                     a "Quit" item in a future in-app menu). The
+   *                     Tray's Quit context-menu item calls
+   *                     `app.quit()` directly from main, not via
+   *                     IPC, but we expose this channel symmetrically
+   *                     so the renderer doesn't have to differentiate
+   *                     close-then-quit from quit-immediately.
+   */
+  ipcMain.handle('window:minimize', () => {
+    const w = mainWindowRef;
+    if (w && !w.isDestroyed()) w.minimize();
+    return { ok: true };
+  });
+
+  ipcMain.handle('window:close', () => {
+    const w = mainWindowRef;
+    if (w && !w.isDestroyed()) w.close();
+    return { ok: true };
+  });
+
+  ipcMain.handle('window:quit', () => {
+    app.quit();
+    return { ok: true };
+  });
+
+  // Renderer asks the coach for a fresh suggestion (seller pressed Skip
+  // on the active suggestion card, or pressed → at the live edge of
+  // suggestion history). Cheap call — the coach handles its own
+  // in-flight guard, so this is safe to fire repeatedly.
   ipcMain.handle('coach:skip', () => {
+    // The seller's intent overrides the auto-reformulate window.
+    // Cancel without firing; the next suggestion that lands will
+    // arm a fresh 10s clock in `onSuggestion`.
+    cancelReformulateTimer();
     coachSession?.skip();
     return { ok: true };
   });
 
+  // Renderer asks the coach to prioritise a specific item in its next
+  // suggestion. Fired when the seller clicks an item in the Logged
+  // pillar — the coach stamps the id into a one-shot boost queue and
+  // re-suggests on the next tick.
+  ipcMain.handle('coach:boost', (_event, payload) => {
+    const itemId = typeof payload?.itemId === 'string' ? payload.itemId : null;
+    if (!itemId) return { ok: false, error: 'missing_item_id' };
+    cancelReformulateTimer();
+    coachSession?.boost(itemId);
+    return { ok: true };
+  });
+
+  /**
+   * Set the coach's interaction mode. Persisted on the renderer side
+   * (localStorage); main holds a live copy because the pause detector
+   * keys off it. Forwarded by the renderer (a) on session start and
+   * (b) every time the user flips the header toggle. Safe to call
+   * before a session exists — the value is held for the next start.
+   */
+  ipcMain.handle('coach:set-mode', (_event, payload) => {
+    const mode = payload?.mode;
+    if (mode !== 'automated' && mode !== 'signalled') {
+      return { ok: false, error: 'invalid_mode' };
+    }
+    coachMode = mode;
+    console.log('[coach] mode set:', mode);
+    // Flipping back to signalled mid-session should clear any
+    // half-armed pause guard so the next mode flip lights up cleanly.
+    if (mode === 'signalled') pendingPauseFired = false;
+    return { ok: true };
+  });
+
+  /**
+   * One of the three "ask" buttons in the transcript pane footer fired.
+   * Maps to Coach.requestSuggestion. The kind enum is enforced on the
+   * coach side as well, but we validate here so the IPC channel's
+   * contract is explicit.
+   */
+  ipcMain.handle('coach:ask-suggest', (_event, payload) => {
+    if (!coachSession) return { ok: false, error: 'no_session' };
+    const kind = payload?.kind;
+    if (kind !== 'next' && kind !== 'deeper' && kind !== 'pivot') {
+      return { ok: false, error: 'invalid_kind' };
+    }
+    cancelReformulateTimer();
+    coachSession.requestSuggestion({ kind });
+    return { ok: true };
+  });
+
+  /**
+   * Recap button fired. Recap is its own channel (rather than a
+   * fourth kind on coach:ask-suggest) because the renderer doesn't
+   * pass any payload — recap is always freeform (item_id =
+   * 'freeform.recap') and the coach picks the prospect themes off
+   * the recent transcript itself. Surface a one-shot suggestion
+   * opportunity with kind:'recap' on the next coach tick.
+   */
+  ipcMain.handle('coach:ask-recap', () => {
+    if (!coachSession) return { ok: false, error: 'no_session' };
+    cancelReformulateTimer();
+    coachSession.requestSuggestion({ kind: 'recap' });
+    return { ok: true };
+  });
+
+  /**
+   * Per-item targeted ask. The renderer fires this with the rubric
+   * item id when the seller clicks the `+ Ask` button on an uncovered
+   * row in the pillar drawer, or when the "Cover remaining" queue
+   * advances to the next item. The coach generates a question for
+   * THAT specific item id (mode: targeted), bypassing the normal
+   * "pick the most valuable backlog item" logic.
+   *
+   * The itemId is validated minimally here (non-empty string); the
+   * coach's tool enum + the prompt's TARGETED_ITEM rules carry the
+   * load-bearing constraint.
+   */
+  ipcMain.handle('coach:ask-item', (_event, payload) => {
+    if (!coachSession) return { ok: false, error: 'no_session' };
+    const itemId = typeof payload?.itemId === 'string' ? payload.itemId : null;
+    if (!itemId) return { ok: false, error: 'missing_item_id' };
+    cancelReformulateTimer();
+    coachSession.requestSuggestion({ kind: 'targeted', itemId });
+    return { ok: true };
+  });
+
   // Audio chunks are high-frequency and fire-and-forget — use `send` not `invoke`.
-  ipcMain.on('gemini:audio', (_event, chunk) => {
-    if (!liveSession) return;
-    liveSession.sendAudio(chunk);
+  //
+  // Channel 1 = salesperson mic. Fan out to BOTH consumers:
+  //   - Gemini Live (for fast flag detection on the salesperson side)
+  //   - Deepgram channel 1 (for the 'you' transcript)
+  ipcMain.on('gemini:audio:channel1', (_event, chunk) => {
+    if (liveSession) liveSession.sendAudio(chunk);
+    if (deepgramSession) deepgramSession.sendAudio({ channel: 1, chunk });
+  });
+
+  // Channel 2 = system audio loopback (prospect's voice as heard
+  // through the system speakers / Zoom output). Only Deepgram needs
+  // this — Gemini Live's flag detection is scoped to the salesperson's
+  // own behaviour and feeding it the prospect's voice would confuse
+  // the flag rules (e.g. "bundled question" must apply to the seller).
+  ipcMain.on('gemini:audio:channel2', (_event, chunk) => {
+    if (deepgramSession) deepgramSession.sendAudio({ channel: 2, chunk });
   });
 }
 
 app.whenReady().then(async () => {
   // Auto-grant media (mic/camera) permission requests from the renderer.
   // The OS-level prompt still gates real access on macOS/Windows.
+  //
+  // Clipboard write is also allowed so the call-summary modal's
+  // Copy JSON / Copy Markdown buttons can use `navigator.clipboard.
+  // writeText()` directly. Without this, Electron's default-deny
+  // path rejected the request and the buttons silently failed with
+  // a "Copy failed." toast. The renderer also has an IPC fallback
+  // via window.gemini.clipboard.writeText() that uses Electron's
+  // native clipboard module — that path doesn't go through this
+  // handler, so the buttons would still work even if a future
+  // tighten-up flips clipboard off here.
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    if (permission === 'media' || permission === 'audioCapture' || permission === 'microphone') {
+    if (
+      permission === 'media' ||
+      permission === 'audioCapture' ||
+      permission === 'microphone' ||
+      permission === 'display-capture' ||
+      permission === 'clipboard-sanitized-write' ||
+      permission === 'clipboard-read'
+    ) {
       return callback(true);
     }
     callback(false);
+  });
+
+  /**
+   * Phase 4: handle the renderer's `getDisplayMedia()` request that
+   * captures the system audio loopback. Without this handler Electron
+   * would either pop up its built-in picker (no audio capable) or
+   * outright reject the request.
+   *
+   * On macOS 13+ `audio: 'loopback'` routes the system output through
+   * ScreenCaptureKit — that's what gives us the prospect's voice as
+   * heard through Zoom / Meet / etc. The browser API requires a video
+   * track in the response even though we only want the audio; we hand
+   * over the first available screen source and the renderer
+   * immediately stops + discards the video track.
+   *
+   * If `desktopCapturer.getSources` returns nothing (e.g. user denied
+   * Screen Recording at the OS level) we respond with an empty object
+   * and the renderer surfaces the explainer modal.
+   */
+  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+    if (process.platform === 'darwin') {
+      try {
+        const status = systemPreferences.getMediaAccessStatus('screen');
+        console.log('[display-media] screen-recording status:', status);
+        if (status !== 'granted') {
+          console.warn(
+            '[display-media] permission not granted at OS level (' + status + '). ' +
+            'Add the Electron binary to System Settings → Privacy → Screen & System Audio Recording. ' +
+            'Path: node_modules/electron/dist/Electron.app',
+          );
+          callback({});
+          return;
+        }
+      } catch (err) {
+        console.warn('[display-media] getMediaAccessStatus failed:', err?.message || err);
+      }
+    }
+    try {
+      // Phase 2: respect the user's persisted system-audio source ID
+      // from the Audio tab. We pull both screens AND windows because
+      // the picker offers both; the fallback when no preference is
+      // set (or the persisted id has gone stale, e.g. the chosen
+      // window was closed) is sources[0] — same as the original
+      // hardcoded behaviour, so an empty `audio.systemAudioSourceId`
+      // is a no-regression default.
+      const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] });
+      if (!sources || sources.length === 0) {
+        console.warn('[display-media] desktopCapturer returned 0 sources');
+        callback({});
+        return;
+      }
+
+      const persistedId = getAudio().systemAudioSourceId || '';
+      let chosen = null;
+      let pickReason = 'fallback';
+      if (persistedId) {
+        chosen = sources.find((s) => s.id === persistedId) || null;
+        if (chosen) {
+          pickReason = 'settings';
+        } else {
+          console.warn(
+            '[display-media] persisted systemAudioSourceId not found in current sources ' +
+            '— falling back to sources[0]. The Audio tab dropdown should re-populate ' +
+            'on next open and surface "Default (first available screen)" as the ' +
+            'effective selection.',
+          );
+        }
+      }
+      if (!chosen) chosen = sources[0];
+
+      console.log(
+        `[display-media] handing source to renderer (${pickReason}):`,
+        chosen.name,
+      );
+      callback({ video: chosen, audio: 'loopback' });
+    } catch (err) {
+      console.warn('[display-media] handler failed:', err?.message || err);
+      callback({});
+    }
   });
 
   if (process.platform === 'darwin') {
@@ -326,6 +2855,7 @@ app.whenReady().then(async () => {
   });
 
   createWindow();
+  createTray();
 
   app.on('second-instance', () => {
     if (mainWindowRef && !mainWindowRef.isDestroyed()) {
@@ -335,10 +2865,16 @@ app.whenReady().then(async () => {
     }
   });
 
+  // macOS dock-icon click. The default Electron handler only recreates
+  // a window when none exist — but for this single-window overlay we
+  // also want to lift a hidden / minimised window back to the front,
+  // since both states are reachable via the in-app Minimise button
+  // and the Cmd+Shift+H global shortcut. `showAndFocusMainWindow`
+  // covers all three start states (destroyed → recreate, minimised →
+  // restore, hidden → show) so the dock icon behaves the same way the
+  // tray icon does.
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
+    showAndFocusMainWindow();
   });
 });
 
@@ -357,4 +2893,13 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   teardownSession();
+  // Explicit tray teardown. On Windows the notification-area icon
+  // can linger until the user hovers over it if we don't destroy
+  // it ourselves; macOS / Linux clean up automatically but the
+  // explicit call is harmless and keeps the lifecycle symmetric
+  // with createTray() above.
+  if (tray) {
+    try { tray.destroy(); } catch { /* ignore */ }
+    tray = null;
+  }
 });

@@ -2,10 +2,34 @@
 <html>
   <head>
     <meta charset="UTF-8" />
-    <title>2-Way Flow</title>
+    <title>Two Way Flow</title>
   </head>
   <body>
     <main class="coach" id="coach" data-status="idle">
+      <!-- Speaker-bleed hint banner. Surfaced once per session when
+           the cross-channel dedup fires repeatedly — strong signal
+           that the user is on speakers and acoustic bleed is being
+           transcribed on both channels. Driven from
+           src/renderer.js (noteDedupDrop → showDedupHintBanner).
+           Absolute-positioned over the body so showing/hiding it
+           never reflows anything else. -->
+      <div
+        id="dedupHintBanner"
+        class="dedup-hint"
+        role="status"
+        aria-live="polite"
+        hidden
+      >
+        <span class="dedup-hint__text">Detecting speaker bleed — headphones will significantly improve attribution.</span>
+        <button
+          type="button"
+          id="dedupHintDismiss"
+          class="dedup-hint__dismiss"
+          aria-label="Dismiss"
+          title="Dismiss"
+        >×</button>
+      </div>
+
       <header class="coach__header">
         <div class="rec" id="recIndicator" aria-live="polite">
           <span class="rec__dot" aria-hidden="true"></span>
@@ -21,9 +45,93 @@
             <span class="speaker__mic" aria-hidden="true">🎙</span>
             <span class="speaker__name">Other</span>
           </div>
+          <!-- AEC (echo cancellation) status badge. Driven by the
+               mic stream's MediaTrackSettings.echoCancellation after
+               getUserMedia returns. Initial state is "unknown" (grey)
+               and flips to green / red when capture starts. See
+               setAecBadgeState in src/renderer.js. -->
+          <span
+            id="aecBadge"
+            class="aec-badge"
+            data-state="unknown"
+            role="status"
+            aria-live="polite"
+            title="Echo cancellation status"
+          >AEC ?</span>
+
+          <!-- Connection-status pill (E4). Surfaces the worst-of
+               health for the two upstream transports (Deepgram +
+               Gemini Live). Three visual states keyed off the rolled-
+               up data-state attribute:
+                 green ('connected') — both transports healthy
+                 amber ('reconnecting') — at least one mid-retry
+                 red   ('down') — both transports down / unavailable
+               The per-transport state lives on data-deepgram and
+               data-gemini-live so the title tooltip can spell out
+               which side is degraded. See renderConnectionStatus in
+               src/renderer.js. -->
+          <span
+            id="connectionStatus"
+            class="conn-pill"
+            data-state="down"
+            data-deepgram="down"
+            data-gemini-live="down"
+            role="status"
+            aria-live="polite"
+            title="Connection status"
+            hidden
+          >
+            <span class="conn-pill__dot" aria-hidden="true"></span>
+            <span class="conn-pill__label">Off</span>
+          </span>
         </div>
 
         <div class="coach__controls">
+          <!-- Settings entry point. Opens the modal Settings dialog
+               (#settingsModal below) on click. Lives leftmost in the
+               control cluster so it reads as a passive utility, not
+               part of the call-start action surface. -->
+          <button
+            id="settingsButton"
+            type="button"
+            class="coach__icon-btn"
+            aria-label="Settings"
+            title="Settings"
+          >
+            <span aria-hidden="true">⚙</span>
+          </button>
+          <!-- Coach interaction mode (v2.5 redesign). Defaults to
+               'signalled' (calmer; matches the user's preference for
+               less noise); 'automated' adds a pause-triggered nudge
+               on top. Persisted in localStorage under `coach.mode`
+               and forwarded to main via window.gemini.setCoachMode. -->
+          <div
+            id="coachModeToggle"
+            class="mode-toggle"
+            role="group"
+            aria-label="Coach mode"
+          >
+            <button
+              type="button"
+              class="mode-toggle__btn"
+              data-mode="signalled"
+              data-active="true"
+              title="Coach only suggests when you ask"
+              aria-pressed="true"
+            >
+              Signalled
+            </button>
+            <button
+              type="button"
+              class="mode-toggle__btn"
+              data-mode="automated"
+              data-active="false"
+              title="Coach also nudges during natural pauses"
+              aria-pressed="false"
+            >
+              Automated
+            </button>
+          </div>
           <button
             id="recToggle"
             type="button"
@@ -62,19 +170,89 @@
         ></nav>
 
         <section
-          id="activePillar"
-          class="active-pillar"
-          aria-label="Active pillar checklist"
+          id="transcriptPane"
+          class="transcript-pane"
+          aria-label="Live transcript"
         >
-          <div id="activePillarHeader" class="active-pillar__header-slot"></div>
-          <div id="activePillarBody" class="active-pillar__body" aria-live="polite"></div>
-          <div id="activePillarFooter" class="active-pillar__footer">
-            <p
-              id="transcriptTicker"
-              class="ticker"
-              aria-live="polite"
-              hidden
-            ></p>
+          <div
+            id="transcriptList"
+            class="transcript-pane__list"
+            aria-live="polite"
+          ></div>
+          <p
+            id="transcriptError"
+            class="transcript-pane__error"
+            hidden
+          ></p>
+          <div class="transcript-pane__footer">
+            <!-- v2.5 redesign: rep-initiated suggestion controls. The
+                 three buttons map 1:1 to the coach's three ask kinds
+                 (next / deeper / pivot). The thinking dot sits inline
+                 so the user sees it pulse the moment any ask fires. -->
+            <div class="ask-controls">
+              <span
+                id="coachThinkingDot"
+                class="thinking-dot"
+                role="status"
+                aria-label="Coach is thinking"
+                data-active="false"
+                hidden
+              ></span>
+              <div
+                class="ask-controls__buttons"
+                role="group"
+                aria-label="Ask coach"
+              >
+                <button
+                  type="button"
+                  class="ask-btn"
+                  data-kind="next"
+                  title="Suggest the highest-priority next question"
+                >
+                  <span class="ask-btn__glyph" aria-hidden="true">+</span>
+                  <span class="ask-btn__label">Suggest</span>
+                </button>
+                <button
+                  type="button"
+                  class="ask-btn"
+                  data-kind="deeper"
+                  title="Go deeper on what the prospect just said"
+                >
+                  <span class="ask-btn__glyph" aria-hidden="true">↓</span>
+                  <span class="ask-btn__label">Deeper</span>
+                </button>
+                <button
+                  type="button"
+                  class="ask-btn"
+                  data-kind="pivot"
+                  title="Pivot to a different topic"
+                >
+                  <span class="ask-btn__glyph" aria-hidden="true">↪</span>
+                  <span class="ask-btn__label">Pivot</span>
+                </button>
+                <button
+                  type="button"
+                  class="ask-btn"
+                  data-kind="recap"
+                  title="Recap what the prospect has shared so far"
+                >
+                  <span class="ask-btn__glyph" aria-hidden="true">↺</span>
+                  <span class="ask-btn__label">Recap</span>
+                  <!-- "Recap in progress…" status pill. Hidden by
+                       default; revealed when the rep clicks Recap and
+                       cleared when the coach:suggestion IPC for
+                       kind=='recap' arrives (or after a 15s safety
+                       timeout). See the Recap click handler in
+                       src/renderer.js for the lifecycle. -->
+                  <span
+                    class="ask-btn__status"
+                    data-kind="recap"
+                    aria-live="polite"
+                    hidden
+                  ></span>
+                </button>
+              </div>
+            </div>
             <div
               id="coachSuggestion"
               class="suggestion"
@@ -89,43 +267,1123 @@
           id="capturedPane"
           class="captured"
           aria-label="Captured information"
-        ></aside>
+        >
+          <!-- Strategy A / Work-stream C: quick-fix rollup card.
+               Sits at the top of #capturedPane and displays the
+               Stage-2 AI roll-up of all structured monetary facts
+               captured this call. Hidden by default until the first
+               scoring:quick-fix IPC arrives with a non-null rollup.
+               See renderQuickFix in src/renderer.js for population
+               + drill-through behaviour (clicking a breakdown row
+               scrolls the transcript pane to the anchor quote). -->
+          <section id="quickFix" class="quick-fix" hidden>
+            <header class="quick-fix__header">
+              <span class="quick-fix__title">Total annual opportunity</span>
+              <span class="quick-fix__confidence" data-level="medium">medium</span>
+            </header>
+            <div class="quick-fix__headline"></div>
+            <ul class="quick-fix__breakdown"></ul>
+            <ul class="quick-fix__assumptions"></ul>
+            <div class="quick-fix__status" hidden></div>
+          </section>
+        </aside>
+
+        <aside
+          id="railOverlay"
+          class="rail-overlay"
+          data-open="false"
+          aria-hidden="true"
+        >
+          <div
+            class="rail-overlay__panel"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="railOverlayTitle"
+          >
+            <header
+              id="railOverlayHeader"
+              class="rail-overlay__header"
+            ></header>
+            <div
+              id="railOverlayBody"
+              class="rail-overlay__body"
+              aria-live="polite"
+            ></div>
+          </div>
+        </aside>
       </div>
 
-      <footer class="coach__footer">
-        <button
-          id="transcriptToggle"
-          type="button"
-          class="link"
-          aria-expanded="false"
-          aria-controls="transcriptDrawer"
-        >
-          <span class="link__icon" aria-hidden="true">▤</span>
-          <span>Show transcript</span>
-        </button>
+      <!-- Phase 4: Screen Recording permission explainer. Shown when
+           getDisplayMedia fails (e.g. macOS Screen Recording perm not
+           granted yet) so the user understands why we need it and has
+           a clear path to grant it. -->
+      <dialog id="permissionModal" class="modal" aria-labelledby="permissionTitle">
+        <div class="modal__panel">
+          <header class="modal__header">
+            <h2 id="permissionTitle" class="modal__title">Capture the prospect's voice</h2>
+          </header>
+          <div class="modal__body">
+            <p>
+              To label the prospect's side of the call we need macOS
+              Screen Recording permission. It lets the app read the
+              audio coming through your speakers (Zoom, Meet, etc.).
+            </p>
+            <p class="modal__body-secondary">
+              Without it the call will still record — but only your
+              own mic will be transcribed, and the &ldquo;Prospect&rdquo;
+              channel will be empty.
+            </p>
+          </div>
+          <footer class="modal__actions">
+            <button
+              type="button"
+              id="permissionContinue"
+              class="modal__btn modal__btn--ghost"
+            >
+              Continue with mic only
+            </button>
+            <button
+              type="button"
+              id="permissionOpenSettings"
+              class="modal__btn"
+            >
+              Open System Settings
+            </button>
+            <button
+              type="button"
+              id="permissionRetry"
+              class="modal__btn modal__btn--primary"
+            >
+              Grant access
+            </button>
+          </footer>
+        </div>
+      </dialog>
 
-        <button
-          id="rubricSwitcher"
-          type="button"
-          class="link"
-          title="Switch rubric (coming soon)"
-        >
-          <span class="link__icon" aria-hidden="true">▦</span>
-          <span>Tuned Automation rubric ▾</span>
-        </button>
-      </footer>
+      <!-- Phase 5: post-call summary. Populated by `summary:ready` IPC
+           and opened automatically on Stop. Three tabs (Scorecard,
+           Captured facts, Transcript). Footer buttons copy/save the
+           JSON or Markdown serialisations produced by src/summary.js. -->
+      <dialog id="summaryModal" class="modal" aria-labelledby="summaryTitle">
+        <div class="modal__panel summary-modal__panel">
+          <header class="summary-modal__header">
+            <h2 id="summaryTitle" class="modal__title">Call summary</h2>
+            <span id="summaryDuration" class="summary-modal__duration" hidden></span>
+            <button
+              type="button"
+              id="summaryCloseX"
+              class="coach__icon-btn"
+              aria-label="Close summary"
+              title="Close (Esc)"
+            >
+              ×
+            </button>
+          </header>
+          <nav class="summary-modal__tabs" role="tablist" aria-label="Summary sections">
+            <button
+              type="button"
+              class="summary-modal__tab"
+              data-tab="scorecard"
+              data-active="true"
+              role="tab"
+              aria-selected="true"
+            >
+              Scorecard
+            </button>
+            <button
+              type="button"
+              class="summary-modal__tab"
+              data-tab="facts"
+              role="tab"
+              aria-selected="false"
+            >
+              Captured facts
+            </button>
+            <button
+              type="button"
+              class="summary-modal__tab"
+              data-tab="transcript"
+              role="tab"
+              aria-selected="false"
+            >
+              Transcript
+            </button>
+            <button
+              type="button"
+              class="summary-modal__tab"
+              data-tab="debrief"
+              role="tab"
+              aria-selected="false"
+            >
+              Debrief
+            </button>
+          </nav>
+          <div class="summary-modal__body">
+            <section
+              id="summaryPanelScorecard"
+              class="summary-panel"
+              data-active="true"
+              role="tabpanel"
+              aria-label="Scorecard"
+            >
+              <p class="summary-panel__empty">Generating summary…</p>
+            </section>
+            <section
+              id="summaryPanelFacts"
+              class="summary-panel"
+              role="tabpanel"
+              aria-label="Captured facts"
+              hidden
+            ></section>
+            <section
+              id="summaryPanelTranscript"
+              class="summary-panel"
+              role="tabpanel"
+              aria-label="Transcript"
+              hidden
+            ></section>
+            <section
+              id="summaryPanelDebrief"
+              class="summary-panel"
+              role="tabpanel"
+              aria-label="AI debrief"
+              hidden
+            ></section>
+          </div>
+          <footer class="summary-modal__footer">
+            <span id="summaryToast" class="summary-modal__toast" aria-live="polite" hidden></span>
+            <div class="summary-modal__footer-actions">
+              <button type="button" id="summaryCopyJson" class="modal__btn">Copy JSON</button>
+              <button type="button" id="summaryCopyMd" class="modal__btn">Copy Markdown</button>
+              <button type="button" id="summarySave" class="modal__btn">Save…</button>
+              <button type="button" id="summaryClose" class="modal__btn modal__btn--primary">Close</button>
+            </div>
+          </footer>
+        </div>
+      </dialog>
 
-      <section
-        id="transcriptDrawer"
-        class="drawer"
-        aria-label="Live transcript"
-        hidden
-      >
-        <div id="transcriptList" class="drawer__list" hidden></div>
-        <p id="transcriptPending" class="drawer__pending" hidden></p>
-        <p id="transcriptError" class="drawer__error" hidden></p>
-      </section>
+      <!-- App-wide Settings dialog. Three tabs:
+             Providers   — per-provider API keys + default-provider routing +
+                           per-provider default model. Replaces the v1
+                           "Setup" tab.
+             Appearance  — placeholder for future tag-colour / theme controls
+             Advanced    — placeholder for future debug / behaviour toggles
+           Persistence is via main's settings:* IPC handlers; see
+           src/settings.js for the v2 storage shape + env-var fallback
+           rules. Saves are auto-debounced (no Save button — the form
+           writes back on blur / 1 s idle / select change / segmented
+           toggle), see src/renderer.js. Opens from the gear icon in
+           the header (#settingsButton). -->
+      <dialog id="settingsModal" class="settings-modal" aria-labelledby="settingsModalTitle">
+        <div class="settings-modal__panel">
+          <header class="settings-modal__header">
+            <h2 id="settingsModalTitle" class="settings-modal__title">
+              <span class="settings-modal__title-glyph" aria-hidden="true">⚙</span>
+              Settings
+            </h2>
+            <button
+              type="button"
+              id="settingsModalClose"
+              class="settings-modal__close"
+              aria-label="Close settings"
+              title="Close (Esc)"
+            >×</button>
+          </header>
+          <nav class="settings-modal__tabs" role="tablist" aria-label="Settings sections">
+            <!-- Six tabs in stable order. Audio / General / Help are
+                 Phase 1 stubs that the corresponding phases populate
+                 (2 / 5 / 6). The order is deliberate: providers first
+                 because that's the gating step for a new install, then
+                 capture (Audio), then look-and-feel (Appearance), then
+                 behaviour (Coach), then workflow + data (General), then
+                 onboarding (Help). -->
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="providers"
+              role="tab"
+              aria-selected="true"
+              aria-controls="settingsTabProviders"
+            >Providers</button>
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="audio"
+              role="tab"
+              aria-selected="false"
+              aria-controls="settingsTabAudio"
+            >Audio</button>
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="appearance"
+              role="tab"
+              aria-selected="false"
+              aria-controls="settingsTabAppearance"
+            >Appearance</button>
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="coach"
+              role="tab"
+              aria-selected="false"
+              aria-controls="settingsTabCoach"
+            >Coach</button>
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="general"
+              role="tab"
+              aria-selected="false"
+              aria-controls="settingsTabGeneral"
+            >General</button>
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="help"
+              role="tab"
+              aria-selected="false"
+              aria-controls="settingsTabHelp"
+            >Help</button>
+          </nav>
+          <div class="settings-modal__body">
+            <section
+              id="settingsTabProviders"
+              class="settings-tab"
+              data-tab-content="providers"
+              role="tabpanel"
+              aria-label="Providers"
+            >
+              <!-- Default provider routing. The segmented control is the
+                   single source of truth for which provider the Coach
+                   runs against — main.js reads `defaultProvider` via
+                   getDefaultProvider() at session start. -->
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Default provider</h4>
+                <p class="settings-section__subtitle">
+                  Used when you start a new call. You can switch on the fly.
+                </p>
+                <div
+                  id="settingsDefaultProvider"
+                  class="provider-segmented"
+                  role="group"
+                  aria-label="Default provider"
+                >
+                  <button
+                    type="button"
+                    class="provider-segmented__btn"
+                    data-provider="anthropic"
+                    data-active="false"
+                    aria-pressed="false"
+                  >Anthropic</button>
+                  <button
+                    type="button"
+                    class="provider-segmented__btn"
+                    data-provider="gemini"
+                    data-active="true"
+                    aria-pressed="true"
+                  >Gemini</button>
+                  <button
+                    type="button"
+                    class="provider-segmented__btn"
+                    data-provider="openai"
+                    data-active="false"
+                    aria-pressed="false"
+                  >OpenAI</button>
+                </div>
+              </div>
+
+              <!-- Providers list. Each card encapsulates the per-provider
+                   key + default-model configuration. Status badges and
+                   Test results are surfaced inline so the user can
+                   verify each connection without leaving the modal. -->
+              <div class="settings-section">
+                <div class="settings-section__row">
+                  <h4 class="settings-section__heading">Providers</h4>
+                  <span class="settings-autosave-chip" aria-live="polite">
+                    <span class="settings-autosave-chip__check" aria-hidden="true">✓</span>
+                    Saved automatically
+                  </span>
+                </div>
+
+                <!-- Anthropic card. Three rows: header (glyph + label +
+                     status badge), key input (password + eye toggle +
+                     Test/Connect button), default model select. The
+                     `data-provider` attribute on the card root scopes
+                     all the renderer's lookups. -->
+                <article
+                  class="provider-card"
+                  data-provider="anthropic"
+                >
+                  <header class="provider-card__header">
+                    <span class="provider-card__glyph" aria-hidden="true">✻</span>
+                    <div class="provider-card__title">
+                      <strong class="provider-card__name">Anthropic</strong>
+                      <span class="provider-card__subtitle">Claude models</span>
+                    </div>
+                    <span
+                      class="provider-card__status"
+                      data-status="unconfigured"
+                      role="status"
+                    >Not configured</span>
+                  </header>
+                  <div class="provider-card__key-row">
+                    <div class="provider-card__input-wrap">
+                      <input
+                        type="password"
+                        class="provider-card__input"
+                        data-provider-key="anthropic"
+                        placeholder="sk-ant-… paste key to connect"
+                        autocomplete="off"
+                        spellcheck="false"
+                        aria-label="Anthropic API key"
+                      />
+                      <button
+                        type="button"
+                        class="provider-card__eye"
+                        data-eye-for="anthropic"
+                        aria-label="Show key"
+                        aria-pressed="false"
+                        title="Show / hide key"
+                      >
+                        <span aria-hidden="true">👁</span>
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      class="provider-card__test"
+                      data-test-for="anthropic"
+                    >Connect</button>
+                    <span
+                      class="provider-card__test-result"
+                      data-test-result-for="anthropic"
+                      aria-live="polite"
+                      hidden
+                    ></span>
+                  </div>
+                  <div class="provider-card__model-row">
+                    <label class="provider-card__model-label" for="settingsModelAnthropic">
+                      Default model
+                    </label>
+                    <select
+                      id="settingsModelAnthropic"
+                      class="provider-card__model"
+                      data-provider-model="anthropic"
+                    >
+                      <optgroup label="Current generation">
+                        <option value="claude-opus-4-7">Claude Opus 4.7 — most capable</option>
+                        <option value="claude-sonnet-4-6">Claude Sonnet 4.6 — balanced (recommended)</option>
+                        <option value="claude-haiku-4-5">Claude Haiku 4.5 — fast &amp; cheap</option>
+                      </optgroup>
+                      <optgroup label="Previous generation">
+                        <option value="claude-opus-4-6">Claude Opus 4.6</option>
+                        <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
+                        <option value="claude-opus-4-5">Claude Opus 4.5</option>
+                        <option value="claude-opus-4-1">Claude Opus 4.1</option>
+                      </optgroup>
+                    </select>
+                  </div>
+                </article>
+
+                <article
+                  class="provider-card"
+                  data-provider="gemini"
+                >
+                  <header class="provider-card__header">
+                    <span class="provider-card__glyph" aria-hidden="true">◆</span>
+                    <div class="provider-card__title">
+                      <strong class="provider-card__name">Gemini</strong>
+                      <span class="provider-card__subtitle">Google AI models</span>
+                    </div>
+                    <span
+                      class="provider-card__status"
+                      data-status="unconfigured"
+                      role="status"
+                    >Not configured</span>
+                  </header>
+                  <div class="provider-card__key-row">
+                    <div class="provider-card__input-wrap">
+                      <input
+                        type="password"
+                        class="provider-card__input"
+                        data-provider-key="gemini"
+                        placeholder="Paste your API key to override"
+                        autocomplete="off"
+                        spellcheck="false"
+                        aria-label="Gemini API key"
+                      />
+                      <button
+                        type="button"
+                        class="provider-card__eye"
+                        data-eye-for="gemini"
+                        aria-label="Show key"
+                        aria-pressed="false"
+                        title="Show / hide key"
+                      >
+                        <span aria-hidden="true">👁</span>
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      class="provider-card__test"
+                      data-test-for="gemini"
+                    >Connect</button>
+                    <span
+                      class="provider-card__test-result"
+                      data-test-result-for="gemini"
+                      aria-live="polite"
+                      hidden
+                    ></span>
+                  </div>
+                  <div class="provider-card__model-row">
+                    <label class="provider-card__model-label" for="settingsModelGemini">
+                      Default model
+                    </label>
+                    <select
+                      id="settingsModelGemini"
+                      class="provider-card__model"
+                      data-provider-model="gemini"
+                    >
+                      <optgroup label="Current generation">
+                        <option value="gemini-3.5-flash">Gemini 3.5 Flash — near-Pro at Flash cost (recommended)</option>
+                        <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite — most cost-efficient</option>
+                      </optgroup>
+                      <optgroup label="Previous generation">
+                        <option value="gemini-2.5-pro">Gemini 2.5 Pro — deepest reasoning</option>
+                        <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                        <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite</option>
+                      </optgroup>
+                    </select>
+                  </div>
+                </article>
+
+                <article
+                  class="provider-card"
+                  data-provider="openai"
+                >
+                  <header class="provider-card__header">
+                    <span class="provider-card__glyph" aria-hidden="true">⚪</span>
+                    <div class="provider-card__title">
+                      <strong class="provider-card__name">OpenAI</strong>
+                      <span class="provider-card__subtitle">GPT models</span>
+                    </div>
+                    <span
+                      class="provider-card__status"
+                      data-status="unconfigured"
+                      role="status"
+                    >Not configured</span>
+                  </header>
+                  <div class="provider-card__key-row">
+                    <div class="provider-card__input-wrap">
+                      <input
+                        type="password"
+                        class="provider-card__input"
+                        data-provider-key="openai"
+                        placeholder="sk-… paste key to connect"
+                        autocomplete="off"
+                        spellcheck="false"
+                        aria-label="OpenAI API key"
+                      />
+                      <button
+                        type="button"
+                        class="provider-card__eye"
+                        data-eye-for="openai"
+                        aria-label="Show key"
+                        aria-pressed="false"
+                        title="Show / hide key"
+                      >
+                        <span aria-hidden="true">👁</span>
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      class="provider-card__test"
+                      data-test-for="openai"
+                    >Connect</button>
+                    <span
+                      class="provider-card__test-result"
+                      data-test-result-for="openai"
+                      aria-live="polite"
+                      hidden
+                    ></span>
+                  </div>
+                  <div class="provider-card__model-row">
+                    <label class="provider-card__model-label" for="settingsModelOpenai">
+                      Default model
+                    </label>
+                    <select
+                      id="settingsModelOpenai"
+                      class="provider-card__model"
+                      data-provider-model="openai"
+                    >
+                      <optgroup label="Current generation">
+                        <option value="gpt-5.5">GPT-5.5 — flagship (recommended)</option>
+                        <option value="gpt-5.5-pro">GPT-5.5 Pro — deeper reasoning</option>
+                        <option value="gpt-5.4">GPT-5.4 — coding &amp; pro work</option>
+                        <option value="gpt-5.4-mini">GPT-5.4 Mini — cost-sensitive</option>
+                        <option value="gpt-5.4-nano">GPT-5.4 Nano — fastest</option>
+                      </optgroup>
+                      <optgroup label="Previous generation">
+                        <option value="gpt-5.1">GPT-5.1</option>
+                        <option value="gpt-5">GPT-5</option>
+                        <option value="gpt-5-mini">GPT-5 Mini</option>
+                        <option value="gpt-5-pro">GPT-5 Pro</option>
+                      </optgroup>
+                    </select>
+                  </div>
+                </article>
+              </div>
+
+              <!-- Subtle footer note. Mirrors the system-prompt-style
+                   "warning" register used elsewhere in the modal so the
+                   user spots it on close. -->
+              <p class="settings-footer-note">
+                <span class="settings-footer-note__glyph" aria-hidden="true">⚠</span>
+                <em>Keys are stored locally on this device. Leave blank to use your .env file.</em>
+              </p>
+            </section>
+            <!-- Appearance tab: speaker-label colour customisation.
+                 The two <input type="color"> pickers fire `input` events
+                 on every nudge, which the renderer uses for live-preview
+                 (CSS variables on :root) + a 200 ms idle debounce that
+                 persists into appearance.tagColors. The reset button
+                 restores DEFAULT_TAG_YOU / DEFAULT_TAG_OTHER (see
+                 src/renderer.js — they mirror settings.js defaults). -->
+            <section
+              id="settingsTabAppearance"
+              class="settings-tab"
+              data-tab-content="appearance"
+              role="tabpanel"
+              aria-label="Appearance"
+              hidden
+            >
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Speaker label colours</h4>
+                <p class="settings-section__subtitle">
+                  Customise the YOU and PROSPECT labels that prefix each transcript turn.
+                </p>
+
+                <div class="appearance-tag-grid">
+                  <div class="appearance-tag-card">
+                    <div class="appearance-tag-card__preview" data-speaker="you">YOU</div>
+                    <label class="appearance-tag-card__label" for="appearanceColorYou">Your label colour</label>
+                    <input
+                      type="color"
+                      id="appearanceColorYou"
+                      class="appearance-tag-card__picker"
+                      aria-label="YOU label colour"
+                    />
+                  </div>
+                  <div class="appearance-tag-card">
+                    <div class="appearance-tag-card__preview" data-speaker="other">PROSPECT</div>
+                    <label class="appearance-tag-card__label" for="appearanceColorOther">Prospect label colour</label>
+                    <input
+                      type="color"
+                      id="appearanceColorOther"
+                      class="appearance-tag-card__picker"
+                      aria-label="PROSPECT label colour"
+                    />
+                  </div>
+                </div>
+
+                <div class="appearance-actions">
+                  <button
+                    id="appearanceResetBtn"
+                    class="appearance-reset-btn"
+                    type="button"
+                  >Reset to defaults</button>
+                </div>
+              </div>
+            </section>
+            <!-- Audio tab. Phase 1 ships an empty stub — Phase 2 will
+                 fill it with the mic / system-audio device selectors,
+                 AEC/NS/AGC toggles, Deepgram model choice, and the
+                 "Hide AEC badge" visual toggle. The Phase 2 plan
+                 inherits this id (`settingsTabAudio`) so renderer
+                 wiring lands cleanly. -->
+            <!-- Audio tab (Phase 2). Source of truth for the capture
+                 pipeline: mic device, system-audio source, AEC/NS/AGC
+                 toggles, Deepgram STT model, and the AEC badge
+                 visibility. Apply policy is mixed — visual toggles
+                 (V10) apply immediately on save; capture / STT
+                 controls bake in at the NEXT session start (they're
+                 read by main.js / startCapture at session-open time).
+                 The "apply-hint" block at the bottom surfaces this
+                 caveat in-place whenever state.status !== 'idle'. -->
+            <section
+              id="settingsTabAudio"
+              class="settings-tab"
+              data-tab-content="audio"
+              role="tabpanel"
+              aria-label="Audio"
+              hidden
+            >
+              <!-- Section 1 — Capture devices. Mic enumeration runs in
+                   the renderer via navigator.mediaDevices.enumerate-
+                   Devices(); system-audio enumeration runs in main
+                   via desktopCapturer (system:list-audio-sources IPC).
+                   Both pickers persist '' as "use the platform
+                   default" so a fresh install / wiped settings
+                   matches the original hardcoded behaviour exactly. -->
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Capture devices</h4>
+                <p class="settings-section__subtitle">
+                  Choose the microphone and screen / window that supplies
+                  prospect audio. Default falls back to your OS-level
+                  picks.
+                </p>
+
+                <div class="audio-picker">
+                  <label class="audio-picker__label" for="audioMicDevice">
+                    Microphone
+                  </label>
+                  <div class="audio-picker__row">
+                    <select
+                      id="audioMicDevice"
+                      class="provider-card__model audio-picker__select"
+                    >
+                      <option value="">Default (OS-selected mic)</option>
+                    </select>
+                    <button
+                      type="button"
+                      id="audioMicRefresh"
+                      class="audio-picker__refresh"
+                      title="Re-scan attached devices"
+                    >Refresh</button>
+                  </div>
+                  <p class="audio-picker__hint">
+                    Changes apply on the next call. If your device is
+                    unplugged, capture falls back to the OS default.
+                  </p>
+                </div>
+
+                <div class="audio-picker">
+                  <label class="audio-picker__label" for="audioSysSource">
+                    System audio source
+                  </label>
+                  <div class="audio-picker__row">
+                    <select
+                      id="audioSysSource"
+                      class="provider-card__model audio-picker__select"
+                    >
+                      <option value="">Default (first available screen)</option>
+                    </select>
+                    <button
+                      type="button"
+                      id="audioSysRefresh"
+                      class="audio-picker__refresh"
+                      title="Re-scan available screens / windows"
+                    >Refresh</button>
+                  </div>
+                  <p class="audio-picker__hint">
+                    Pick the screen or window playing the prospect's
+                    voice. macOS requires Screen Recording permission
+                    for the list to populate.
+                  </p>
+                </div>
+              </div>
+
+              <!-- Section 2 — Audio processing. Three constraint
+                   toggles that pass through to getUserMedia's
+                   echoCancellation / noiseSuppression / autoGainControl
+                   fields. AEC has an extra caveat: Chromium's command-
+                   line force-switches (src/main.js lines 72–76) may
+                   override `echoCancellation: false` on some platforms.
+                   We surface that in the sub-text rather than try to
+                   hot-patch the switches at boot. -->
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Audio processing</h4>
+                <p class="settings-section__subtitle">
+                  Constraints applied to the microphone stream. Defaults
+                  on — match Chromium's recommended setup for speakerphone
+                  use.
+                </p>
+
+                <div class="advanced-toggle">
+                  <label class="advanced-toggle__label">
+                    <input
+                      type="checkbox"
+                      id="audioAec"
+                      class="advanced-toggle__input"
+                    />
+                    <span class="advanced-toggle__title">
+                      Echo cancellation (AEC)
+                    </span>
+                    <span class="advanced-toggle__sub">
+                      Cancels prospect audio bleed when you're on
+                      speakers. May be force-enabled by Chromium on
+                      some platforms even when this is off.
+                    </span>
+                  </label>
+                </div>
+
+                <div class="advanced-toggle">
+                  <label class="advanced-toggle__label">
+                    <input
+                      type="checkbox"
+                      id="audioNoiseSuppression"
+                      class="advanced-toggle__input"
+                    />
+                    <span class="advanced-toggle__title">
+                      Noise suppression
+                    </span>
+                    <span class="advanced-toggle__sub">
+                      Filters out fans, keyboard clicks, and other
+                      background noise from your mic.
+                    </span>
+                  </label>
+                </div>
+
+                <div class="advanced-toggle">
+                  <label class="advanced-toggle__label">
+                    <input
+                      type="checkbox"
+                      id="audioAutoGainControl"
+                      class="advanced-toggle__input"
+                    />
+                    <span class="advanced-toggle__title">
+                      Auto-gain control
+                    </span>
+                    <span class="advanced-toggle__sub">
+                      Normalises mic input level so quiet and loud
+                      speech both reach the AI clearly.
+                    </span>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Section 3 — Speech-to-text. Deepgram model select.
+                   The model is baked into the WebSocket query string
+                   at connect time, so a change here only takes effect
+                   when the next call starts. The Deepgram API key
+                   stays env-only for now (see DEEPGRAM_API_KEY in
+                   .env.example); moving it to Settings is a Phase 5
+                   follow-up. -->
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Speech-to-text</h4>
+                <p class="settings-section__subtitle">
+                  Deepgram model used for prospect-side transcription.
+                  Higher tiers give better accuracy at higher cost.
+                </p>
+
+                <div class="provider-card__model-row">
+                  <label class="provider-card__model-label" for="audioDeepgramModel">
+                    Deepgram model
+                  </label>
+                  <select
+                    id="audioDeepgramModel"
+                    class="provider-card__model"
+                  >
+                    <option value="nova-3">Nova-3 — Best (default)</option>
+                    <option value="nova-2-meeting">Nova-2 Meeting — Video calls</option>
+                    <option value="nova-2-phonecall">Nova-2 Phonecall — Telephony</option>
+                    <option value="nova-2-general">Nova-2 General — Previous gen</option>
+                    <option value="enhanced">Enhanced — Mid-tier (cheaper)</option>
+                    <option value="base">Base — Cheapest</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Section 4 — Display. V10: hide-AEC-badge toggle.
+                   This is the ONLY immediately-applied control on
+                   the Audio tab — the renderer's applyAecBadge-
+                   Visibility() helper toggles `#aecBadge.hidden`
+                   synchronously on save. -->
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Display</h4>
+
+                <div class="advanced-toggle">
+                  <label class="advanced-toggle__label">
+                    <input
+                      type="checkbox"
+                      id="audioHideAecBadge"
+                      class="advanced-toggle__input"
+                    />
+                    <span class="advanced-toggle__title">
+                      Hide AEC status badge in header
+                    </span>
+                    <span class="advanced-toggle__sub">
+                      The AEC badge surfaces whether Chromium's echo
+                      canceller is active. Hide it for a cleaner
+                      header — the internal state machine still
+                      tracks AEC.
+                    </span>
+                  </label>
+                </div>
+              </div>
+
+              <!-- Section 5 — Apply hint. Gated by JS: visible only
+                   while a call is in flight (state.status ===
+                   'listening' | 'starting'). The hint reminds the
+                   user that edits made mid-call don't hot-swap into
+                   the existing pipeline. -->
+              <div
+                id="audioApplyHint"
+                class="audio-apply-hint"
+                hidden
+              >
+                <span class="audio-apply-hint__dot" aria-hidden="true">●</span>
+                Changes to audio capture and speech-to-text apply on
+                the next Start. Visual changes (badge) update
+                immediately.
+              </div>
+            </section>
+            <!-- Coach tab (renamed from "Advanced" in schema v3). The
+                 two toggles below live under settings.coach.* now;
+                 the v2→v3 migration in src/settings.js moves the old
+                 settings.advanced.* values onto this block transparently.
+                 Phase 4 adds timing knobs (tickMs, pauseThresholdMs,
+                 kickstartDelayMs, …) into this same tab. -->
+            <section
+              id="settingsTabCoach"
+              class="settings-tab"
+              data-tab-content="coach"
+              role="tabpanel"
+              aria-label="Coach"
+              hidden
+            >
+              <!-- Coach behaviour toggles. Both default OFF. The
+                   renderer wires these to settings.coach.* via the
+                   auto-save channel; main reads the live values each
+                   tick (no IPC roundtrip needed). -->
+              <div class="settings-section">
+                <h4 class="settings-section__title">Coach behaviour</h4>
+                <p class="settings-section__subtitle">
+                  Experimental features. Off by default.
+                </p>
+
+                <div class="advanced-toggle">
+                  <label class="advanced-toggle__label">
+                    <input
+                      type="checkbox"
+                      id="coachTrackQuestionState"
+                      class="advanced-toggle__input"
+                    />
+                    <span class="advanced-toggle__title">
+                      Track which questions were asked
+                    </span>
+                    <span class="advanced-toggle__sub">
+                      Uses the AI to validate against the transcript and
+                      highlights asked questions in green.
+                    </span>
+                  </label>
+                </div>
+
+                <div class="advanced-toggle">
+                  <label class="advanced-toggle__label">
+                    <input
+                      type="checkbox"
+                      id="coachAutoReformulate"
+                      class="advanced-toggle__input"
+                    />
+                    <span class="advanced-toggle__title">
+                      Auto-reformulate unasked questions every 10s
+                    </span>
+                    <span class="advanced-toggle__sub">
+                      Pinned suggestions get rephrased automatically if
+                      you don't ask them. Requires the toggle above.
+                    </span>
+                  </label>
+                </div>
+              </div>
+            </section>
+            <!-- General tab. Phase 1 ships the Data subsection
+                 (export / import / reset). Phase 5 will add workflow
+                 controls above it (auto-test API key, transcript /
+                 summary autosave folders, live cost meter, crash
+                 autosave, rubric selection, pillar enable/disable).
+                 -->
+            <section
+              id="settingsTabGeneral"
+              class="settings-tab"
+              data-tab-content="general"
+              role="tabpanel"
+              aria-label="General"
+              hidden
+            >
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Data</h4>
+                <p class="settings-section__subtitle">
+                  Move your settings between devices, share team defaults,
+                  or start fresh.
+                </p>
+
+                <!-- Export. The renderer reads the "Include API keys"
+                     checkbox at click time so flipping it doesn't fire
+                     a save; only the Export button does work. -->
+                <div class="data-action">
+                  <div class="data-action__info">
+                    <strong class="data-action__title">Export to JSON</strong>
+                    <span class="data-action__desc">
+                      Save a copy of every setting (API keys redacted by default).
+                    </span>
+                  </div>
+                  <div class="data-action__controls">
+                    <label class="data-action__option" title="Off by default — exported files are safer to share">
+                      <input
+                        type="checkbox"
+                        id="settingsExportIncludeKeys"
+                      />
+                      <span>Include API keys</span>
+                    </label>
+                    <button
+                      type="button"
+                      id="settingsExportBtn"
+                      class="data-action__btn"
+                    >Export…</button>
+                  </div>
+                </div>
+
+                <!-- Import. Click → Open dialog → validate → preview
+                     modal (#settingsImportPreview below) → user
+                     confirms or cancels. -->
+                <div class="data-action">
+                  <div class="data-action__info">
+                    <strong class="data-action__title">Import from JSON</strong>
+                    <span class="data-action__desc">
+                      Replace current settings with a previously-exported file.
+                      You'll see a preview before anything changes.
+                    </span>
+                  </div>
+                  <div class="data-action__controls">
+                    <button
+                      type="button"
+                      id="settingsImportBtn"
+                      class="data-action__btn"
+                    >Import…</button>
+                  </div>
+                </div>
+
+                <!-- Reset. The danger variant + dedicated confirmation
+                     modal (#settingsResetConfirm below) reflect that
+                     this is irreversible. -->
+                <div class="data-action data-action--danger">
+                  <div class="data-action__info">
+                    <strong class="data-action__title">Reset all settings</strong>
+                    <span class="data-action__desc">
+                      Return every tab to its built-in defaults. API keys
+                      can be preserved.
+                    </span>
+                  </div>
+                  <div class="data-action__controls">
+                    <button
+                      type="button"
+                      id="settingsResetBtn"
+                      class="data-action__btn data-action__btn--danger"
+                    >Reset…</button>
+                  </div>
+                </div>
+              </div>
+            </section>
+            <!-- Help tab. Phase 1 ships an empty stub — Phase 6 will
+                 fill it with the first-run wizard re-trigger, shortcut
+                 cheat-sheet toggle, and onboarding tour re-trigger. -->
+            <section
+              id="settingsTabHelp"
+              class="settings-tab"
+              data-tab-content="help"
+              role="tabpanel"
+              aria-label="Help"
+              hidden
+            >
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Help &amp; onboarding</h4>
+                <p class="settings-section__subtitle settings-tab__placeholder">
+                  First-run wizard, shortcut cheat-sheet, and onboarding
+                  tour controls land in Phase 6 of the settings expansion.
+                </p>
+              </div>
+            </section>
+          </div>
+        </div>
+      </dialog>
+
+      <!-- Settings → General → Data: confirmation dialog for Reset.
+           Lives as a sibling of #settingsModal so its showModal() puts
+           it on the top layer ABOVE the open settings dialog. The
+           checkbox defaults to checked because preserving API keys is
+           the high-value default (everything else is one-click-fixable;
+           keys are paste-from-vault work). -->
+      <dialog id="settingsResetConfirm" class="modal" aria-labelledby="settingsResetTitle">
+        <div class="modal__panel">
+          <header class="modal__header">
+            <h2 id="settingsResetTitle" class="modal__title">Reset all settings?</h2>
+          </header>
+          <div class="modal__body">
+            <p>
+              This returns every tab (Providers, Audio, Appearance, Coach,
+              General, Help) to its built-in defaults. There is no undo.
+            </p>
+            <label class="modal__option">
+              <input
+                type="checkbox"
+                id="settingsResetPreserveKeys"
+                checked
+              />
+              <span>Keep my API keys (recommended)</span>
+            </label>
+          </div>
+          <footer class="modal__actions">
+            <button
+              type="button"
+              id="settingsResetCancel"
+              class="modal__btn modal__btn--ghost"
+            >Cancel</button>
+            <button
+              type="button"
+              id="settingsResetConfirmBtn"
+              class="modal__btn modal__btn--danger"
+            >Reset settings</button>
+          </footer>
+        </div>
+      </dialog>
+
+      <!-- Settings → General → Data: preview-and-confirm dialog for
+           Import. The renderer populates #settingsImportSource with
+           the source file path, #settingsImportDiff with a per-block
+           diff, and shows #settingsImportError if validation fails
+           (in which case Apply is hidden). -->
+      <dialog id="settingsImportPreview" class="modal" aria-labelledby="settingsImportTitle">
+        <div class="modal__panel settings-import__panel">
+          <header class="modal__header">
+            <h2 id="settingsImportTitle" class="modal__title">Import settings</h2>
+          </header>
+          <div class="modal__body">
+            <p
+              id="settingsImportSource"
+              class="settings-import__source"
+              hidden
+            ></p>
+            <p
+              id="settingsImportError"
+              class="settings-import__error"
+              role="alert"
+              hidden
+            ></p>
+            <div
+              id="settingsImportDiff"
+              class="settings-import__diff"
+              aria-live="polite"
+            ></div>
+          </div>
+          <footer class="modal__actions">
+            <button
+              type="button"
+              id="settingsImportCancel"
+              class="modal__btn modal__btn--ghost"
+            >Cancel</button>
+            <button
+              type="button"
+              id="settingsImportApply"
+              class="modal__btn modal__btn--primary"
+            >Apply import</button>
+          </footer>
+        </div>
+      </dialog>
     </main>
+    <!-- Captured-field recap tooltip. Positioned via JS on mouseenter;
+         pointer-events:none so it never blocks panel interaction. -->
+    <div id="capturedTooltip" class="captured-tooltip" role="tooltip" aria-hidden="true"></div>
     <script type="module" src="/src/renderer.js"></script>
   </body>
 </html>
