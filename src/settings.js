@@ -207,6 +207,51 @@ export const DEFAULT_SETTINGS = Object.freeze({
     /** @type {string} */
     model: '',
   },
+  /**
+   * Stage-1 facts scanner (rearchitected pipeline, post-test-call
+   * fixes batch 2 / Issue 3).
+   *
+   * Owns the periodic AI sweep that extracts monetary / time /
+   * headcount / percentage / opportunity facts from the rolling
+   * transcript. Each tick the scanner reads the lines committed since
+   * its previous run, asks the configured provider for zero-or-more
+   * `record_meeting_fact`-shaped JSON objects, and appends them to
+   * `coachContext.factsSheet.entries`. Stage-2 (`src/quick-fix.js`)
+   * then debounces and rolls the entries up into the headline total.
+   *
+   * Why this lives outside the Coach now:
+   *   The Coach used to own `record_meeting_fact` as one of its
+   *   per-tick tools. That coupled (a) the fast 1.5 s lifecycle-
+   *   tracking loop with (b) the slower, more expensive "extract a
+   *   complete list of facts from the chunk" task. Splitting the two
+   *   lets the Coach stay narrowly focused on rubric scoring + ask
+   *   suggestions, and lets the scanner take the longer cadence it
+   *   actually needs.
+   *
+   * Cadence:
+   *   `intervalMs` is the period between scans. 12 s is the default —
+   *   short enough that a fact stated during the call is reflected in
+   *   the headline within the same conversational beat, long enough
+   *   that the per-tick model cost stays bounded. The spec called for
+   *   ~10 s but flagged that as "probably too short"; 12-15 s is the
+   *   pragmatic window.
+   *
+   *   `enabled: false` falls back to the old behaviour (no scanner
+   *   tick, no fact emission). Provided for testability + a manual
+   *   kill-switch if a future model regression makes the scanner
+   *   chatty.
+   *
+   * Provider routing intentionally reuses the existing `quickFix`
+   * cascade via `getQuickFix()` — both AI passes belong to the same
+   * "background financial analyst" workflow so the user's provider
+   * choice should apply uniformly.
+   */
+  factsScanner: {
+    /** @type {number} */
+    intervalMs: 12_000,
+    /** @type {boolean} */
+    enabled: true,
+  },
   // Visual customisation. Right now this is just speaker-label tag
   // colours for the live transcript pane + summary modal; future
   // theming knobs (font scale, accent colour, …) should be added here
@@ -896,6 +941,27 @@ export function getQuickFix() {
 export function getAudio() {
   const settings = loadSettings();
   return settings.audio;
+}
+
+/**
+ * Resolve the Stage-1 facts-scanner configuration. Returns the merged
+ * `factsScanner` block (defaults filled) so callers can read
+ * `.intervalMs` and `.enabled` without defensive optional chaining.
+ *
+ * Read live by main.js at session start to arm the scanner's
+ * setInterval, and during teardown to clear it. Settings changes
+ * mid-call don't hot-swap the cadence — the next call picks up the
+ * new value, matching the existing "audio settings apply on next
+ * Start" pattern.
+ *
+ * The scanner shares provider routing with the Stage-2 worker (see
+ * `getQuickFix()` above) — both AI passes belong to the same
+ * background financial-analyst workflow, so the user's `quickFix`
+ * provider choice applies to both.
+ */
+export function getFactsScanner() {
+  const settings = loadSettings();
+  return settings.factsScanner;
 }
 
 /**

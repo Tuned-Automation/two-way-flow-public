@@ -1,56 +1,77 @@
 /**
- * Stage 2 of the two-stage AI facts pipeline (Strategy A / Work-stream
- * C of the post-test-call fixes).
+ * Stage 2 of the three-step AI facts pipeline (post-test-call fixes
+ * batch 2 / Issue 3 — quick-fix wobble rearchitecture).
  *
- * The Coach (src/coach.js) captures structured monetary facts via the
- * `record_meeting_fact` tool. Each capture appends an entry to
- * `coachContext.factsSheet.entries` in main, which then calls
- * `scheduleQuickFix()` exported below. This module owns:
+ * Pipeline overview
+ *
+ *     Stage 0 — transcript                (src/main.js)
+ *           ↓
+ *     Stage 1 — facts scanner             (src/facts-scanner.js)
+ *           ↓ append per fact
+ *     coachContext.factsSheet.entries
+ *           ↓ scheduleQuickFix()
+ *     Stage 2 — quick-fix roller          (this module)
+ *           ↓ dedupe + sum (NOT free-think)
+ *     coachContext.factsSheet.quickFix
+ *           ↓ scoring:quick-fix IPC
+ *     #quickFix card in the renderer
+ *
+ * This module owns:
  *
  *   1. A single debounce timer (~2.5 s after the last fact write) so
- *      a flurry of facts from a quick exchange triggers ONE Stage-2
- *      roundtrip when things settle, rather than a roundtrip per
- *      capture.
+ *      a flurry of facts from the Stage-1 scanner triggers ONE
+ *      Stage-2 roundtrip when things settle.
  *
- *   2. The Stage-2 prompt + JSON schema + validator that asks a more
- *      capable model ("financial analyst") to roll the active facts
- *      up into a single annualised USD opportunity with a breakdown,
- *      assumptions, and a confidence rating.
+ *   2. A DEDUPE-AND-SUM-ONLY prompt. The Stage-2 model is no longer
+ *      allowed to free-think the rollup on every pass; the prompt's
+ *      explicit job is "look at this list of facts + the previous
+ *      headline, identify overlaps, sum the unique ones, and produce
+ *      a new headline that NEVER DECREASES unless a `correction: true`
+ *      entry is present". This eliminates the wobble that the prior
+ *      "convert and roll up" prompt produced (model re-classifying
+ *      duplicates, dropping facts on later passes, non-deterministic
+ *      sums).
  *
- *   3. A last-known-good fallback: a malformed Stage-2 response leaves
- *      the previous rollup intact and surfaces a `stale: true` flag
- *      so the renderer can show a "Rollup paused, retrying…" pill on
- *      the card. After three consecutive invalid responses we set
- *      `error: true` so the rep knows the rollup is unavailable —
- *      reset to false on the next valid response.
+ *   3. Code-side monotonic enforcement (`enforceMonotonicConstraint`
+ *      below). Even if the model produces a smaller headline without
+ *      a justified reason, we REJECT the response: keep the previous
+ *      rollup, mark it `stale: true`, and surface the "Rollup
+ *      paused, retrying…" pill. The 3-strikes failure counter
+ *      escalates to `error: true` if the model keeps trying to
+ *      decrease unjustifiably.
  *
- *   4. A `cancelPendingRollup()` exported so `teardownSession()` can
- *      cancel a debounced timer if the user stops the call before it
- *      fires (otherwise a late roll-up would arrive after the
- *      coachContext reset).
+ *      Acceptance criteria for a decrease:
+ *        (a) the active entries include at least one entry whose
+ *            `correction` flag is true, OR
+ *        (b) the response includes a non-empty `correctionReason`
+ *            string explaining the drop.
  *
- * Architecture diagram (mirrors the plan):
+ *      Either condition is sufficient. The flag-based path is the
+ *      common case (Stage-1 caught an explicit correction), the
+ *      reason-string path is a model escape hatch for legitimate
+ *      "dedupe revealed a double-count" rectifications.
  *
- *     coachContext.factsSheet.entries
- *           ↓ (every write)
- *     scheduleQuickFix() — debounce 2.5 s
- *           ↓
- *     runQuickFix() — Stage-2 AI roundtrip
- *           ↓
- *     coachContext.factsSheet.quickFix = result
- *     send('scoring:quick-fix', { quickFix, entries })
+ *   4. A last-known-good fallback: a malformed Stage-2 response
+ *      leaves the previous rollup intact, surfaces `stale: true`, and
+ *      bumps the failure counter. After 3 consecutive failures we
+ *      surface `error: true`. Reset to false on the next valid
+ *      response.
  *
- * The worker reads `factsSheet.entries` indirectly via the getter
- * passed in at construction time so it never holds a shared mutable
- * reference. A reset on the source (resetCoachContext clears
- * factsSheet) is therefore safe — the worker's next read sees the
- * cleared state and produces an empty rollup or skips entirely.
+ *   5. `cancelPendingRollup()` so `teardownSession()` can cancel a
+ *      debounced timer if the user stops the call before it fires.
+ *
+ * The worker reads `factsSheet.entries` via the getter passed in at
+ * construction time so it never holds a shared mutable reference. A
+ * reset on the source (`resetCoachContext` clears `factsSheet`) is
+ * therefore safe — the worker's next read sees the cleared state
+ * and produces an empty rollup or skips entirely.
  *
  * Provider routing: the Stage-2 provider is constructed at run time
  * via `getQuickFix()` from settings.js, which cascades the
  * `quickFix.provider` / `quickFix.model` overrides over the coach's
- * routed provider. So the user can keep the live coach on Flash and
- * point the rollup at Pro without touching the live path.
+ * routed provider. The Stage-1 scanner shares the same routing so
+ * both AI passes belong to the same "background financial analyst"
+ * workflow.
  *
  * Extension points
  *   - To make the debounce cadence configurable, plumb the value
@@ -60,10 +81,10 @@
  *   - To support multi-currency, extend the prompt + schema to
  *     accept a target currency parameter; the validator already
  *     keeps a `currency` field on the result (always "USD" for v1).
- *   - To swap the schema for a richer breakdown (e.g. annualised
- *     ARR vs. one-time savings), update the JSON schema below AND
- *     the validator in lockstep so a future model that returns the
- *     new shape doesn't get dropped.
+ *   - To relax the monotonic constraint (e.g. allow a decrease when
+ *     the call enters a "scope reduction" mode), gate
+ *     `enforceMonotonicConstraint` on a new context flag passed in
+ *     via the deps.
  */
 
 import { getProvider } from './providers/index.js';
@@ -89,41 +110,88 @@ const ERROR_THRESHOLD = 3;
  * model returns parseable JSON without prose preamble. Anthropic /
  * OpenAI paths fall through to the same prompt — both honour the
  * "return JSON only" instruction reliably for structured-output
- * tasks of this size. */
+ * tasks of this size.
+ *
+ * Crucially, this prompt is DEDUPE-AND-SUM only — it does NOT free-
+ * think the rollup on every pass. The wobble that surfaced in the
+ * post-test-call review came from the previous "convert and roll up"
+ * prompt giving the model latitude to re-classify duplicates, drop
+ * facts on later passes, and produce different numbers per call. The
+ * job here is mechanical:
+ *
+ *   1. Walk the FACTS list, ignore the superseded ones, identify
+ *      duplicates / overlaps within the remaining list.
+ *   2. Sum the unique annualised amounts to produce
+ *      `headlineUsdAnnual`.
+ *   3. NEVER produce a headline LESS than `previousHeadlineUsdAnnual`
+ *      unless either (a) the FACTS list contains an entry with
+ *      `correction: true`, or (b) a top-level `correctionReason`
+ *      string is set explaining the drop. Code-side enforcement
+ *      catches any model that ignores this rule. */
 const STAGE2_SYSTEM_PROMPT = [
   'You are a financial analyst supporting a live sales conversation.',
-  'You receive a JSON array of discrete, AI-extracted financial facts',
-  'from a call in progress and produce a single summary of the total',
-  'annual economic opportunity for the prospect.',
+  'You receive (a) a JSON array of discrete, AI-extracted financial facts',
+  'from a call in progress, and (b) the previously-accepted headline',
+  'total. Your job is narrowly scoped:',
   '',
-  'Rules:',
-  '1. Convert every fact to annual USD. Use these standard conversions',
-  '   when the unit is not USD:',
-  '   - hours/week × 52 × stated_hourly_rate_if_known (otherwise note',
-  '     "rate not stated")',
-  '   - hours/month × 12 × stated_hourly_rate_if_known',
-  '   - people × stated_loaded_cost_per_person (otherwise note',
-  '     "loaded cost not stated")',
-  '   - percent → only meaningful when applied to a base; treat as a',
-  '     multiplier on a stated revenue/spend, otherwise carry forward',
-  '     as a note.',
-  '   - period "one_time" → leave as-is, do NOT annualise; note "one-time".',
-  '2. Detect and flag double-counts: if two facts describe the same',
-  '   dollar stream from different angles (e.g. "we spend $50K on',
-  '   consultants" and "consulting line item is $4K/mo"), include only',
-  '   ONE in the sum and mention the duplicate in `assumptions`.',
-  '3. If a fact is superseded (`supersedes_id` populated) ignore the',
-  '   older entry entirely.',
-  '4. Each breakdown row must cite the source fact\'s `id` so the UI',
-  '   can drill through to the anchor quote.',
-  '5. Confidence rubric:',
-  '   - high  → all facts have explicit amounts, units, periods, and',
-  '             at most one inferred conversion.',
-  '   - medium → 1-2 inferred conversions OR 1 likely-but-not-confirmed',
-  '              double-count.',
-  '   - low   → more than 2 inferences, OR more than one unresolved',
-  '             double-count, OR contradictory facts.',
+  '  1. DEDUPE the facts. Identify overlaps where two entries describe',
+  '     the same underlying dollar stream from different angles',
+  '     ("we spend $50K on consultants" + "consulting line item is',
+  '     $4K/mo") and keep only ONE in the sum. Mention dropped',
+  '     duplicates in `assumptions`.',
+  '  2. IGNORE facts whose id appears in the `supersedes` field of a',
+  '     newer fact — those entries have been replaced.',
+  '  3. ANNUALISE each remaining fact to USD and SUM them to produce',
+  '     `headlineUsdAnnual`. Conversions when the unit is not USD:',
+  '       - hours/week × 52 × stated_hourly_rate_if_known (else note',
+  '         "rate not stated" and carry the row at $0).',
+  '       - hours/month × 12 × stated_hourly_rate_if_known.',
+  '       - people × stated_loaded_cost_per_person (else note',
+  '         "loaded cost not stated").',
+  '       - percent → only meaningful applied to a base; treat as a',
+  '         multiplier on a stated revenue/spend, otherwise carry as',
+  '         a note at $0.',
+  '       - period "one_time" → leave as-is, do NOT annualise; note',
+  '         "one-time" in the row.',
+  '  4. Each breakdown row must cite the source fact\'s `id` so the UI',
+  '     can drill through to the anchor quote. Use the literal string',
+  '     "derived" only when a row is the sum of two facts (the dedupe',
+  '     winner).',
+  '  5. Confidence rubric:',
+  '       - high   → all facts have explicit amounts/units/periods,',
+  '                  ≤1 inferred conversion, no unresolved duplicates.',
+  '       - medium → 1-2 inferred conversions OR 1 likely double-count.',
+  '       - low    → >2 inferences, OR >1 unresolved double-count, OR',
+  '                  contradictory facts.',
+  '',
+  '*** MONOTONIC CONSTRAINT (LOAD-BEARING) ***',
+  '',
+  '  The headline total MUST NOT DECREASE compared to the previous',
+  '  accepted headline (provided in the user message as',
+  '  `previousHeadlineUsdAnnual`) UNLESS one of these is true:',
+  '',
+  '    (a) AT LEAST ONE entry in the FACTS list has `correction: true`',
+  '        (the Stage-1 scanner caught an explicit revision like',
+  '        "actually it\'s closer to $80K not $50K"), OR',
+  '',
+  '    (b) you set a top-level `correctionReason` string in the',
+  '        response explaining WHY a decrease is justified (e.g. a',
+  '        dedupe pass uncovered a previously-missed double-count',
+  '        worth $X).',
+  '',
+  '  If neither condition holds, KEEP the previous headline value.',
+  '  Code-side enforcement will REJECT a smaller headline with neither',
+  '  (a) nor (b) — producing one will mark the rollup card stale until',
+  '  the next tick. The rule is "add-only by default"; corrections',
+  '  are the ONLY exception.',
+  '',
+  '  If a `correction: true` entry IS present, you SHOULD adjust the',
+  '  headline accordingly (the prospect explicitly revised a figure).',
+  '',
   '6. Return JSON only, matching the schema. No prose outside the JSON.',
+  '   Omit `correctionReason` (or set it to null) when there is no',
+  '   correction in play — populating it with empty/filler text would',
+  '   bypass the monotonic constraint.',
 ].join('\n');
 
 /**
@@ -172,6 +240,11 @@ const STAGE2_RESPONSE_SCHEMA = {
       type: 'STRING',
       description: 'For v1 always "USD".',
     },
+    correctionReason: {
+      type: 'STRING',
+      description:
+        'Optional. Required by the monotonic-constraint enforcer ONLY when the new headline is LESS than the previous AND no entry in the active list has correction:true. Leave empty / omit otherwise — populating it without a real reason will not bypass the enforcer.',
+    },
   },
   required: ['headlineUsdAnnual', 'breakdown', 'assumptions', 'confidence'],
 };
@@ -217,8 +290,17 @@ export function validateQuickFix(raw) {
  * coerces optional values to safe defaults (notes → '', currency →
  * 'USD'). Kept separate from `validateQuickFix` so the validator's
  * job stays "is this safe to use?" without taking on "make it nice".
+ *
+ * `correctionReason` is carried through unchanged from the model
+ * (null when absent / empty). The renderer doesn't render it today
+ * — it exists for the monotonic enforcer's audit log and any future
+ * "why did the total drop?" tooltip on the card.
  */
 function normaliseRollup(raw, updatedAt) {
+  const correctionReason =
+    typeof raw.correctionReason === 'string' && raw.correctionReason.trim().length > 0
+      ? raw.correctionReason.trim()
+      : null;
   return {
     headlineUsdAnnual: raw.headlineUsdAnnual,
     breakdown: raw.breakdown.map((row) => ({
@@ -232,6 +314,7 @@ function normaliseRollup(raw, updatedAt) {
       .slice(0, 5),
     confidence: raw.confidence,
     currency: typeof raw.currency === 'string' && raw.currency.length > 0 ? raw.currency : 'USD',
+    correctionReason,
     updatedAt,
     stale: false,
     error: false,
@@ -239,15 +322,69 @@ function normaliseRollup(raw, updatedAt) {
 }
 
 /**
+ * Code-side monotonic enforcement (post-test-call fixes batch 2 /
+ * Issue 3 — add-only headline). Returns `{ ok: true }` when the new
+ * rollup is acceptable or `{ ok: false, reason }` when it should be
+ * rejected.
+ *
+ * Acceptance criteria:
+ *   - newHeadline >= previousHeadline                       → ok
+ *   - newHeadline <  previousHeadline AND at least one      → ok
+ *     active entry has correction === true
+ *   - newHeadline <  previousHeadline AND `correctionReason` → ok
+ *     is a non-empty string
+ *   - newHeadline <  previousHeadline with neither           → REJECT
+ *
+ * The first-pass case (`previousHeadline` null/undefined) is also
+ * accepted — there's nothing to compare against on the very first
+ * rollup of a session.
+ *
+ * @param {{ headlineUsdAnnual: number, correctionReason: string | null }} newRollup
+ * @param {number | null} previousHeadline
+ * @param {Array<{ correction?: boolean }>} activeEntries
+ * @returns {{ ok: true } | { ok: false, reason: string }}
+ */
+function enforceMonotonicConstraint(newRollup, previousHeadline, activeEntries) {
+  if (previousHeadline === null || previousHeadline === undefined) {
+    return { ok: true };
+  }
+  if (!Number.isFinite(previousHeadline)) {
+    return { ok: true };
+  }
+  if (newRollup.headlineUsdAnnual >= previousHeadline) {
+    return { ok: true };
+  }
+  const hasCorrectionEntry = Array.isArray(activeEntries)
+    && activeEntries.some((entry) => entry && entry.correction === true);
+  if (hasCorrectionEntry) return { ok: true };
+  if (typeof newRollup.correctionReason === 'string' && newRollup.correctionReason.trim().length > 0) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason: `headline decreased from ${previousHeadline} to ${newRollup.headlineUsdAnnual} without correction flag or reason`,
+  };
+}
+
+/**
  * Build the user-message payload for the Stage-2 model. Active
  * entries only (i.e. nothing that has been superseded by a newer
- * entry). The fact id, kind, amount, unit, period, basis, quote, and
- * recordedAt are all included so the model can reason about
- * conversions and double-counts.
+ * entry). The fact id, kind, amount, unit, period, basis, quote,
+ * recordedAt, and the `correction` flag are all included so the
+ * model can reason about conversions, double-counts, and explicit
+ * revisions.
+ *
+ * `previousHeadlineUsdAnnual` is included even when null/0 so the
+ * model sees a stable schema and the monotonic-constraint
+ * instructions in the system prompt remain anchored on a concrete
+ * field. The enforcer at the call site is the authoritative check
+ * regardless — the prompt copy is the model's first line of
+ * defence; the enforcer is the second.
  *
  * @param {Array<object>} activeEntries
+ * @param {number | null} previousHeadlineUsdAnnual
  */
-function buildStage2UserMessage(activeEntries) {
+function buildStage2UserMessage(activeEntries, previousHeadlineUsdAnnual) {
   const json = activeEntries.map((entry) => ({
     id: entry.id,
     kind: entry.kind,
@@ -257,12 +394,20 @@ function buildStage2UserMessage(activeEntries) {
     basis: entry.basis,
     quote: entry.quote,
     recordedAt: entry.recordedAt,
+    correction: entry.correction === true,
+    supersedes: entry.supersedes || null,
   }));
   return [
-    'FACTS (active):',
+    `previousHeadlineUsdAnnual: ${
+      Number.isFinite(previousHeadlineUsdAnnual) ? previousHeadlineUsdAnnual : 0
+    }`,
+    '',
+    'FACTS (active, after supersedes filter):',
     JSON.stringify(json, null, 2),
     '',
-    'Return the rollup JSON.',
+    'Return the rollup JSON. Remember: NEVER decrease the headline',
+    'unless an entry has `correction: true` OR you provide a',
+    '`correctionReason` string in the response.',
   ].join('\n');
 }
 
@@ -307,6 +452,12 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
    *  fallback semantics — the broadcast carries this value with
    *  `stale: true` when a validation fails. */
   let lastGoodRollup = null;
+  /** Last ACCEPTED headline total (the value the monotonic enforcer
+   *  compares against on the next rollup). Distinct from
+   *  `lastGoodRollup.headlineUsdAnnual` only in name: tracking it
+   *  explicitly makes the intent of the enforcer obvious at read
+   *  time, and gives us one place to clear it on reset. */
+  let lastAcceptedHeadline = null;
 
   /**
    * Build the active-entries view: filter superseded entries, sort by
@@ -343,8 +494,11 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
     if (entries.length === 0) {
       // Nothing to roll up — clear the rollup if we had one (e.g.
       // user superseded their only fact). Marks lastGood null too so
-      // a subsequent failure doesn't restore stale data.
+      // a subsequent failure doesn't restore stale data. Reset the
+      // monotonic baseline so the next non-empty rollup starts from
+      // zero rather than carrying a stale ceiling.
       lastGoodRollup = null;
+      lastAcceptedHeadline = null;
       consecutiveFailures = 0;
       onRollup(null, entries);
       return;
@@ -369,7 +523,7 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
       return;
     }
 
-    const userMessage = buildStage2UserMessage(entries);
+    const userMessage = buildStage2UserMessage(entries, lastAcceptedHeadline);
     inFlight = true;
     try {
       const result = await provider.generateContent({
@@ -402,7 +556,20 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
         return;
       }
       const normalised = normaliseRollup(parsed, Date.now());
+      // Monotonic constraint: reject any decrease that lacks a
+      // justification (correction flag or correctionReason). On
+      // rejection the previous lastGoodRollup is re-broadcast with
+      // stale=true and the failure counter ticks toward the
+      // error-threshold so a model that keeps trying to decrease
+      // unjustifiably eventually surfaces "Rollup unavailable" to
+      // the rep.
+      const monotonic = enforceMonotonicConstraint(normalised, lastAcceptedHeadline, entries);
+      if (!monotonic.ok) {
+        recordFailure(`monotonic_violation: ${monotonic.reason}`, entries, raw);
+        return;
+      }
       lastGoodRollup = normalised;
+      lastAcceptedHeadline = normalised.headlineUsdAnnual;
       consecutiveFailures = 0;
       onRollup(normalised, entries);
     } catch (err) {
@@ -445,6 +612,7 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
           assumptions: [],
           confidence: 'low',
           currency: 'USD',
+          correctionReason: null,
           updatedAt: Date.now(),
           stale: true,
           error: consecutiveFailures >= ERROR_THRESHOLD,

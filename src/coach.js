@@ -216,7 +216,7 @@ const UPDATE_ITEM_STATE = {
 const RECORD_FIELD = {
   name: 'record_field',
   description:
-    "Record a captured key/value pair extracted from the transcript. Field ids are namespaced as '<group>.<localId>'. Calling again with the same field_id replaces the value. Use this for non-aggregable text descriptors only; dollar amounts and other quantitative opportunity figures go through record_meeting_fact instead.",
+    "Record a captured key/value pair extracted from the transcript. Field ids are namespaced as '<group>.<localId>'. Calling again with the same field_id replaces the value. Use this for non-aggregable text descriptors only; dollar amounts and other quantitative opportunity figures are handled by a separate background scanner — do NOT try to record them here.",
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -228,76 +228,26 @@ const RECORD_FIELD = {
   },
 };
 
-/**
- * record_meeting_fact — the SOLE monetary-capture tool in v3.
+/*
+ * NOTE — record_meeting_fact removed in post-test-call fixes batch 2.
  *
- * Test-call finding 2/4a: the legacy `record_field` path was dropping
- * dollar amounts into free-text slots (`revenue.annual`,
- * `pain.cost_annual`) which the renderer then regex-summed into a
- * single "Total potential revenue" without any semantic gate. The two
- * resulting failure modes — double-counting and the "total keeps
- * changing" symptom — both come from there being no structured place
- * for a quantitative fact to live.
+ * The Coach used to own a `record_meeting_fact` tool here that ran
+ * every 1.5 s alongside item-state tracking and field capture. That
+ * coupling produced the headline-wobble symptom: on every Coach tick
+ * the model would re-classify duplicates and re-fire similar facts,
+ * which the Stage-2 worker then re-summed differently each time.
  *
- * This tool replaces that flow. Each call appends a structured fact
- * to `coachContext.factsSheet.entries` in main, then triggers a
- * debounced background AI (see src/quick-fix.js) that rolls all the
- * active facts up into a single annualised USD opportunity. The
- * rendered card replaces the old regex rollup at the top of the
- * captured pane.
+ * The new pipeline moves quantitative-fact extraction OUT of the
+ * Coach into a dedicated Stage-1 scanner (src/facts-scanner.js) that
+ * runs on its own cadence (~12 s) and appends directly to
+ * `coachContext.factsSheet.entries`. The Coach is no longer in the
+ * monetary-extraction business — its focus is back to rubric scoring
+ * + ask suggestions + mark_question_asked.
  *
- * Field grammar deliberately constrains kind / unit / period to
- * enumerated values so the Stage-2 worker can reason about them
- * predictably. The `anchor_quote` is REQUIRED — the renderer uses it
- * to drill from a breakdown row back to the moment in the transcript
- * where the number was stated.
- *
- * Cost / cadence: each call adds one entry to the sheet; the rollup
- * worker debounces ~2.5 s after the last write, so a flurry of facts
- * from a quick exchange triggers ONE Stage-2 call once things settle.
+ * The system prompt in src/rubric.js has been updated accordingly
+ * (the section describing record_meeting_fact has been replaced with
+ * a "leave money to the scanner" note).
  */
-const RECORD_MEETING_FACT = {
-  name: 'record_meeting_fact',
-  description:
-    'Record a single quantitative fact the prospect or seller stated that affects the total economic opportunity of the deal. Examples: current spend on a tool, hours lost per week, headcount on a process, expected revenue lift. Only record facts you can directly anchor to a quote.',
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      kind: {
-        type: Type.STRING,
-        enum: ['current_spend', 'pain_cost', 'savings_opportunity', 'revenue_uplift', 'time_cost', 'headcount_cost', 'other'],
-        description: "Category of fact. Pick the closest match; prefer 'other' over guessing.",
-      },
-      amount: {
-        type: Type.NUMBER,
-        description: 'Raw number as stated by the prospect (do not convert units yourself).',
-      },
-      unit: {
-        type: Type.STRING,
-        enum: ['usd', 'hours', 'people', 'percent'],
-        description: 'Unit matching the value in `amount`. The Stage-2 worker handles cross-unit normalisation.',
-      },
-      period: {
-        type: Type.STRING,
-        enum: ['one_time', 'weekly', 'monthly', 'quarterly', 'annual'],
-        description: 'Time period the amount applies to. "one_time" for non-recurring costs; the worker annualises the rest.',
-      },
-      basis: {
-        type: Type.STRING,
-        description: 'One short sentence explaining what the number represents.',
-      },
-      anchor_quote: {
-        type: Type.STRING,
-        description: 'Direct quote (≤120 chars) where this number was stated. Required — used by the UI to drill back to the source line.',
-      },
-      supersedes_id: {
-        type: Type.STRING,
-        description: 'Optional. Id of an earlier fact this one corrects — pass when the prospect explicitly revised a previously-stated figure.',
-      },
-    },
-    required: ['kind', 'amount', 'unit', 'period', 'basis', 'anchor_quote'],
-  },
-};
 
 const SUGGEST_NEXT_QUESTION = {
   name: 'suggest_next_question',
@@ -415,11 +365,15 @@ export class Coach {
     this.onItemStateChange = onItemStateChange;
     this.onFieldCaptured = onFieldCaptured;
     this.onSuggestion = onSuggestion;
-    // record_meeting_fact (Strategy A) — fires when the coach captures
-    // a quantitative opportunity figure. Defaults to a no-op so older
-    // call sites that don't wire the quick-fix pipeline keep working;
-    // when wired, main appends to coachContext.factsSheet.entries and
-    // triggers the Stage-2 debouncer in src/quick-fix.js.
+    // onMeetingFact is DEPRECATED as of post-test-call fixes batch 2.
+    // The Coach no longer owns the `record_meeting_fact` tool — that
+    // job moved to the Stage-1 scanner (src/facts-scanner.js), which
+    // appends directly to coachContext.factsSheet.entries.
+    //
+    // The parameter is kept in the constructor signature (with a
+    // no-op default) so older call sites that still pass it don't
+    // throw. The dispatch path above ignores any stray
+    // record_meeting_fact calls a stale model might still emit.
     this.onMeetingFact = onMeetingFact || (() => {});
     // Optional callbacks for the Advanced → Track question state
     // feature. Both default to no-ops so existing call sites that
@@ -726,20 +680,19 @@ export class Coach {
     })();
     const wantMarkAsked = pendingSuggestions.length > 0;
 
-    // Build the per-tick tool list. Items + fields + meeting facts
-    // are always available; the suggest tool is included ONLY when a
-    // request kind is queued so the model has no way to spontaneously
-    // rotate suggestions. mark_question_asked is gated separately —
-    // it's only useful when there are unresolved pending suggestions
-    // to validate against.
+    // Build the per-tick tool list. Items + fields are always
+    // available; the suggest tool is included ONLY when a request
+    // kind is queued so the model has no way to spontaneously rotate
+    // suggestions. mark_question_asked is gated separately — it's
+    // only useful when there are unresolved pending suggestions to
+    // validate against.
     //
-    // record_meeting_fact is offered unconditionally because monetary
-    // facts can land at any point in the call — gating would create
-    // dead time where the prospect mentions a dollar figure that
-    // never gets captured. Cost impact is bounded because the Stage-2
-    // worker (src/quick-fix.js) is the expensive call, and IT is
-    // debounced 2.5 s after the last fact write.
-    const functionDeclarations = [UPDATE_ITEM_STATE, RECORD_FIELD, RECORD_MEETING_FACT];
+    // record_meeting_fact USED to live here but moved out to a
+    // dedicated Stage-1 scanner (src/facts-scanner.js) — see the
+    // doc-block above the now-removed RECORD_MEETING_FACT constant
+    // for the rationale. The Coach no longer participates in
+    // monetary fact extraction.
+    const functionDeclarations = [UPDATE_ITEM_STATE, RECORD_FIELD];
     if (wantSuggest) functionDeclarations.push(SUGGEST_NEXT_QUESTION);
     if (wantMarkAsked) functionDeclarations.push(MARK_QUESTION_ASKED);
 
@@ -947,39 +900,35 @@ export class Coach {
         return;
       }
       case 'record_meeting_fact': {
-        const kind = typeof args.kind === 'string' ? args.kind : null;
-        const amount = Number(args.amount);
-        const unit = typeof args.unit === 'string' ? args.unit : null;
-        const period = typeof args.period === 'string' ? args.period : null;
-        const basis = typeof args.basis === 'string' ? args.basis.trim() : '';
-        const anchorQuote = typeof args.anchor_quote === 'string' ? args.anchor_quote.trim() : '';
-        // Hard guards mirror the tool's `required` schema. Anchor
-        // quote is the load-bearing one — the renderer drill-through
-        // can't work without it and the rest of the entry would just
-        // be a number with no provenance.
-        if (!kind || !unit || !period || !basis || !anchorQuote) {
-          console.warn('[coach] dropping record_meeting_fact (missing required fields)');
-          return;
-        }
-        if (!Number.isFinite(amount)) {
-          console.warn('[coach] dropping record_meeting_fact (non-finite amount):', args.amount);
-          return;
-        }
-        const supersedesId = typeof args.supersedes_id === 'string' && args.supersedes_id.trim().length > 0
-          ? args.supersedes_id.trim()
-          : null;
-        this.onMeetingFact({
-          kind,
-          amount,
-          unit,
-          period,
-          basis,
-          anchorQuote,
-          supersedesId,
-        });
+        // Defensive ignore. record_meeting_fact was removed from the
+        // Coach's tool declarations in batch 2 (the Stage-1 scanner
+        // in src/facts-scanner.js owns this now), but a stale model
+        // that has the tool description cached in its context may
+        // still try to emit a call. Drop silently rather than route
+        // through the deprecated onMeetingFact callback.
+        console.warn('[coach] dropping deprecated record_meeting_fact call (now scanner-owned)');
         return;
       }
       case 'suggest_next_question': {
+        // Belt-and-braces SIGNALLED-mode gate (Issue 2 of post-test-
+        // call fixes batch 2): the tool is conditionally added to
+        // `functionDeclarations` only when `wantSuggest` was true for
+        // this tick, but a provider that ignores the declarations
+        // filter — or a future model trained to fire tools mentioned
+        // in the system prompt regardless of declarations — could
+        // still emit this call. `meta.suggestionKind` is non-null
+        // ONLY when `_tick()` ran with a queued kind, so it's the
+        // authoritative signal that this dispatch is legitimate.
+        // Dropping unsolicited calls here keeps Signalled mode
+        // strictly silent (acceptance criterion: zero
+        // coach:suggestion IPC events during a 60 s idle test).
+        if (!meta.suggestionKind) {
+          console.warn(
+            '[coach] dropping unsolicited suggest_next_question (no queued kind — signalled-mode gate)',
+            typeof args.item_id === 'string' ? args.item_id : '',
+          );
+          return;
+        }
         const itemId = typeof args.item_id === 'string' ? args.item_id : null;
         const question = typeof args.question === 'string' ? args.question : null;
         const anchorQuote = typeof args.anchor_quote === 'string' ? args.anchor_quote.trim() : '';
@@ -995,13 +944,13 @@ export class Coach {
         // Stamp the new pin. Pull-based: the pin holds until the rep
         // explicitly asks for a new one (skip / Suggest / Deeper /
         // Pivot) or the model marks the item covered.
-        this.lastSuggestion = { itemId, at: Date.now(), kind: meta.suggestionKind || 'next' };
+        this.lastSuggestion = { itemId, at: Date.now(), kind: meta.suggestionKind };
         this.onSuggestion({
           itemId,
           question,
           rationale: typeof args.rationale === 'string' ? args.rationale : '',
           anchorQuote,
-          kind: meta.suggestionKind || 'next',
+          kind: meta.suggestionKind,
         });
         return;
       }

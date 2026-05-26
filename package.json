@@ -1,7 +1,7 @@
 {
   "name": "2-way-flow",
-  "productName": "2-way-flow",
-  "version": "1.0.0",
+  "productName": "Two Way Flow",
+  "version": "1.1.0",
   "description": "My Electron application description",
   "main": ".vite/build/main.js",
   "private": true,
@@ -32,8 +32,11 @@
     "vite": "^5.4.21"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.98.0",
+    "@deepgram/sdk": "^5.3.0",
     "@google/genai": "^2.4.0",
     "dotenv": "^17.4.2",
-    "electron-squirrel-startup": "^1.0.1"
+    "electron-squirrel-startup": "^1.0.1",
+    "openai": "^6.39.0"
   }
 }

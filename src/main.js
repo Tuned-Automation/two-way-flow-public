@@ -240,6 +240,7 @@ import { DeepgramSession } from './deepgram-session.js';
 import { Coach } from './coach.js';
 import { generateSummary } from './summary.js';
 import { createQuickFixRoller } from './quick-fix.js';
+import { createFactsScanner } from './facts-scanner.js';
 import {
   loadSettings,
   saveSettings,
@@ -255,6 +256,7 @@ import {
   getProviderEnvAvailability,
   getCoach,
   getAudio,
+  getFactsScanner,
 } from './settings.js';
 import { getProvider } from './providers/index.js';
 
@@ -332,21 +334,57 @@ let mainWindowRef = null;
 let sessionStartedAt = 0;
 
 /**
- * Stage-2 quick-fix roller (Strategy A / Work-stream C).
+ * Stage-2 quick-fix roller (post-test-call fixes batch 2 / Issue 3).
  *
- * Lazily created on the first `record_meeting_fact` of a session (see
- * the onMeetingFact callback in gemini:start). The roller owns its
- * own debounce timer and the last-good-rollup state — keeping it as a
- * module-level singleton mirrors the other per-call instances
- * (liveSession / coachSession / deepgramSession) and gives
- * teardownSession a single handle to cancel the pending timer.
+ * Eagerly constructed at `gemini:start` time alongside the Stage-1
+ * scanner (see the facts-scanner setup block). Earlier iterations
+ * built the roller lazily on the first model-fired `record_meeting_fact`,
+ * but that path no longer exists — the Stage-1 scanner owns fact
+ * extraction now and the roller has to be alive from the moment the
+ * scanner's first tick could land. Eager construction also lets the
+ * roller's monotonic baseline (`lastAcceptedHeadline`) reset cleanly
+ * with the session lifecycle.
  *
  * Cleared in teardownSession after `cancelPendingRollup()` so a
  * stale roller from a previous session can't fire against a fresh
- * coachContext.factsSheet — the factory is cheap to re-construct
- * because all configuration lives on settings.
+ * coachContext.factsSheet.
  */
 let quickFixRoller = null;
+
+/**
+ * Stage-1 facts scanner (post-test-call fixes batch 2 / Issue 3).
+ *
+ * Eagerly constructed in `gemini:start` once a session is open
+ * (unlike the lazy `quickFixRoller`, which only materialised on the
+ * first model-fired meeting fact). The scanner runs on its own
+ * periodic interval and needs to be alive from the start of the
+ * call so it can stay caught up to the rolling transcript.
+ *
+ * Lifecycle:
+ *   - constructed + `start()` in `gemini:start` after the live
+ *     sessions open. Skipped silently when `settings.factsScanner
+ *     .enabled` is false (a manual kill-switch for testing).
+ *   - `stop()` + cleared in `teardownSession()` so a fresh
+ *     `gemini:start` rebuilds with the latest settings.
+ */
+let factsScanner = null;
+
+/**
+ * Read-cursor into `coachContext.transcriptLines` for the facts
+ * scanner. Each scanner tick consumes everything from the cursor
+ * onward and then advances the cursor to the new tail.
+ *
+ * Stored as a length count (not an index into a snapshot) so that
+ * any in-place mutation of `transcriptLines` (e.g. the
+ * cross-channel dedup splicing out a YOU line in favour of a
+ * PROSPECT one) doesn't cause us to skip or re-feed lines —
+ * `findAndRemoveMatchingLine` modifies the array but leaves all
+ * unaffected entries in place, and a length-based cursor naturally
+ * recovers.
+ *
+ * Reset to 0 by `resetCoachContext` on every fresh session.
+ */
+let factsScannerCursor = 0;
 
 /**
  * Module-level reference to the menu-bar / system-tray icon. Held here
@@ -455,6 +493,47 @@ const coachContext = {
   pendingTranscriptBySpeaker: { you: '', other: '' },
 
   /**
+   * Per-speaker timestamp of the MOST RECENT interim that landed
+   * non-empty text in the slot (post-test-call fixes batch 2 / Issue
+   * 1 — stale-pending watchdog).
+   *
+   * The bug being prevented:
+   *   Deepgram's `finished` event maps to `speech_final=true`, not
+   *   `is_final=true` (see src/deepgram-session.js). If Deepgram
+   *   never fires `speech_final` for a segment (network blip, AEC
+   *   misfire, conservative VAD), the pending text stays in the slot
+   *   until the NEXT segment's first interim arrives — at which
+   *   point `pendingTranscriptBySpeaker[speaker] = text` SILENTLY
+   *   OVERWRITES it. The text the rep saw greyed in the transcript
+   *   pane never makes it to transcriptLines (or to the saved
+   *   transcript / downstream coach + scanner).
+   *
+   * Two defences run in parallel:
+   *   1. Rotation guard in handleDeepgramTranscript: when a new
+   *      interim is NOT a prefix-extension of the existing pending,
+   *      force-commit the old text BEFORE replacing.
+   *   2. Periodic watchdog (`maybeForceCommitStalePending`): if a
+   *      pending has been sitting unchanged for > STALE_PENDING_MS
+   *      with no new interim, force-commit it.
+   *
+   * Semantics: this is "time since the most recent interim", NOT
+   * "time since the segment started". A slowly-but-actively-growing
+   * segment with frequent Deepgram interim refreshes never hits the
+   * threshold because every extending interim re-stamps the timer.
+   * The watchdog fires only when Deepgram genuinely goes silent on a
+   * pending slot — which is exactly the bug case.
+   *
+   * 0 means "no segment in flight" — set when the slot is cleared
+   * by a successful commit (normal `finished=true` path OR forced).
+   * Stamped to Date.now() on every interim that lands non-empty
+   * text (fresh segment OR extension OR rotation — the only thing
+   * that DOESN'T re-stamp is an empty `finished=true` no-op).
+   *
+   * @type {{ you: number, other: number }}
+   */
+  pendingTranscriptStartedAt: { you: 0, other: 0 },
+
+  /**
    * 4-state item lifecycle. Map<itemId, { state, evidence, confidence, at }>.
    *   state — 'in_progress' | 'covered' | 'logged'
    *   evidence — short quote from the transcript
@@ -469,22 +548,31 @@ const coachContext = {
   capturedFields: {},
 
   /**
-   * Structured monetary facts (Strategy A / Work-stream C).
+   * Structured monetary facts (post-test-call fixes batch 2 / Issue 3).
    *
-   * Populated by the coach via the `record_meeting_fact` tool. Each
-   * entry is a discrete quantitative fact (current spend, pain cost,
-   * time cost, etc.) with the raw amount, unit, period, and an anchor
-   * quote that lets the renderer drill back to the moment in the
-   * transcript where the number was stated.
+   * Populated by the Stage-1 scanner (src/facts-scanner.js), which
+   * runs on a ~12 s periodic sweep over the transcript. Each entry
+   * is a discrete quantitative fact (current spend, pain cost, time
+   * cost, etc.) with the raw amount, unit, period, an anchor quote
+   * for renderer drill-through, and a `correction` flag the scanner
+   * sets to `true` when the speaker explicitly revised an earlier
+   * figure.
    *
-   * `entries` is the input to the Stage-2 quick-fix worker (see
-   * src/quick-fix.js). The worker rolls active entries (those NOT
-   * superseded by a newer one) up into a single annualised USD
-   * opportunity that lives on `quickFix`.
+   * `entries` feeds the Stage-2 quick-fix worker (src/quick-fix.js).
+   * The worker dedupes the entries (ignoring superseded ones), sums
+   * them into a headline, and enforces a CODE-SIDE monotonic
+   * constraint: the headline MUST NOT decrease unless either at
+   * least one entry has `correction === true` OR the response
+   * carries a non-empty `correctionReason`.
+   *
+   * `previousHeadlineUsdAnnual` is the last ACCEPTED headline value,
+   * stamped on each successful Stage-2 rollup. The Stage-2 prompt
+   * receives this as input so the model knows the floor it's working
+   * against; the enforcer uses it for the actual gate.
    *
    * Entry shape:
    *   {
-   *     id: string,            // `${kind}__${Date.now()}` (stable per call)
+   *     id: string,            // `fact_${seq}_${Date.now()}` (stable per call)
    *     kind: string,          // 'current_spend' | 'pain_cost' | …
    *     amount: number,
    *     unit: 'usd' | 'hours' | 'people' | 'percent',
@@ -493,6 +581,7 @@ const coachContext = {
    *     quote: string,         // ≤120 chars anchor quote
    *     recordedAt: number,
    *     supersedes: string | null,
+   *     correction: boolean,   // Stage-1 sets true on explicit revisions
    *   }
    *
    * `quickFix` shape: null until the first successful rollup, then
@@ -502,8 +591,9 @@ const coachContext = {
    *     assumptions: string[],
    *     confidence: 'low' | 'medium' | 'high',
    *     currency: 'USD',
+   *     correctionReason: string | null, // when Stage-2 justifies a drop
    *     updatedAt: number,
-   *     stale: boolean,        // true while Stage-2 is retrying after validation failure
+   *     stale: boolean,        // true while Stage-2 is retrying after validation/monotonic failure
    *     error: boolean,        // true after ERROR_THRESHOLD consecutive failures
    *   }
    *
@@ -512,6 +602,7 @@ const coachContext = {
   factsSheet: {
     entries: [],
     quickFix: null,
+    previousHeadlineUsdAnnual: null,
   },
 
   /**
@@ -552,6 +643,42 @@ const AUTO_LOG_MS = 30_000;
 const AUTO_LOG_CHECK_INTERVAL_MS = 5_000;
 
 let autoLogTimer = null;
+
+/* ── Stale-pending watchdog (post-test-call fixes batch 2 / Issue 1) ──
+ *
+ * Background — the bug being fixed: Deepgram's `interim_results=true`
+ * stream produces non-incremental segment text on every interim, and
+ * we surface `finished=true` ONLY when Deepgram fires `speech_final`.
+ * If Deepgram never fires `speech_final` for a particular utterance
+ * (silent VAD hand-off, network blip, AEC misfire) the pending text
+ * stays in the slot until the NEXT segment's first interim arrives —
+ * which then SILENTLY OVERWRITES it via
+ * `pendingTranscriptBySpeaker[speaker] = text`. The text the rep saw
+ * greyed in the transcript pane never makes it to transcriptLines,
+ * the saved transcript, the coach, or the scanner.
+ *
+ * STALE_PENDING_MS is the per-segment ceiling: if the watchdog ticks
+ * and finds a pending that's been sitting unchanged for longer than
+ * this, it force-commits the segment via the same path
+ * `speech_final` would have taken.
+ *
+ * 4500 ms is the empirical pick — short enough that lost text lands
+ * in the same beat of the call (the rep doesn't have to wait long to
+ * see committed lines appear), long enough that a deliberately slow
+ * speaker mid-sentence isn't aggressively force-flushed mid-thought.
+ * Tighter would risk fragmenting genuinely-long utterances; looser
+ * would let the rotation guard in handleDeepgramTranscript do most of
+ * the work (which it already does for the common case of a new
+ * segment beginning immediately after the dropped one).
+ *
+ * STALE_PENDING_CHECK_INTERVAL_MS is the watchdog cadence. 1 s gives
+ * sub-second granularity on stale detection without burning cycles —
+ * the check itself just walks two slots and reads two timestamps,
+ * so overhead is negligible.
+ */
+const STALE_PENDING_MS = 4_500;
+const STALE_PENDING_CHECK_INTERVAL_MS = 1_000;
+let stalePendingTimer = null;
 
 /* ── Coach mode + pause detection (v2.5 redesign) ──────────────────────
  *
@@ -652,15 +779,21 @@ let currentPinnedSuggestionId = null;
 function resetCoachContext() {
   coachContext.transcriptLines = [];
   coachContext.pendingTranscriptBySpeaker = { you: '', other: '' };
+  coachContext.pendingTranscriptStartedAt = { you: 0, other: 0 };
   coachContext.itemStates = new Map();
   coachContext.capturedFields = {};
   coachContext.suggestionHistory = new Map();
-  // Wipe the Strategy A facts sheet so the new call starts with an
-  // empty rollup. The Stage-2 worker's debounce timer is cancelled
-  // by teardownSession (which fires before resetCoachContext on a
+  // Wipe the facts sheet so the new call starts with an empty
+  // rollup. The Stage-2 worker's debounce timer is cancelled by
+  // teardownSession (which fires before resetCoachContext on a
   // fresh start) so a late roll-up can't land against the new
-  // session's empty entries.
-  coachContext.factsSheet = { entries: [], quickFix: null };
+  // session's empty entries. previousHeadlineUsdAnnual back to null
+  // so the next session's first rollup isn't constrained by the
+  // previous call's ceiling.
+  coachContext.factsSheet = { entries: [], quickFix: null, previousHeadlineUsdAnnual: null };
+  // Reset the scanner cursor so a fresh session starts from line 0
+  // of its own transcript rather than skipping the opening turns.
+  factsScannerCursor = 0;
   currentPinnedSuggestionId = null;
   // Treat the session start as "fresh transcript activity" so the
   // pause detector doesn't immediately trip on an empty buffer.
@@ -1616,13 +1749,35 @@ async function teardownSession() {
     reformulateTimer = null;
   }
   // Cancel any in-flight Stage-2 debounce so a late roll-up can't fire
-  // against the about-to-be-reset factsSheet. The roller is rebuilt on
-  // the next session's first record_meeting_fact — keeping it null
-  // here ensures we don't carry the last session's lastGoodRollup
-  // forward into a fresh call.
+  // against the about-to-be-reset factsSheet. The roller is rebuilt
+  // on the next session's gemini:start (no longer lazy — see the
+  // facts-scanner setup block) so keeping it null here ensures we
+  // don't carry the last session's monotonic baseline forward into
+  // a fresh call.
   if (quickFixRoller) {
     try { quickFixRoller.cancelPendingRollup(); } catch { /* ignore */ }
     quickFixRoller = null;
+  }
+  // Stop the Stage-1 facts scanner (post-test-call fixes batch 2).
+  // No in-flight call can leak into the next session because the
+  // scanner's setInterval is gone before the next gemini:start
+  // re-creates a fresh instance. An in-flight provider roundtrip
+  // that lands after stop() is a no-op because the scanner's
+  // `stopped` guard short-circuits before any appendEntry call.
+  if (factsScanner) {
+    try { factsScanner.stop(); } catch { /* ignore */ }
+    factsScanner = null;
+  }
+  // Stop the stale-pending watchdog (post-test-call fixes batch 2 /
+  // Issue 1). Cleared before flushPendingTranscripts is called above
+  // so a late watchdog tick can't race with the flush — actually,
+  // flushPendingTranscripts runs FIRST in this function, which is
+  // intentional: the flush captures everything the watchdog would
+  // have caught one tick later, and then we kill the watchdog so it
+  // doesn't fire against an emptied pending slot.
+  if (stalePendingTimer) {
+    clearInterval(stalePendingTimer);
+    stalePendingTimer = null;
   }
 
   const c = coachSession;
@@ -1685,91 +1840,62 @@ function handleDeepgramTranscript({ speaker, text, finished }) {
   if (speaker !== 'you' && speaker !== 'other') return;
   if (typeof text !== 'string') return;
 
+  // ── Segment-rotation guard (post-test-call fixes batch 2 / Issue 1)
+  //
+  // The bug: if Deepgram never fires `speech_final` for a segment but
+  // immediately starts a new segment, the next interim arrives with
+  // entirely different text and `pendingTranscriptBySpeaker[speaker]
+  // = text` SILENTLY OVERWRITES the previous text. The rep saw the
+  // greyed-out text live but it never made it to the committed
+  // transcript.
+  //
+  // Detection: if a non-empty pending exists and the new interim is
+  // NOT a prefix-extension (i.e. doesn't start with the existing
+  // pending), treat the new interim as a NEW segment and force-
+  // commit the old one before replacing the slot.
+  //
+  // We deliberately ignore the rotation guard when `finished` is true
+  // — the normal `finished=true` path below already handles the
+  // commit, and a rotation immediately followed by a finished event
+  // can't happen in Deepgram's stream (finished applies to the slot
+  // we're about to replace anyway).
+  if (!finished) {
+    const currentPending = coachContext.pendingTranscriptBySpeaker[speaker];
+    if (currentPending && currentPending.trim().length > 0 && !text.startsWith(currentPending)) {
+      if (DEBUG_TRANSCRIPT) {
+        console.log(
+          '[transcript] rotation guard: force-commit', speaker,
+          JSON.stringify(currentPending.slice(0, 50)),
+          'before new segment',
+          JSON.stringify(text.slice(0, 50)),
+        );
+      }
+      forceCommitPendingSegment(speaker);
+    }
+  }
+
   coachContext.pendingTranscriptBySpeaker[speaker] = text;
+  // Stamp the timer on EVERY interim that lands non-empty text in
+  // the slot. The watchdog measures "time since the most recent
+  // interim" — not "time since the segment started" — so a slowly-
+  // but-actively-growing segment (long sentence with frequent
+  // Deepgram interim refreshes) never hits the threshold. The
+  // watchdog only fires when Deepgram has genuinely gone silent on
+  // a pending slot. Per the post-test-call spec: "Reset the watch-
+  // dog on every interim that genuinely extends or replaces the
+  // pending." See `maybeForceCommitStalePending` for the cadence.
+  if (text.length > 0) {
+    coachContext.pendingTranscriptStartedAt[speaker] = Date.now();
+  }
 
   send('gemini:transcript', { speaker, text, finished: Boolean(finished) });
 
   if (finished) {
     const committed = coachContext.pendingTranscriptBySpeaker[speaker].trim();
     coachContext.pendingTranscriptBySpeaker[speaker] = '';
+    coachContext.pendingTranscriptStartedAt[speaker] = 0;
     if (committed) {
-      // ── Cross-channel dedupe (PROSPECT-biased) ─────────────────────
-      // Runs FIRST so the prefix-extension path below only ever sees
-      // the lines we're keeping. The resolution rule is asymmetric:
-      // see the "Attribution bias" doc-block at module top — bleed
-      // almost always flows AI/prospect → mic, so when both channels
-      // carry the same content we keep PROSPECT and drop YOU.
-      const other = speaker === 'you' ? 'other' : 'you';
-      const otherEntry = recentCommitBySpeaker[other];
-      const now = Date.now();
-      const isDuplicateOfOtherChannel =
-        Boolean(otherEntry) &&
-        now - otherEntry.ts < CROSS_CHANNEL_WINDOW_MS &&
-        committed.length >= CROSS_CHANNEL_DEDUPE_MIN_CHARS &&
-        isNearIdentical(committed, otherEntry.text);
-
-      if (speaker === 'you' && isDuplicateOfOtherChannel) {
-        // Incoming YOU matches a recent PROSPECT commit — this is
-        // (almost certainly) the bleed copy of what the prospect just
-        // said. Drop it before it reaches transcriptLines OR the
-        // renderer. The pause-detector clock still ticks because the
-        // audio activity itself is real.
-        if (DEBUG_TRANSCRIPT) {
-          console.log(
-            '[transcript] you commit → DROP (matched recent PROSPECT)',
-            JSON.stringify(committed.slice(0, 50)),
-          );
-        }
-        markTranscriptActivity();
-        return;
-      }
-
-      if (speaker === 'other' && isDuplicateOfOtherChannel) {
-        // Incoming PROSPECT matches a recent YOU commit. PROSPECT is
-        // the trusted side, so the YOU line already in transcriptLines
-        // is the bleed copy we want to retract. Splice it out, clear
-        // the recent-YOU tracker so the prefix-extension path
-        // downstream doesn't re-anchor on a line we just removed,
-        // then fall through to the normal PROSPECT commit flow.
-        const removed = findAndRemoveMatchingLine(
-          coachContext.transcriptLines,
-          'you',
-          committed,
-        );
-        if (removed) recentCommitBySpeaker.you = null;
-        if (DEBUG_TRANSCRIPT) {
-          console.log(
-            '[transcript] other commit → KEEP, removed prior YOU line:',
-            removed,
-            JSON.stringify(committed.slice(0, 50)),
-          );
-        }
-        // Fall through.
-      } else if (DEBUG_TRANSCRIPT) {
-        console.log(
-          '[transcript]',
-          speaker,
-          'commit → KEEP',
-          JSON.stringify(committed.slice(0, 50)),
-        );
-      }
-
-      recentCommitBySpeaker[speaker] = { text: committed, ts: now };
-
-      // Prefix-extension dedupe (belt-and-braces). The primary fix lives
-      // in deepgram-session.js (only commit on `speech_final`), but if
-      // VAD ever emits two `speech_final`s back-to-back on a continuing
-      // utterance the second commit would otherwise produce a duplicate
-      // line whose text contains the first as a prefix. Detect that
-      // case and REPLACE the prior line instead of pushing.
-      const lines = coachContext.transcriptLines;
-      const lastIdx = findLastLineBySpeaker(lines, speaker);
-      const newLine = speakerPrefix(speaker) + committed;
-      if (lastIdx >= 0 && newLine.startsWith(lines[lastIdx])) {
-        lines[lastIdx] = newLine;
-      } else {
-        lines.push(newLine);
-      }
+      commitTranscriptLineForSpeaker(speaker, committed);
     }
   }
 
@@ -1777,6 +1903,188 @@ function handleDeepgramTranscript({ speaker, text, finished }) {
   // for the pause detector — we only want to nudge when both channels
   // have genuinely gone quiet.
   if (text || finished) markTranscriptActivity();
+}
+
+/**
+ * Commit a finalised (or force-finalised) segment for one speaker.
+ *
+ * Extracted from the original `handleDeepgramTranscript` body so that
+ * three call sites can share one implementation:
+ *
+ *   1. The normal `finished=true` Deepgram path.
+ *   2. The rotation guard at the top of `handleDeepgramTranscript`,
+ *      when a new interim arrives that's not a prefix-extension of
+ *      the existing pending (post-test-call fixes batch 2 / Issue 1).
+ *   3. The periodic stale-pending watchdog
+ *      (`maybeForceCommitStalePending`) — the safety net for when
+ *      Deepgram never fires `speech_final` AND no rotation arrives.
+ *
+ * Performs the same cross-channel PROSPECT-biased dedup, prefix-
+ * extension folding, and recent-commit bookkeeping as the original
+ * inline block. Does NOT touch the pending slot — the caller is
+ * responsible for clearing `pendingTranscriptBySpeaker[speaker]` and
+ * `pendingTranscriptStartedAt[speaker]` before calling so the watch-
+ * dog can't see stale state if we throw mid-commit.
+ *
+ * @param {'you'|'other'} speaker
+ * @param {string} committed  Already trim()ed segment text.
+ */
+function commitTranscriptLineForSpeaker(speaker, committed) {
+  if (!committed) return;
+
+  // ── Cross-channel dedupe (PROSPECT-biased) ─────────────────────
+  // Bleed almost always flows AI/prospect → mic, so when both
+  // channels carry the same content within CROSS_CHANNEL_WINDOW_MS
+  // we keep PROSPECT and drop YOU. See "Attribution bias" doc-block
+  // at module top.
+  const other = speaker === 'you' ? 'other' : 'you';
+  const otherEntry = recentCommitBySpeaker[other];
+  const now = Date.now();
+  const isDuplicateOfOtherChannel =
+    Boolean(otherEntry) &&
+    now - otherEntry.ts < CROSS_CHANNEL_WINDOW_MS &&
+    committed.length >= CROSS_CHANNEL_DEDUPE_MIN_CHARS &&
+    isNearIdentical(committed, otherEntry.text);
+
+  if (speaker === 'you' && isDuplicateOfOtherChannel) {
+    if (DEBUG_TRANSCRIPT) {
+      console.log(
+        '[transcript] you commit → DROP (matched recent PROSPECT)',
+        JSON.stringify(committed.slice(0, 50)),
+      );
+    }
+    return;
+  }
+
+  if (speaker === 'other' && isDuplicateOfOtherChannel) {
+    const removed = findAndRemoveMatchingLine(
+      coachContext.transcriptLines,
+      'you',
+      committed,
+    );
+    if (removed) recentCommitBySpeaker.you = null;
+    if (DEBUG_TRANSCRIPT) {
+      console.log(
+        '[transcript] other commit → KEEP, removed prior YOU line:',
+        removed,
+        JSON.stringify(committed.slice(0, 50)),
+      );
+    }
+    // Fall through to the normal PROSPECT commit flow.
+  } else if (DEBUG_TRANSCRIPT) {
+    console.log(
+      '[transcript]', speaker, 'commit → KEEP',
+      JSON.stringify(committed.slice(0, 50)),
+    );
+  }
+
+  recentCommitBySpeaker[speaker] = { text: committed, ts: now };
+
+  // Prefix-extension dedupe (belt-and-braces). The primary fix lives
+  // in deepgram-session.js (only commit on `speech_final`), but if
+  // VAD ever emits two `speech_final`s back-to-back on a continuing
+  // utterance the second commit would otherwise produce a duplicate
+  // line whose text contains the first as a prefix. Detect that
+  // case and REPLACE the prior line instead of pushing.
+  const lines = coachContext.transcriptLines;
+  const lastIdx = findLastLineBySpeaker(lines, speaker);
+  const newLine = speakerPrefix(speaker) + committed;
+  if (lastIdx >= 0 && newLine.startsWith(lines[lastIdx])) {
+    lines[lastIdx] = newLine;
+  } else {
+    lines.push(newLine);
+  }
+}
+
+/**
+ * Force-commit the current pending segment for `speaker`, regardless
+ * of whether Deepgram has fired `speech_final` for it yet. Used by
+ * the rotation guard (when a new segment's interim arrives without
+ * the previous having committed) and by the watchdog (when nothing
+ * else has arrived to displace a stale pending).
+ *
+ * Mirrors the `finished=true` path inside `handleDeepgramTranscript`
+ * step by step:
+ *   - clear the pending slot + start-time stamp FIRST so the watchdog
+ *     can't see stale state if we re-enter (e.g. the renderer commit
+ *     synchronously triggers a re-entry on an interim that was
+ *     buffered while we were processing).
+ *   - synthesise the `gemini:transcript` IPC with `finished: true` so
+ *     the renderer's mirror commits its own copy of the text and
+ *     clears its `pendingBySpeaker[speaker]` slot. Order matters:
+ *     this happens BEFORE the next interim's `finished=false`
+ *     broadcast in the rotation case, so the renderer commits the
+ *     OLD text before receiving the NEW one as a fresh pending.
+ *   - run the same cross-channel + prefix-extension commit pipeline
+ *     so the line lands in `transcriptLines` exactly as if Deepgram
+ *     had fired `speech_final`.
+ *
+ * Bookkeeping for `markTranscriptActivity` is intentionally NOT
+ * called here — the caller of `forceCommitPendingSegment` (either
+ * the rotation guard's enclosing `handleDeepgramTranscript` or the
+ * watchdog) is the right place to decide whether this counts as
+ * activity for the pause detector.
+ *
+ * @param {'you'|'other'} speaker
+ */
+function forceCommitPendingSegment(speaker) {
+  const committed = coachContext.pendingTranscriptBySpeaker[speaker].trim();
+  coachContext.pendingTranscriptBySpeaker[speaker] = '';
+  coachContext.pendingTranscriptStartedAt[speaker] = 0;
+  if (!committed) return;
+
+  // Tell the renderer to commit too. Synthesising finished=true is
+  // semantically identical to a real Deepgram speech_final from the
+  // renderer's perspective — it runs its own mirror of the
+  // commit-and-clear pipeline. See the renderer's
+  // window.gemini.onTranscript subscriber for the matching code path.
+  send('gemini:transcript', { speaker, text: committed, finished: true });
+
+  commitTranscriptLineForSpeaker(speaker, committed);
+}
+
+/**
+ * Periodic watchdog (post-test-call fixes batch 2 / Issue 1). Runs
+ * every STALE_PENDING_CHECK_INTERVAL_MS once a session is active and
+ * force-commits any pending segment that's been sitting unchanged
+ * for longer than STALE_PENDING_MS.
+ *
+ * This is the safety net for the worst case where Deepgram (a) never
+ * fires `speech_final` for a segment AND (b) no new segment arrives
+ * to trigger the rotation guard. Without it that segment would just
+ * sit greyed in the renderer forever and never reach the saved
+ * transcript / coach / scanner.
+ *
+ * Idempotent: a slot already cleared (because either a real
+ * speech_final OR the rotation guard already committed it) shows up
+ * with startedAt=0, which fails the threshold check and is skipped.
+ *
+ * Double-commit safety: `forceCommitPendingSegment` clears the slot
+ * BEFORE running the commit pipeline, so a watchdog tick that races
+ * with a real speech_final arriving at the same moment can't both
+ * land the same text — whichever runs first leaves the slot empty
+ * for the other to skip.
+ */
+function maybeForceCommitStalePending() {
+  const now = Date.now();
+  for (const speaker of /** @type {const} */ (['you', 'other'])) {
+    const startedAt = coachContext.pendingTranscriptStartedAt[speaker];
+    if (!startedAt) continue;
+    const pending = coachContext.pendingTranscriptBySpeaker[speaker];
+    if (!pending || pending.trim().length === 0) continue;
+    if (now - startedAt < STALE_PENDING_MS) continue;
+    console.log(
+      '[transcript] watchdog: force-commit stale pending',
+      speaker,
+      `(age ${now - startedAt}ms)`,
+      JSON.stringify(pending.slice(0, 60)),
+    );
+    forceCommitPendingSegment(speaker);
+    // Treat the watchdog-fired commit as transcript activity so the
+    // pause detector doesn't simultaneously nudge — same speaker that
+    // just dropped a line probably wasn't actually silent.
+    markTranscriptActivity();
+  }
 }
 
 /**
@@ -1874,8 +2182,13 @@ function handleTurnComplete() {
 function flushPendingTranscripts() {
   for (const speaker of /** @type {const} */ (['you', 'other'])) {
     const pending = coachContext.pendingTranscriptBySpeaker[speaker].trim();
-    if (!pending) continue;
+    // Also wipe the started-at stamp regardless — even if pending
+    // was empty (a clean state), we want to leave the slot in a
+    // consistent "no segment in flight" shape so the watchdog
+    // doesn't misfire on stale timestamps from a previous session.
     coachContext.pendingTranscriptBySpeaker[speaker] = '';
+    coachContext.pendingTranscriptStartedAt[speaker] = 0;
+    if (!pending) continue;
     const lines = coachContext.transcriptLines;
     const lastIdx = findLastLineBySpeaker(lines, speaker);
     const newLine = speakerPrefix(speaker) + pending;
@@ -2251,63 +2564,14 @@ function registerIpcHandlers() {
         );
         send('scoring:field', payload);
       },
-      onMeetingFact: (payload) => {
-        // Strategy A: append a structured fact to the sheet and
-        // arm the Stage-2 debouncer. Sheet entry id is stable per
-        // call so the renderer's drill-through can reference it
-        // even if the model re-emits a similar fact later.
-        const id = `${payload.kind}__${Date.now()}__${coachContext.factsSheet.entries.length}`;
-        const entry = {
-          id,
-          kind: payload.kind,
-          amount: payload.amount,
-          unit: payload.unit,
-          period: payload.period,
-          basis: payload.basis,
-          quote: payload.anchorQuote,
-          recordedAt: Date.now(),
-          supersedes: typeof payload.supersedesId === 'string' && payload.supersedesId
-            ? payload.supersedesId
-            : null,
-        };
-        coachContext.factsSheet.entries.push(entry);
-        console.log(
-          '[coach] fact:',
-          entry.id,
-          '·',
-          entry.amount,
-          entry.unit,
-          entry.period,
-          '—',
-          entry.basis,
-        );
-        // Lazy-construct the roller on first fact. Capturing
-        // coachContext.factsSheet.entries by reference through the
-        // getter means a reset that swaps `entries` for a new array
-        // wouldn't be seen — but resetCoachContext keeps the
-        // factsSheet object identity and only mutates `entries` in
-        // place, so the reference stays valid across resets. We
-        // also rebuild the roller on every fresh session in
-        // teardownSession to be safe.
-        if (!quickFixRoller) {
-          quickFixRoller = createQuickFixRoller({
-            getEntries: () => coachContext.factsSheet.entries,
-            onRollup: (rollup, activeEntries) => {
-              coachContext.factsSheet.quickFix = rollup;
-              // Mirror the active entries onto the IPC payload so
-              // the renderer can build its drill-through index
-              // without having to mirror the whole factsSheet in
-              // local state. activeEntries excludes superseded
-              // ones — only the rows the rollup actually counted.
-              send('scoring:quick-fix', { quickFix: rollup, entries: activeEntries });
-            },
-            onError: (message) => {
-              console.warn('[quick-fix] worker error:', message);
-            },
-          });
-        }
-        quickFixRoller.schedule();
-      },
+      // onMeetingFact is intentionally omitted — record_meeting_fact
+      // moved out of the Coach to the Stage-1 facts scanner (see
+      // `factsScanner` setup further below). The Coach's constructor
+      // accepts a no-op default for this slot so older builds keep
+      // running. The scanner's `appendEntry` callback owns the same
+      // job (push onto coachContext.factsSheet.entries + schedule
+      // the Stage-2 rollup) but lives on the scanner's cadence
+      // instead of the Coach's 1.5s tick.
       onSuggestion: (payload) => {
         console.log(
           '[coach] suggest:',
@@ -2379,6 +2643,123 @@ function registerIpcHandlers() {
       onTickEnd: () => send('coach:tick-end', null),
     });
     coachSession.start();
+
+    // ── Stage-1 facts scanner (post-test-call fixes batch 2 / Issue 3)
+    //
+    // Construct the scanner eagerly (NOT lazy on first fact like the
+    // legacy onMeetingFact path) so its first tick fires after one
+    // `intervalMs` window of conversation. The scanner pulls
+    // configuration (`intervalMs`, `enabled`) live from settings on
+    // start; settings changes mid-call don't hot-swap — the next
+    // gemini:start picks them up. Disabled scanners produce no IPC
+    // and no Stage-2 work; the renderer's #quickFix card stays hidden
+    // until a fact lands.
+    //
+    // The scanner's `appendEntry` callback re-uses the same shape +
+    // bookkeeping the legacy Coach onMeetingFact callback did:
+    //   - stable id per call (used by the renderer's drill-through)
+    //   - push onto coachContext.factsSheet.entries IN PLACE so the
+    //     getter we hand to the roller / scanner stays valid
+    //     across resetCoachContext (which mutates `entries` rather
+    //     than replacing the array)
+    //   - schedule the Stage-2 quick-fix roller (debounced 2.5s) so a
+    //     burst of facts from a single scanner tick coalesces into
+    //     one Stage-2 roundtrip
+    //
+    // The roller is also constructed eagerly here (rather than the
+    // old lazy-on-first-fact path) so its monotonic baseline
+    // (`lastAcceptedHeadline`) starts null at the right moment in
+    // the session lifecycle.
+    const factsScannerConfig = getFactsScanner();
+    if (factsScannerConfig.enabled) {
+      if (!quickFixRoller) {
+        quickFixRoller = createQuickFixRoller({
+          getEntries: () => coachContext.factsSheet.entries,
+          onRollup: (rollup, activeEntries) => {
+            coachContext.factsSheet.quickFix = rollup;
+            // Stamp the accepted headline back onto the factsSheet so
+            // a future debugging tool / future read-only viewer can
+            // see the monotonic baseline alongside the live quickFix.
+            // The roller owns the AUTHORITATIVE copy of this value
+            // (lastAcceptedHeadline) — this mirror is just for
+            // observability.
+            if (rollup && !rollup.stale && Number.isFinite(rollup.headlineUsdAnnual)) {
+              coachContext.factsSheet.previousHeadlineUsdAnnual = rollup.headlineUsdAnnual;
+            }
+            send('scoring:quick-fix', { quickFix: rollup, entries: activeEntries });
+          },
+          onError: (message) => {
+            console.warn('[quick-fix] worker error:', message);
+          },
+        });
+      }
+      factsScanner = createFactsScanner({
+        intervalMs: factsScannerConfig.intervalMs,
+        getEntries: () => coachContext.factsSheet.entries,
+        getNewTranscriptLines: () => {
+          // Hand back lines committed since the previous scan and
+          // advance the cursor. Using `.length` as a marker means an
+          // in-place splice (e.g. cross-channel dedup removing a YOU
+          // line in favour of a PROSPECT one) doesn't cause us to
+          // re-feed earlier lines on the next tick — the cursor still
+          // points at "the count we'd already consumed", which is the
+          // same count post-splice for the entries before the splice
+          // point. The trade-off is that a splice can leave the
+          // scanner re-feeding the LAST consumed line on the next
+          // tick (because the splice shifted indices), but the
+          // scanner's `correction:false` semantics + Stage-1 dedup
+          // make that benign.
+          const total = coachContext.transcriptLines.length;
+          if (factsScannerCursor >= total) return [];
+          const slice = coachContext.transcriptLines.slice(factsScannerCursor);
+          factsScannerCursor = total;
+          return slice;
+        },
+        appendEntry: (validated) => {
+          const idx = coachContext.factsSheet.entries.length;
+          const id = `fact_${idx}_${Date.now()}`;
+          const entry = {
+            id,
+            kind: validated.kind,
+            amount: validated.amount,
+            unit: validated.unit,
+            period: validated.period,
+            basis: validated.basis,
+            quote: validated.anchorQuote,
+            recordedAt: Date.now(),
+            supersedes: validated.supersedesId || null,
+            correction: validated.correction === true,
+          };
+          coachContext.factsSheet.entries.push(entry);
+          console.log(
+            '[facts]', entry.id, '·',
+            entry.amount, entry.unit, entry.period,
+            entry.correction ? '(CORRECTION)' : '',
+            '—', entry.basis,
+          );
+          if (quickFixRoller) quickFixRoller.schedule();
+        },
+        onError: (message) => {
+          console.warn('[facts-scanner] error:', message);
+        },
+      });
+      factsScanner.start();
+    } else {
+      console.log('[facts-scanner] disabled via settings.factsScanner.enabled');
+    }
+
+    // Start the stale-pending transcript watchdog (post-test-call
+    // fixes batch 2 / Issue 1). The watchdog is the safety net for
+    // segments Deepgram never speech_final's AND that no new
+    // rotation displaces — without it, that text never reaches the
+    // saved transcript / coach / scanner. The rotation guard in
+    // handleDeepgramTranscript handles the common case; this is the
+    // catch-all for the long-tail "Deepgram just went silent".
+    if (stalePendingTimer) clearInterval(stalePendingTimer);
+    stalePendingTimer = setInterval(
+      maybeForceCommitStalePending,
+      STALE_PENDING_CHECK_INTERVAL_MS,
+    );
 
     // Start the periodic auto-log sweep. Each tick (every ~5s) demotes
     // stale `in_progress` items to `logged` per maybeAutoLogStaleItems.

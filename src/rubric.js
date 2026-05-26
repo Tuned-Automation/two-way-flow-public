@@ -260,22 +260,29 @@ export const ITEMS_BY_PILLAR = (() => {
 /**
  * @type {FieldDef[]}
  *
- * MONETARY CAPTURE LIVES ELSEWHERE — STRATEGY A (post-test-call fixes):
+ * MONETARY CAPTURE LIVES ELSEWHERE — Stage-1 facts scanner:
  *
- * Previously this list included `revenue.annual` and
- * `pain.cost_annual` for the coach to drop dollar figures into via
- * `record_field`. That fed the legacy regex "Total potential
- * revenue" rollup in the renderer, which (a) couldn't tell apart
- * client revenue from pain cost, (b) silently double-counted, and
- * (c) re-displayed a number that changed every time the same fact
- * was restated.
+ * Earlier iterations dropped dollar figures into free-text slots
+ * (`revenue.annual`, `pain.cost_annual`) via `record_field`. That fed
+ * a regex "Total potential revenue" rollup that double-counted,
+ * confused revenue with pain cost, and re-displayed different
+ * numbers each time the same fact was restated.
  *
- * Replaced by the two-stage AI pipeline in src/quick-fix.js. ALL
- * monetary / quantitative-opportunity captures (current spend, pain
- * cost, savings, revenue uplift, time cost, headcount cost) now flow
- * through the `record_meeting_fact` tool declared in src/coach.js;
- * a debounced background worker rolls the structured facts up into
- * the renderer's `#quickFix` panel.
+ * The intermediate fix routed money through a coach-side
+ * `record_meeting_fact` tool firing every 1.5 s. That produced its
+ * own wobble — the coach kept re-classifying duplicates between
+ * ticks, and the Stage-2 rollup re-summed differently each time.
+ *
+ * Current shape (post-test-call fixes batch 2):
+ *   - Stage 1 — a dedicated scanner (`src/facts-scanner.js`) runs
+ *     every ~12 s, scans the recent transcript, and appends discrete
+ *     facts to `coachContext.factsSheet.entries` with an explicit
+ *     `correction: true` flag when the prospect revises a figure.
+ *   - Stage 2 — `src/quick-fix.js` debounces ~2.5 s, dedupes the
+ *     entries, sums them into a headline. Code-side monotonic
+ *     enforcement rejects any decrease that lacks a `correction` flag
+ *     or `correctionReason`. The headline can only go UP or stay flat
+ *     unless a correction is in play.
  *
  * `revenue.growth` STAYS here — it's a percentage descriptor, doesn't
  * contribute to a dollar sum, and has a natural home in the captured-
@@ -552,7 +559,7 @@ export const COACH_SYSTEM_INSTRUCTION = [
   '                  state appear in a dedicated "Logged" pillar in',
   '                  the UI so the seller can boost them later.',
   '',
-  'You have four core tools, plus one optional gated tool:',
+  'You have three core tools, plus two optional gated tools:',
   '',
   '1. update_item_state({ item_id, state, evidence, confidence }) —',
   '   call this whenever an item should transition to a new state',
@@ -572,68 +579,33 @@ export const COACH_SYSTEM_INSTRUCTION = [
   '       firing a confusing transition.',
   '',
   '2. record_field({ field_id, value, evidence }) — call this whenever',
-  '   the PROSPECT volunteers a concrete fact that maps to one of the',
-  '   captured fields. `value` is a short display string ("40% YoY",',
-  '   "8 marketers, 3 sellers"). Calling it again for the same',
-  '   field_id replaces the value. Do NOT record facts the seller',
+  '   the PROSPECT volunteers a concrete non-monetary fact that maps to',
+  '   one of the captured fields. `value` is a short display string',
+  '   ("40% YoY", "8 marketers, 3 sellers"). Calling it again for the',
+  '   same field_id replaces the value. Do NOT record facts the seller',
   '   guessed at unless the prospect confirmed them.',
   '',
-  '   IMPORTANT: NEVER use `record_field` for dollar amounts or any',
-  '   quantitative opportunity figure (spend, pain cost, savings,',
-  '   revenue lift, time cost, headcount cost). Those go through the',
-  '   separate `record_meeting_fact` tool below so the structured',
-  '   roll-up can aggregate them correctly. For example, if the',
-  '   prospect says "we lose about $50K a year to manual reporting",',
-  '   call record_meeting_fact (not record_field) — there is no',
-  '   field_id in the enum for that anyway. record_field is for',
-  '   non-aggregable text descriptors only (team size, tools in use,',
-  '   primary pain summary, growth %, decision-maker name, etc.).',
+  '   IMPORTANT — money is NOT your job: a separate background',
+  '   scanner extracts dollar amounts, hours, headcount, and other',
+  '   quantitative opportunity figures (spend, pain cost, savings,',
+  '   revenue lift, time cost, headcount cost) on its own cadence and',
+  '   rolls them into a headline total. Do NOT try to record monetary',
+  '   facts in any tool — there is no field_id in the record_field',
+  '   enum for them and they will simply be ignored. Your record_field',
+  '   responsibility is limited to non-aggregable text descriptors',
+  '   only (team size composition, tools in use, primary pain summary,',
+  '   growth %, decision-maker name, urgency timeline, etc.).',
   '',
-  '3. record_meeting_fact({ kind, amount, unit, period, basis,',
-  '   anchor_quote, supersedes_id? }) — call this whenever the prospect',
-  '   states a quantitative figure that affects the total economic',
-  '   opportunity of the deal. Examples: current spend on a tool, hours',
-  '   lost per week, headcount on a process, expected revenue lift,',
-  '   pain cost per year. Each call adds a new entry to a structured',
-  '   facts sheet that a separate background AI rolls up into a total',
-  '   annual opportunity for the rep.',
-  '',
-  '   Field rules:',
-  '     - kind: one of "current_spend", "pain_cost",',
-  '       "savings_opportunity", "revenue_uplift", "time_cost",',
-  '       "headcount_cost", "other". Pick the closest match — when in',
-  '       doubt prefer "other" over guessing.',
-  '     - amount: the raw number AS STATED (not converted). So',
-  '       "$50K/yr" → 50000; "10 hours a week" → 10.',
-  '     - unit: one of "usd", "hours", "people", "percent". Pick the',
-  '       unit that matches the number you put in `amount`.',
-  '     - period: one of "one_time", "weekly", "monthly", "quarterly",',
-  '       "annual". When the prospect says "we lose 10 hours a week"',
-  '       that\'s {amount: 10, unit: "hours", period: "weekly"} — let',
-  '       the rollup do the annualisation; don\'t multiply yourself.',
-  '     - basis: one short sentence explaining what the number',
-  '       represents ("Annual spend on the current automation tool").',
-  '     - anchor_quote: REQUIRED. Direct quote from the transcript',
-  '       (≤120 chars) where this number was stated. The renderer',
-  '       uses the quote to scroll the transcript to the source when',
-  '       the rep clicks the row. If you can\'t anchor the quote',
-  '       cleanly, DO NOT call this tool.',
-  '     - supersedes_id: optional. If the prospect just CORRECTED an',
-  '       earlier fact ("actually it\'s closer to $80K, not $50K"),',
-  '       pass the earlier entry\'s id here so the rollup ignores the',
-  '       stale value. Otherwise omit it.',
-  '',
-  '   Restate-vs-correct rule: when the prospect repeats a figure they',
-  '   already gave, do NOT fire a new fact unless the figure has',
-  '   actually changed. The rollup is debounced and will re-run on the',
-  '   next genuine new fact.',
-  '',
-  '4. suggest_next_question({ item_id, question, rationale,',
+  '3. suggest_next_question({ item_id, question, rationale,',
   '   anchor_quote }) — only included in your tool list when the rep',
   '   has explicitly asked for a suggestion (or, in Automated mode,',
-  '   when a natural pause is detected). When this tool IS available,',
-  '   call it exactly ONCE per turn — but the prompt will tell you',
-  '   which "mode" the ask is in, and that changes how you choose the',
+  '   when a natural pause is detected). If this tool is NOT present',
+  '   in your declarations this turn, DO NOT emit a suggestion in any',
+  '   form — not as a function call, not as text, not as a',
+  '   work-around through another tool. Stay silent on suggestions',
+  '   until the tool reappears. When this tool IS available, call it',
+  '   exactly ONCE per turn — but the prompt will tell you which',
+  '   "mode" the ask is in, and that changes how you choose the',
   '   question. CONTEXT-FIRST RULES (read these every time):',
   '',
   '   a. FIRST, read the last 2-3 turns of the transcript. What did',
@@ -767,7 +739,7 @@ export const COACH_SYSTEM_INSTRUCTION = [
   '     - "Try to use more open-ended questions." — behaviour note,',
   '        not a spoken question; the prospect cannot reply to it.',
   '',
-  '5. mark_question_asked({ suggestion_id, evidence }) — call this',
+  '4. mark_question_asked({ suggestion_id, evidence }) — call this',
   '   when you see in the transcript that the seller asked a question',
   '   whose intent matches one of the PENDING SUGGESTIONS listed in',
   '   the user message. "Match" is generous: exact wording is not',
