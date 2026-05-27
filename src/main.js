@@ -3515,7 +3515,22 @@ function registerIpcHandlers() {
     const result = markSuggestionAskedManual({ suggestionId, source: 'manual_mark_asked' });
     if (result.unknown) return { ok: false, error: 'unknown_suggestion' };
     if (result.alreadyAsked) return { ok: true, alreadyAsked: true };
-    if (result.changed) broadcastSuggestionHistory();
+    if (result.changed) {
+      broadcastSuggestionHistory();
+      // Auto-advance-on-green: in Automated mode, mirror the AI
+      // path's behaviour so a manual tick also triggers a fresh
+      // next-kind suggestion. The rep has already touched the
+      // pin, so the explicit cleanup inside markSuggestionAskedManual
+      // (markItemAsAsked + 'logged' transition + skip-set stamp)
+      // has run before we get here. requestSuggestion is therefore
+      // safe to call without further bookkeeping.
+      //
+      // Signalled mode stays calm — same contract as Task 1.
+      if (coachMode === 'automated' && coachSession) {
+        cancelReformulateTimer();
+        coachSession.requestSuggestion({ kind: 'next' });
+      }
+    }
     return { ok: true };
   });
 
