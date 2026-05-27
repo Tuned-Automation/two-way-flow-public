@@ -2874,7 +2874,27 @@ function registerIpcHandlers() {
       },
       onQuestionAsked: ({ suggestionId, evidence }) => {
         const changed = applyMarkAsked({ suggestionId, evidence });
-        if (changed) broadcastSuggestionHistory();
+        if (!changed) return;
+        broadcastSuggestionHistory();
+        // Auto-advance-on-green: in Automated mode, fire a fresh
+        // 'next' the moment the model spots the seller asking a
+        // pinned question. The pin greens via the broadcast above,
+        // and the new suggestion lands within ~1 tick (~1.5s) so
+        // the rep has a follow-up ready before the prospect
+        // finishes answering. Signalled mode stays calm — see the
+        // coachMode doc-block above for the contract.
+        //
+        // Why no explicit markItemAsAsked() here (unlike the manual
+        // path): requestSuggestion() itself stamps the previous
+        // pin's itemId into skippedItemIds (see src/coach.js
+        // lines 553-555), and the AI typically pairs this call with
+        // update_item_state(covered) which also removes the item
+        // from the candidate pool. Either way, the next tick won't
+        // re-pin the same item.
+        if (coachMode === 'automated' && coachSession) {
+          cancelReformulateTimer();
+          coachSession.requestSuggestion({ kind: 'next' });
+        }
       },
       getSuggestionContext: () => {
         // The Coach asks for this on every tick — return an empty
