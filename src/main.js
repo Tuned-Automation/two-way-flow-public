@@ -718,11 +718,29 @@ let stalePendingTimer = null;
  *   'signalled' (default) — the coach NEVER auto-suggests. Suggestions
  *                           only come from the rep's explicit asks
  *                           (Suggest / Deeper / Pivot) or a skip.
- *   'automated'           — same as signalled, PLUS the pause detector
- *                           fires a `kind: 'pause'` request whenever
- *                           the transcript has been silent on both
- *                           channels for PAUSE_THRESHOLD_MS and there's
- *                           no currently-pinned suggestion.
+ *   'automated'           — same as signalled, PLUS the following
+ *                           automated triggers:
+ *                             • Kickstart — one-shot opening suggestion
+ *                               ~10s after session start. See
+ *                               `armKickstart()`.
+ *                             • Pause nudge — `kind: 'pause'` request
+ *                               whenever the transcript has been silent
+ *                               on both channels for PAUSE_THRESHOLD_MS
+ *                               and there's no currently-pinned
+ *                               suggestion. See `maybeFirePauseNudge()`.
+ *                             • Auto-reformulate — `kind: 'reformulate'`
+ *                               request every REFORMULATE_DELAY_MS while
+ *                               a pin stays unasked. Additionally gated
+ *                               on coach.trackQuestionState and
+ *                               coach.autoReformulate Advanced toggles.
+ *                               See `armReformulateTimer()`.
+ *                             • Auto-advance on green — `kind: 'next'`
+ *                               request the moment a pinned question
+ *                               flips to asked (either via the AI's
+ *                               mark_question_asked tool or the rep's
+ *                               manual tick button). See the
+ *                               onQuestionAsked callback and the
+ *                               coach:mark-suggestion-asked IPC handler.
  *
  * The mode is held here in main rather than on the Coach instance
  * because main owns the canonical transcript stream timing — the
