@@ -105,6 +105,39 @@ const DEFAULT_DEBOUNCE_MS = 2_500;
  * next valid response. */
 const ERROR_THRESHOLD = 3;
 
+/* Tolerance for the anchor constraint. When a `stated_total` fact
+ * exists, the Stage-2 headline must land within ±20% of it. This is
+ * the prospect's own self-stated total — ground truth. The model
+ * gets latitude inside the band; outside it, we reject. */
+const ANCHOR_TOLERANCE = 0.2;
+
+/* Tolerance for the headline-vs-breakdown sum guard. If the model
+ * returns a headline more than 5% off from sum(breakdown), we treat
+ * the response like a validation failure (the wobble on the
+ * 2026-05-26 test call showed bullets summing to ~$238K under a $340K
+ * headline — that gap was hidden, not surfaced, and the rep had no
+ * way to audit it). Catching it client-side surfaces "Rollup paused,
+ * retrying…" instead of shipping a misleading number. */
+const SUM_TOLERANCE = 0.05;
+
+/* Fact kinds that NEVER enter the headline. Stage-1 emits these so
+ * the renderer can surface them for drill-through and audit, but
+ * Stage-2 filters them out of the payload before the rollup model
+ * sees the FACTS list:
+ *
+ *   - `context_only`         — base salaries, hourly rates, headcount
+ *                              stated for context, NOT opportunity.
+ *   - `hypothetical_fix_cost` — prospective ops hires, tool purchases
+ *                              that only happen IF the fix is adopted.
+ *
+ * `stated_total` is NOT excluded here — it's still kept in the
+ * payload AND surfaced via `anchorUsdAnnual` so the model can use it
+ * as both reference and constraint. */
+const EXCLUDED_FROM_HEADLINE_KINDS = new Set([
+  'context_only',
+  'hypothetical_fix_cost',
+]);
+
 /* Stage-2 system prompt. Sent as-is to the configured provider; the
  * Gemini path uses `responseMimeType: 'application/json'` so the
  * model returns parseable JSON without prose preamble. Anthropic /
@@ -130,18 +163,45 @@ const ERROR_THRESHOLD = 3;
  *      catches any model that ignores this rule. */
 const STAGE2_SYSTEM_PROMPT = [
   'You are a financial analyst supporting a live sales conversation.',
-  'You receive (a) a JSON array of discrete, AI-extracted financial facts',
-  'from a call in progress, and (b) the previously-accepted headline',
-  'total. Your job is narrowly scoped:',
+  'You receive (a) a JSON array of discrete, AI-extracted financial',
+  'facts from a call in progress, (b) the previously-accepted headline',
+  'total, and (c) an `anchorUsdAnnual` value — the prospect\'s own',
+  'self-stated total opportunity, or 0 if they haven\'t summed one yet.',
+  'Your job is narrowly scoped:',
   '',
-  '  1. DEDUPE the facts. Identify overlaps where two entries describe',
-  '     the same underlying dollar stream from different angles',
-  '     ("we spend $50K on consultants" + "consulting line item is',
-  '     $4K/mo") and keep only ONE in the sum. Mention dropped',
-  '     duplicates in `assumptions`.',
-  '  2. IGNORE facts whose id appears in the `supersedes` field of a',
+  '  1. DEDUPE the facts. Two facts about the SAME UNDERLYING ACTIVITY,',
+  '     measured two different ways, count ONCE — not twice. This is',
+  '     the load-bearing dedupe axis; we lose money to it constantly.',
+  '     Common patterns to collapse:',
+  '       - "team duplicate work" via "12 people × 4 hrs/wk × $40" AND',
+  '         "team duplicate work" via "25 hrs/wk total × $40" — these',
+  '         are the same activity from two angles. Keep the higher-',
+  '         confidence row, drop the other.',
+  '       - "consulting spend" via "$50K/yr" AND via "$4K/mo" — same',
+  '         dollar stream, drop one.',
+  '       - "his admin time" billed at his salary rate AND at his',
+  '         strategic-work rate — same hours; pick ONE rate (prefer',
+  '         strategic when stated) and drop the other.',
+  '     For each dropped duplicate add an entry to `assumptions` like',
+  '     "dropped duplicate: <basis> via <alt formula>".',
+  '  2. ANCHOR. If `anchorUsdAnnual` is non-zero, that is the LATEST',
+  '     `stated_total` from the prospect — the speaker explicitly',
+  '     summed their own opportunity. The headline MUST land within',
+  '     ±20% of it. The anchor is GROUND TRUTH:',
+  '       - If your bottom-up sum of components naturally lands HIGHER',
+  '         than anchor × 1.2, drop the lowest-confidence components',
+  '         until the headline fits the window. Note the dropped',
+  '         components in `assumptions`.',
+  '       - If your bottom-up sum lands LOWER than anchor × 0.8, keep',
+  '         the headline at the anchor itself and surface the gap as',
+  '         an assumption ("anchor higher than identified components',
+  '         by $X — likely covering indirect costs not itemised").',
+  '     Do not exceed the anchor band without a `correction: true`',
+  '     entry justifying it. When `anchorUsdAnnual` is 0 or missing,',
+  '     this rule does not apply.',
+  '  3. IGNORE facts whose id appears in the `supersedes` field of a',
   '     newer fact — those entries have been replaced.',
-  '  3. ANNUALISE each remaining fact to USD and SUM them to produce',
+  '  4. ANNUALISE each remaining fact to USD and SUM them to produce',
   '     `headlineUsdAnnual`. Conversions when the unit is not USD:',
   '       - hours/week × 52 × stated_hourly_rate_if_known (else note',
   '         "rate not stated" and carry the row at $0).',
@@ -153,16 +213,24 @@ const STAGE2_SYSTEM_PROMPT = [
   '         a note at $0.',
   '       - period "one_time" → leave as-is, do NOT annualise; note',
   '         "one-time" in the row.',
-  '  4. Each breakdown row must cite the source fact\'s `id` so the UI',
+  '  5. HEADLINE = SUM(BREAKDOWN). The `headlineUsdAnnual` field MUST',
+  '     equal the sum of `amountUsdAnnual` across all `breakdown` rows',
+  '     (within 5% rounding tolerance). If they disagree, the rollup',
+  '     is rejected client-side and the previous-good headline stays',
+  '     stale until the next tick. Do not put a "summary" number in',
+  '     the headline that isn\'t reflected in the visible bullets.',
+  '  6. Each breakdown row must cite the source fact\'s `id` so the UI',
   '     can drill through to the anchor quote. Use the literal string',
   '     "derived" only when a row is the sum of two facts (the dedupe',
   '     winner).',
-  '  5. Confidence rubric:',
+  '  7. Confidence rubric:',
   '       - high   → all facts have explicit amounts/units/periods,',
-  '                  ≤1 inferred conversion, no unresolved duplicates.',
+  '                  ≤1 inferred conversion, no unresolved duplicates,',
+  '                  and (when an anchor is set) headline within',
+  '                  ±10% of anchor.',
   '       - medium → 1-2 inferred conversions OR 1 likely double-count.',
   '       - low    → >2 inferences, OR >1 unresolved double-count, OR',
-  '                  contradictory facts.',
+  '                  contradictory facts, OR anchor divergence > 10%.',
   '',
   '*** MONOTONIC CONSTRAINT (LOAD-BEARING) ***',
   '',
@@ -177,18 +245,22 @@ const STAGE2_SYSTEM_PROMPT = [
   '    (b) you set a top-level `correctionReason` string in the',
   '        response explaining WHY a decrease is justified (e.g. a',
   '        dedupe pass uncovered a previously-missed double-count',
-  '        worth $X).',
+  '        worth $X), OR',
   '',
-  '  If neither condition holds, KEEP the previous headline value.',
+  '    (c) the new headline is being pulled DOWN to fit the',
+  '        `anchorUsdAnnual` band (in which case set `correctionReason`',
+  '        to "anchor enforcement: clamping to stated_total band").',
+  '',
+  '  If none of (a)/(b)/(c) holds, KEEP the previous headline value.',
   '  Code-side enforcement will REJECT a smaller headline with neither',
-  '  (a) nor (b) — producing one will mark the rollup card stale until',
-  '  the next tick. The rule is "add-only by default"; corrections',
-  '  are the ONLY exception.',
+  '  justification — producing one will mark the rollup card stale',
+  '  until the next tick. The rule is "add-only by default";',
+  '  corrections and anchor enforcement are the ONLY exceptions.',
   '',
   '  If a `correction: true` entry IS present, you SHOULD adjust the',
   '  headline accordingly (the prospect explicitly revised a figure).',
   '',
-  '6. Return JSON only, matching the schema. No prose outside the JSON.',
+  '8. Return JSON only, matching the schema. No prose outside the JSON.',
   '   Omit `correctionReason` (or set it to null) when there is no',
   '   correction in play — populating it with empty/filler text would',
   '   bypass the monotonic constraint.',
@@ -322,29 +394,100 @@ function normaliseRollup(raw, updatedAt) {
 }
 
 /**
- * Code-side monotonic enforcement (post-test-call fixes batch 2 /
- * Issue 3 — add-only headline). Returns `{ ok: true }` when the new
- * rollup is acceptable or `{ ok: false, reason }` when it should be
- * rejected.
+ * Annualise a `stated_total` fact into a USD-per-year figure for
+ * anchor enforcement. Returns null when the entry can't be sensibly
+ * annualised — those entries don't anchor the rollup (we'd rather
+ * have no anchor than a wrong one).
  *
- * Acceptance criteria:
- *   - newHeadline >= previousHeadline                       → ok
- *   - newHeadline <  previousHeadline AND at least one      → ok
+ * Mirrors the period conversions the Stage-2 model is told to apply
+ * in the system prompt; kept here as code so the anchor math doesn't
+ * depend on the model returning the right number.
+ */
+function annualiseStatedTotal(entry) {
+  if (!entry || entry.unit !== 'usd') return null;
+  if (!Number.isFinite(entry.amount)) return null;
+  switch (entry.period) {
+    case 'annual':
+      return entry.amount;
+    case 'monthly':
+      return entry.amount * 12;
+    case 'weekly':
+      return entry.amount * 52;
+    case 'quarterly':
+      return entry.amount * 4;
+    case 'one_time':
+      // A one-time figure isn't a recurring opportunity; don't let it
+      // anchor the rollup. The fact is still kept for drill-through.
+      return null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Pick the LATEST `stated_total` entry from the active set and return
+ * its annualised USD value. Returns 0 when no stated_total exists
+ * (the Stage-2 prompt treats 0 as "no anchor; skip the constraint").
+ *
+ * "Latest" is chosen by `recordedAt`. A speaker who revises their
+ * estimate ("I was thinking $80K but really it's more like $120K")
+ * gets the newer number used as the anchor.
+ */
+function pickAnchorUsdAnnual(activeEntries) {
+  if (!Array.isArray(activeEntries) || activeEntries.length === 0) return 0;
+  let best = null;
+  for (const entry of activeEntries) {
+    if (!entry || entry.kind !== 'stated_total') continue;
+    const annual = annualiseStatedTotal(entry);
+    if (annual === null) continue;
+    if (!best || (entry.recordedAt || 0) > (best.recordedAt || 0)) {
+      best = { ...entry, _annual: annual };
+    }
+  }
+  return best ? best._annual : 0;
+}
+
+/**
+ * Code-side monotonic enforcement + anchor ceiling. Returns
+ * `{ ok: true }` when the new rollup is acceptable or
+ * `{ ok: false, reason }` when it should be rejected.
+ *
+ * Acceptance criteria (checks run top-down; first failure wins):
+ *   - anchorUsdAnnual > 0 AND headline > anchor × 1.2          → REJECT
+ *   - newHeadline >= previousHeadline                          → ok
+ *   - newHeadline <  previousHeadline AND at least one         → ok
  *     active entry has correction === true
- *   - newHeadline <  previousHeadline AND `correctionReason` → ok
+ *   - newHeadline <  previousHeadline AND `correctionReason`   → ok
  *     is a non-empty string
- *   - newHeadline <  previousHeadline with neither           → REJECT
+ *   - newHeadline <  previousHeadline with neither             → REJECT
  *
  * The first-pass case (`previousHeadline` null/undefined) is also
- * accepted — there's nothing to compare against on the very first
- * rollup of a session.
+ * accepted for the monotonic check — there's nothing to compare
+ * against on the very first rollup of a session — but the anchor
+ * ceiling still applies if one has been stated.
  *
  * @param {{ headlineUsdAnnual: number, correctionReason: string | null }} newRollup
  * @param {number | null} previousHeadline
  * @param {Array<{ correction?: boolean }>} activeEntries
+ * @param {number} anchorUsdAnnual
  * @returns {{ ok: true } | { ok: false, reason: string }}
  */
-function enforceMonotonicConstraint(newRollup, previousHeadline, activeEntries) {
+function enforceMonotonicConstraint(newRollup, previousHeadline, activeEntries, anchorUsdAnnual) {
+  // Anchor ceiling: when the prospect has stated their own total, a
+  // headline more than 20% above it almost certainly means the model
+  // double-counted or invented a component. Reject regardless of
+  // monotonic state — anchor wins over add-only. (The PROSPECT'S
+  // self-stated number is the ground truth, not whatever the model
+  // re-derived.)
+  if (Number.isFinite(anchorUsdAnnual) && anchorUsdAnnual > 0) {
+    const ceiling = anchorUsdAnnual * (1 + ANCHOR_TOLERANCE);
+    if (Number.isFinite(newRollup.headlineUsdAnnual) && newRollup.headlineUsdAnnual > ceiling) {
+      return {
+        ok: false,
+        reason: `headline ${newRollup.headlineUsdAnnual} exceeds anchor ceiling ${ceiling.toFixed(0)} (anchor=${anchorUsdAnnual}, +${(ANCHOR_TOLERANCE * 100).toFixed(0)}%)`,
+      };
+    }
+  }
   if (previousHeadline === null || previousHeadline === undefined) {
     return { ok: true };
   }
@@ -374,6 +517,10 @@ function enforceMonotonicConstraint(newRollup, previousHeadline, activeEntries) 
  * model can reason about conversions, double-counts, and explicit
  * revisions.
  *
+ * Entries with `kind` in EXCLUDED_FROM_HEADLINE_KINDS (context_only,
+ * hypothetical_fix_cost) are FILTERED OUT here — they exist on the
+ * factsSheet for drill-through but must never enter the rollup math.
+ *
  * `previousHeadlineUsdAnnual` is included even when null/0 so the
  * model sees a stable schema and the monotonic-constraint
  * instructions in the system prompt remain anchored on a concrete
@@ -381,11 +528,19 @@ function enforceMonotonicConstraint(newRollup, previousHeadline, activeEntries) 
  * regardless — the prompt copy is the model's first line of
  * defence; the enforcer is the second.
  *
+ * `anchorUsdAnnual` is 0 when no `stated_total` is on the sheet, or
+ * the annualised USD value of the LATEST stated_total. Stage-2 uses
+ * it to clamp the headline within ±20% of what the prospect said.
+ *
  * @param {Array<object>} activeEntries
  * @param {number | null} previousHeadlineUsdAnnual
+ * @param {number} anchorUsdAnnual
  */
-function buildStage2UserMessage(activeEntries, previousHeadlineUsdAnnual) {
-  const json = activeEntries.map((entry) => ({
+function buildStage2UserMessage(activeEntries, previousHeadlineUsdAnnual, anchorUsdAnnual) {
+  const includedEntries = activeEntries.filter(
+    (entry) => entry && !EXCLUDED_FROM_HEADLINE_KINDS.has(entry.kind),
+  );
+  const json = includedEntries.map((entry) => ({
     id: entry.id,
     kind: entry.kind,
     amount: entry.amount,
@@ -401,13 +556,17 @@ function buildStage2UserMessage(activeEntries, previousHeadlineUsdAnnual) {
     `previousHeadlineUsdAnnual: ${
       Number.isFinite(previousHeadlineUsdAnnual) ? previousHeadlineUsdAnnual : 0
     }`,
+    `anchorUsdAnnual: ${Number.isFinite(anchorUsdAnnual) ? anchorUsdAnnual : 0}`,
     '',
-    'FACTS (active, after supersedes filter):',
+    'FACTS (active, after supersedes filter and excluded-kind filter):',
     JSON.stringify(json, null, 2),
     '',
-    'Return the rollup JSON. Remember: NEVER decrease the headline',
-    'unless an entry has `correction: true` OR you provide a',
-    '`correctionReason` string in the response.',
+    'Return the rollup JSON. Remember:',
+    ' - NEVER decrease the headline unless an entry has `correction: true`',
+    '   OR you provide a `correctionReason` string OR you are clamping to',
+    '   the anchor band.',
+    ' - If anchorUsdAnnual > 0, the headline MUST land within ±20% of it.',
+    ' - The headline MUST equal the sum of the breakdown rows.',
   ].join('\n');
 }
 
@@ -523,7 +682,13 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
       return;
     }
 
-    const userMessage = buildStage2UserMessage(entries, lastAcceptedHeadline);
+    // Compute the anchor BEFORE filtering — `stated_total` entries
+    // must be considered even though they're not part of the
+    // breakdown math themselves. Anchor pickup uses the full active
+    // set; the model's view of FACTS is filtered down inside
+    // buildStage2UserMessage().
+    const anchorUsdAnnual = pickAnchorUsdAnnual(entries);
+    const userMessage = buildStage2UserMessage(entries, lastAcceptedHeadline, anchorUsdAnnual);
     inFlight = true;
     try {
       const result = await provider.generateContent({
@@ -556,14 +721,47 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
         return;
       }
       const normalised = normaliseRollup(parsed, Date.now());
-      // Monotonic constraint: reject any decrease that lacks a
-      // justification (correction flag or correctionReason). On
-      // rejection the previous lastGoodRollup is re-broadcast with
-      // stale=true and the failure counter ticks toward the
-      // error-threshold so a model that keeps trying to decrease
-      // unjustifiably eventually surfaces "Rollup unavailable" to
-      // the rep.
-      const monotonic = enforceMonotonicConstraint(normalised, lastAcceptedHeadline, entries);
+
+      // Headline-vs-breakdown sum guard. The Stage-2 model has been
+      // told the headline MUST equal the sum of the breakdown rows;
+      // we enforce that client-side because Window-2 / Window-3 of
+      // the 2026-05-26 test call shipped bullets summing to ~$238K
+      // under a $340K headline — the rep had a visible card that
+      // didn't add up. Reject any response where the gap exceeds 5%
+      // and re-broadcast the previous-good with stale=true.
+      const breakdownSum = Array.isArray(normalised.breakdown)
+        ? normalised.breakdown.reduce(
+            (acc, row) => acc + (Number.isFinite(row.amountUsdAnnual) ? row.amountUsdAnnual : 0),
+            0,
+          )
+        : 0;
+      const headline = normalised.headlineUsdAnnual;
+      if (Number.isFinite(headline) && headline > 0 && breakdownSum > 0) {
+        const divergence = Math.abs(headline - breakdownSum) / Math.max(headline, breakdownSum);
+        if (divergence > SUM_TOLERANCE) {
+          recordFailure(
+            `headline_sum_mismatch: headline=${headline} sum=${breakdownSum.toFixed(0)} divergence=${(divergence * 100).toFixed(1)}%`,
+            entries,
+            raw,
+          );
+          return;
+        }
+      }
+
+      // Monotonic constraint + anchor ceiling: reject any decrease
+      // that lacks a justification (correction flag, correctionReason,
+      // or anchor enforcement) and reject any headline more than 20%
+      // above the prospect's own stated total. On rejection the
+      // previous lastGoodRollup is re-broadcast with stale=true and
+      // the failure counter ticks toward the error-threshold so a
+      // model that keeps trying to drift unjustifiably eventually
+      // surfaces "Rollup unavailable" to the rep.
+      const monotonic = enforceMonotonicConstraint(
+        normalised,
+        lastAcceptedHeadline,
+        entries,
+        anchorUsdAnnual,
+      );
       if (!monotonic.ok) {
         recordFailure(`monotonic_violation: ${monotonic.reason}`, entries, raw);
         return;

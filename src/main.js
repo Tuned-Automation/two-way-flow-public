@@ -314,8 +314,37 @@ app.commandLine.appendSwitch(
   'WebRTC-Audio-EchoCanceller3/Enabled/',
 );
 
-const WINDOW_WIDTH = 720;
-const WINDOW_HEIGHT = 440;
+/* Floating-overlay window geometry.
+ *
+ * The original 720×440 default was too tight for the v1.1.0 header — the
+ * accumulated row of pills (You / Other / AEC / Connection / Version) +
+ * the right-side controls (gear, Signalled|Automated mode toggle, Start,
+ * minimise, close) requires ~950px of header content width once the
+ * grid-template-columns:1fr auto 1fr forces both 1fr tracks to match
+ * the controls cluster. At 720px the Start button was clipped to "St"
+ * and the captured pane on the right rendered with its edge cropped.
+ *
+ * WINDOW_MIN_* is a soft floor — `resizable: true` lets the user pull
+ * the overlay smaller for narrow displays, but Chromium will refuse to
+ * go below the min so the header layout never collapses entirely. The
+ * outer .coach card carries the visible drop-shadow via box-shadow, so
+ * the window dimensions include 20-28px of transparent gutter for the
+ * shadow to render into (see .coach { margin } in src/index.css). */
+const WINDOW_WIDTH = 1100;
+const WINDOW_HEIGHT = 520;
+/* WINDOW_MIN_WIDTH must remain >= rail(60) + transcript_floor(360) +
+ * captured_min(160) + 2 × col-splitter(4) + body horizontal padding (~0).
+ * Inner pane clamps live in src/renderer.js — see mountSplitter() and
+ * the .coach__body grid-template-columns rule in src/index.css. If you
+ * drop this below ~600 the captured-pane container queries collapse
+ * to the single-column branch and the row of ask buttons starts
+ * hiding labels — see the reflow rules in
+ * /Users/taylor/.cursor/plans/resizable_internal_panes_4bf4f174.plan.md
+ * (sections D1/D2). The plan keeps 960 as the floor so the header
+ * pill cluster (You / Other / AEC / Connection / Version) doesn't
+ * collapse either. */
+const WINDOW_MIN_WIDTH = 960;
+const WINDOW_MIN_HEIGHT = 440;
 const EDGE_MARGIN = 20;
 
 /**
@@ -741,6 +770,99 @@ let kickstartTimer = null;
 const KICKSTART_DELAY_MS = 10_000;
 
 /**
+ * One-shot latch: has the kickstart timer ALREADY fired (i.e.
+ * actually requested an opening suggestion) for the current session?
+ * Set inside armKickstart's timer callback at the moment the
+ * coach.requestSuggestion call goes out; reset to false in
+ * resetCoachContext() so a fresh session re-arms cleanly.
+ *
+ * Combined with `kickstartTimer` (the in-flight timer reference) this
+ * forms a small state machine that lets coach:set-mode call
+ * armKickstart() safely after a session is already underway: if the
+ * kickstart has already fired this session, the re-arm is a no-op so
+ * the rep doesn't get a duplicate opening question.
+ */
+let kickstartFired = false;
+
+/**
+ * Arm the one-shot coach kickstart. Two call sites:
+ *
+ *   1. `gemini:start`, once liveSession.open() succeeds — covers the
+ *      "user starts a session already in automated mode" path.
+ *   2. `coach:set-mode`, when the rep flips signalled → automated
+ *      mid-session — covers the gap that surfaced on the 2026-05-26
+ *      test call where the rep started in signalled, flipped to
+ *      automated, and nothing happened until they manually asked the
+ *      first question. The original code armed kickstart ONCE at
+ *      session start so the post-flip session sat silent.
+ *
+ * Behaviour:
+ *   - No-op if `kickstartFired` (already done this session).
+ *   - No-op if `coachMode !== 'automated'` at arm time (with silent-
+ *     failure logging — this IS the expected case when the rep is
+ *     still in signalled mode at session start, but logging it lets
+ *     us audit unexpected arms after a flip).
+ *   - Otherwise clears any previously-armed timer and arms a fresh
+ *     KICKSTART_DELAY_MS-second one. The timer callback re-checks the
+ *     session, mode, and pin state before firing so a teardown / flip
+ *     during the wait window cleanly cancels the fire.
+ *
+ * Side-effect contract: only writes `kickstartTimer` (timer
+ * reference) and `kickstartFired` (latch). Reads `coachMode`,
+ * `coachSession`, and a method on coachSession.
+ */
+function armKickstart() {
+  if (kickstartFired) {
+    return;
+  }
+  if (coachMode !== 'automated') {
+    console.warn(
+      '[coach-silent-failure] armKickstart: skipped — coachMode is',
+      coachMode,
+    );
+    return;
+  }
+  if (kickstartTimer) clearTimeout(kickstartTimer);
+  kickstartTimer = setTimeout(() => {
+    kickstartTimer = null;
+    if (!coachSession) {
+      console.warn('[coach-silent-failure] kickstart fired but coachSession is null');
+      return;
+    }
+    if (coachMode !== 'automated') {
+      console.warn(
+        '[coach-silent-failure] kickstart timer fired but coachMode is now',
+        coachMode,
+      );
+      return;
+    }
+    if (coachSession.hasPinnedSuggestion?.()) {
+      console.log('[kickstart] skipped — pinned suggestion already present');
+      return;
+    }
+    kickstartFired = true;
+    console.log('[kickstart] firing opening question');
+    coachSession.requestSuggestion({ kind: 'next' });
+  }, KICKSTART_DELAY_MS);
+}
+
+/**
+ * Per-guard "have we already logged the silent-failure warning since
+ * the last mode flip?" latches. Each value flips to true on the
+ * first console.warn for that guard, then stays true until the next
+ * coach:set-mode transition resets all three back to false. Throttles
+ * the 5s pause-nudge tick (which would otherwise spam the console in
+ * signalled mode) while still surfacing one audit line per
+ * transition. The auto-reformulate guards see fewer fires (once per
+ * pinned suggestion) but follow the same pattern for consistency.
+ */
+const silentFailureLogged = {
+  pauseNudge: false,
+  reformulateArm: false,
+  reformulateFire: false,
+};
+
+/**
  * Advanced → Auto-reformulate: re-fire 10s after a pinned suggestion
  * that the seller hasn't asked. Lives at module scope so the IPC
  * handlers (skip / boost / ask) can cancel it from outside the
@@ -795,6 +917,10 @@ function resetCoachContext() {
   // of its own transcript rather than skipping the opening turns.
   factsScannerCursor = 0;
   currentPinnedSuggestionId = null;
+  // Reset the kickstart latch so the next session's armKickstart()
+  // call can fire (whether from gemini:start or from a mid-session
+  // signalled → automated flip via coach:set-mode).
+  kickstartFired = false;
   // Treat the session start as "fresh transcript activity" so the
   // pause detector doesn't immediately trip on an empty buffer.
   lastTranscriptAt = Date.now();
@@ -1027,7 +1153,16 @@ function markTranscriptActivity() {
  * dropped on top of one they haven't acted on yet.
  */
 function maybeFirePauseNudge() {
-  if (coachMode !== 'automated') return;
+  if (coachMode !== 'automated') {
+    if (!silentFailureLogged.pauseNudge) {
+      console.warn(
+        '[coach-silent-failure] maybeFirePauseNudge: skipped — coachMode is',
+        coachMode,
+      );
+      silentFailureLogged.pauseNudge = true;
+    }
+    return;
+  }
   if (!coachSession) return;
   if (pendingPauseFired) return;
   if (coachSession.hasPinnedSuggestion?.()) return;
@@ -1481,6 +1616,89 @@ function applyMarkAsked({ suggestionId, evidence }) {
 }
 
 /**
+ * Manual mark-as-asked helper. Wraps the same `applyMarkAsked`
+ * side-effects the AI-driven path uses (flip entry.asked + cancel the
+ * reformulate timer + stamp the recap window) and additionally
+ * transitions the entry's rubric item to `'logged'` so the next coach
+ * tick's `formatCoachState` candidate list naturally drops it.
+ *
+ * The extra item-state transition is intentionally manual-path only:
+ * when the AI fires `mark_question_asked` it typically pairs the call
+ * with its own `update_item_state` for coverage off the prospect's
+ * answer, so the AI path doesn't need this nudge. The rep clicking
+ * the tick has no such guarantee — without this we'd flip the
+ * suggestion green but the model could still resurface the same item
+ * one tick later.
+ *
+ * Returns the same `{ changed, alreadyAsked }` discriminator both
+ * call sites (the IPC handler + a hypothetical future caller) can use
+ * to decide whether to broadcast. Idempotent — a second call for an
+ * already-asked entry resolves with `{ changed: false, alreadyAsked:
+ * true }` and skips the item-state side-effect.
+ *
+ * `source` is forwarded onto the `scoring:item-state` IPC so the
+ * renderer can distinguish manual marks from model-driven ones for
+ * future debugging / audit.
+ *
+ * Freeform sentinels (`freeform.deeper`, `freeform.recap`) carry no
+ * rubric item, so the transition step is skipped for those — there's
+ * no item to log. The asked-flip still runs.
+ */
+function markSuggestionAskedManual({ suggestionId, source }) {
+  const entry = coachContext.suggestionHistory.get(suggestionId);
+  if (!entry) return { changed: false, alreadyAsked: false, unknown: true };
+  if (entry.asked) return { changed: false, alreadyAsked: true };
+
+  const evidence = entry.questionText
+    ? `Manually marked asked by rep: "${entry.questionText}"`
+    : 'Manually marked asked by rep';
+  const changed = applyMarkAsked({ suggestionId, evidence });
+  if (!changed) return { changed: false, alreadyAsked: true };
+
+  // Stamp the coach's in-memory skip set so the model drops the item
+  // from its candidate pool on the next tick. The itemStates update
+  // below is additive — it makes the rubric row green in the rail
+  // drawer — but `formatCoachState` only EXCLUDES candidates that
+  // are in `coveredSet` or `skippedSet`, NOT items in the `logged`
+  // bucket. Without this skip-set stamp, an over-eager model could
+  // still pick the same item one tick later despite the asked flip.
+  // No-op for freeform sentinels (handled inside markItemAsAsked).
+  if (coachSession && entry.itemId) {
+    coachSession.markItemAsAsked(entry.itemId);
+  }
+
+  if (entry.itemId && !entry.itemId.startsWith('freeform.')) {
+    const prev = coachContext.itemStates.get(entry.itemId);
+    const isTerminal = prev?.state === 'covered' || prev?.state === 'logged';
+    if (!isTerminal) {
+      const updated = {
+        state: 'logged',
+        evidence: entry.questionText || evidence,
+        confidence: prev?.confidence ?? 0.8,
+        at: Date.now(),
+        source: source || 'manual_mark_asked',
+      };
+      coachContext.itemStates.set(entry.itemId, updated);
+      console.log(
+        '[coach] manual mark-asked → logged:',
+        entry.itemId,
+        '—',
+        entry.questionText,
+      );
+      send('scoring:item-state', {
+        itemId: entry.itemId,
+        state: updated.state,
+        evidence: updated.evidence,
+        confidence: updated.confidence,
+        source: updated.source,
+      });
+    }
+  }
+
+  return { changed: true, alreadyAsked: false };
+}
+
+/**
  * Arm the 10s auto-reformulate timer for the currently-pinned
  * suggestion. Called from `onSuggestion` after a new pin lands.
  * Reads the live Advanced settings each time so flipping the toggle
@@ -1505,7 +1723,16 @@ function armReformulateTimer(suggestionId) {
   // hard upper bound on automatic coach activity. Test-call note 5
   // surfaced the leak: signalled mode was still firing reformulates
   // every 10s of an unasked pin.
-  if (coachMode !== 'automated') return;
+  if (coachMode !== 'automated') {
+    if (!silentFailureLogged.reformulateArm) {
+      console.warn(
+        '[coach-silent-failure] armReformulateTimer: skipped — coachMode is',
+        coachMode,
+      );
+      silentFailureLogged.reformulateArm = true;
+    }
+    return;
+  }
   reformulateTimer = setTimeout(() => {
     reformulateTimer = null;
     if (!coachSession) return;
@@ -1520,7 +1747,16 @@ function armReformulateTimer(suggestionId) {
     // flipped from automated → signalled during the window.
     const live = getCoach();
     if (!live?.trackQuestionState || !live?.autoReformulate) return;
-    if (coachMode !== 'automated') return;
+    if (coachMode !== 'automated') {
+      if (!silentFailureLogged.reformulateFire) {
+        console.warn(
+          '[coach-silent-failure] reformulate timer fired but coachMode is now',
+          coachMode,
+        );
+        silentFailureLogged.reformulateFire = true;
+      }
+      return;
+    }
     console.log('[coach] auto-reformulating pinned suggestion:', entry.itemId);
     coachSession.requestSuggestion({ kind: 'reformulate', itemId: entry.itemId });
   }, REFORMULATE_DELAY_MS);
@@ -1545,12 +1781,38 @@ const createWindow = () => {
   const mainWindow = new BrowserWindow({
     width: WINDOW_WIDTH,
     height: WINDOW_HEIGHT,
+    minWidth: WINDOW_MIN_WIDTH,
+    minHeight: WINDOW_MIN_HEIGHT,
     x,
     y,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
-    resizable: false,
+    /* Resizable so the user can pull the overlay narrower on small
+     * displays. The Chromium-enforced min above keeps the header
+     * controls from being clipped at whatever the floor ends up being. */
+    resizable: true,
+    /* hasShadow: false is REQUIRED on macOS for this overlay.
+     *
+     * With frame:false + transparent:true, current macOS still draws
+     * a native NSWindow shadow around the alpha mask of the rendered
+     * content. That OS shadow stacks on top of .coach's CSS
+     * box-shadow and rasterises as a sharp ~1px ring tracing the
+     * rounded perimeter of the card — exactly the "ugly outline"
+     * users see (and have reported twice now). The macOS shadow
+     * renderer samples the alpha edge of whatever the renderer
+     * paints; even the soft outer pixels of our CSS box-shadow are
+     * enough to anchor a native ring around them.
+     *
+     * The CSS box-shadow in src/index.css alone is sufficient for
+     * elevation — see the comment on `.coach` for the two-layer
+     * recipe. Disabling the native shadow here removes the
+     * conflicting second layer and the outline goes away.
+     *
+     * Background: this is the canonical Electron-on-macOS workaround
+     * (electron/electron#8847, #21173). hasShadow:false is the
+     * recommended pattern for any transparent + frameless window
+     * that draws its own shadow in CSS. */
     hasShadow: false,
     skipTaskbar: false,
     backgroundColor: '#00000000',
@@ -2781,21 +3043,11 @@ function registerIpcHandlers() {
     // model naturally lands on an agenda / "what brings us together
     // today" prompt. Cancelled by teardownSession() on Stop.
     //
-    // Gated on coachMode === 'automated' so signalled mode is TRULY
-    // silent — the rep gets a suggestion only when they click one of
-    // the Suggest / Deeper / Pivot / Recap buttons. Test-call note 5
-    // surfaced this leak: even in signalled mode the 10s kickstart was
-    // firing and surfacing an opening question the rep hadn't asked for.
-    if (kickstartTimer) clearTimeout(kickstartTimer);
-    if (coachMode === 'automated') {
-      kickstartTimer = setTimeout(() => {
-        kickstartTimer = null;
-        if (!coachSession) return;
-        if (coachSession.hasPinnedSuggestion?.()) return;
-        console.log('[kickstart] firing opening question');
-        coachSession.requestSuggestion({ kind: 'next' });
-      }, KICKSTART_DELAY_MS);
-    }
+    // armKickstart() (defined above) gates on coachMode === 'automated'
+    // and on kickstartFired so a session started in signalled mode no-
+    // ops here; a later coach:set-mode flip to 'automated' will call
+    // armKickstart() again and pick it up cleanly.
+    armKickstart();
 
     return { ok: true };
   });
@@ -3191,11 +3443,59 @@ function registerIpcHandlers() {
     if (mode !== 'automated' && mode !== 'signalled') {
       return { ok: false, error: 'invalid_mode' };
     }
+    const previousMode = coachMode;
     coachMode = mode;
     console.log('[coach] mode set:', mode);
     // Flipping back to signalled mid-session should clear any
     // half-armed pause guard so the next mode flip lights up cleanly.
     if (mode === 'signalled') pendingPauseFired = false;
+    // Reset the silent-failure log latches so each mode transition
+    // gets one fresh audit line per guard. Without this the per-
+    // guard booleans would stick "true" forever after the first
+    // skip, swallowing later transitions that we DO want to see.
+    silentFailureLogged.pauseNudge = false;
+    silentFailureLogged.reformulateArm = false;
+    silentFailureLogged.reformulateFire = false;
+    // signalled → automated mid-session: arm the kickstart so the
+    // coach actually engages within ~10s of the flip. Without this
+    // the test-call session sat silent until the rep manually asked
+    // their first question — the kickstart was armed ONCE at session
+    // start (when coachMode was still 'signalled') and never re-armed
+    // after the flip. armKickstart() is a no-op when kickstartFired
+    // is already true, so flipping back-and-forth doesn't double-fire.
+    if (
+      previousMode === 'signalled'
+      && mode === 'automated'
+      && coachSession
+      && !kickstartFired
+    ) {
+      console.log('[coach] mid-session flip to automated — arming kickstart');
+      armKickstart();
+    }
+    return { ok: true };
+  });
+
+  /**
+   * Manual mark-as-asked tick on the pinned suggestion card. Mirrors
+   * the AI's `mark_question_asked` side-effects (flip entry.asked +
+   * stamp the recap window + cancel the reformulate timer) and
+   * additionally transitions the rubric item to `'logged'` so the
+   * model's next-tick candidate list drops it. The shared
+   * `markSuggestionAskedManual` helper owns the logic so the IPC
+   * surface stays a thin validation layer.
+   *
+   * Idempotent — repeated clicks resolve with `{ ok: true,
+   * alreadyAsked: true }` without re-running the side-effects (which
+   * would otherwise spam scoring:item-state and the suggestion-history
+   * broadcast).
+   */
+  ipcMain.handle('coach:mark-suggestion-asked', (_event, payload) => {
+    const suggestionId = typeof payload?.suggestionId === 'string' ? payload.suggestionId : null;
+    if (!suggestionId) return { ok: false, error: 'missing_suggestion_id' };
+    const result = markSuggestionAskedManual({ suggestionId, source: 'manual_mark_asked' });
+    if (result.unknown) return { ok: false, error: 'unknown_suggestion' };
+    if (result.alreadyAsked) return { ok: true, alreadyAsked: true };
+    if (result.changed) broadcastSuggestionHistory();
     return { ok: true };
   });
 

@@ -102,6 +102,7 @@ const LEVEL_GAIN = 3;
 /* ── DOM refs ──────────────────────────────────────────────────────── */
 
 const coachEl = document.getElementById('coach');
+const coachBodyEl = document.querySelector('.coach__body');
 const recIndicatorEl = document.getElementById('recIndicator'); // eslint-disable-line no-unused-vars
 const recTimerEl = document.getElementById('recTimer');
 const speakerEls = Array.from(document.querySelectorAll('.speaker'));
@@ -112,13 +113,58 @@ const recToggleEl = document.getElementById('recToggle');
 const minButtonEl = document.getElementById('minButton');
 const closeButtonEl = document.getElementById('closeButton');
 const railEl = document.getElementById('pillarRail');
-const transcriptPaneEl = document.getElementById('transcriptPane'); // eslint-disable-line no-unused-vars
+const transcriptPaneEl = document.getElementById('transcriptPane');
 const transcriptListEl = document.getElementById('transcriptList');
 const transcriptErrorEl = document.getElementById('transcriptError');
+const transcriptFooterEl = document.querySelector('.transcript-pane__footer');
+
+/* "Stick to bottom" follow behaviour for the transcript list.
+ *
+ * Classic chat-app pattern: new lines auto-scroll to the bottom ONLY
+ * if the user is already "near" the bottom. If they scroll up to
+ * read earlier turns, we freeze the view; scrolling back near the
+ * bottom resumes the follow.
+ *
+ *   stickToBottomTranscript — module-scope flag. true = follow the
+ *                             live edge; false = the user has
+ *                             scrolled away and we leave the view
+ *                             alone.
+ *
+ *   STICK_TO_BOTTOM_THRESHOLD_PX — distance-from-bottom under which
+ *                                  the listener flips the flag
+ *                                  back on. 80px ≈ ~3 lines, generous
+ *                                  enough that a small upward nudge
+ *                                  doesn't break the follow.
+ *
+ * Wiring (see snapTranscriptToBottomIfStuck + the one-time listener
+ * mount just below renderTranscriptPane):
+ *   - scroll listener on transcriptListEl  →  recomputes the flag
+ *     on every user scroll. Programmatic scrollTop writes also
+ *     bounce through this listener, but they always re-confirm
+ *     distance ≈ 0 so the flag stays true.
+ *   - ResizeObserver on transcriptListEl   →  re-snaps to the bottom
+ *     whenever the visible height changes (drawer drag, captured
+ *     splitter, window resize). If we WERE stuck we stay stuck;
+ *     otherwise the existing scroll position is preserved.
+ *   - clearScoringState                    →  resets the flag to
+ *     true on session start/reset so a fresh call begins in follow
+ *     mode regardless of where the previous session ended up.
+ */
+let stickToBottomTranscript = true;
+const STICK_TO_BOTTOM_THRESHOLD_PX = 80;
 const coachSuggestionEl = document.getElementById('coachSuggestion');
 const coachThinkingDotEl = document.getElementById('coachThinkingDot');
 const capturedPaneEl = document.getElementById('capturedPane');
 const capturedTooltipEl = document.getElementById('capturedTooltip');
+
+/* v3 resizable panes (see plan: resizable_internal_panes_4bf4f174):
+ * three splitter <div>s flank the rail / transcript / captured grid
+ * tracks on .coach__body, plus one inside .transcript-pane between
+ * the list and the pinned drawer footer. mountSplitter() below wires
+ * pointer-drag, dblclick reset, and keyboard nudge for each. */
+const splitterRailEl = document.getElementById('splitterRail');
+const splitterCapturedEl = document.getElementById('splitterCaptured');
+const splitterDrawerEl = document.getElementById('splitterDrawer');
 /* Strategy A / Work-stream C: Quick-fix rollup card.
  *
  * Lives at the top of #capturedPane in index.html (rather than being
@@ -276,6 +322,413 @@ const appearanceColorOtherEl = document.getElementById('appearanceColorOther');
 const appearanceResetBtnEl = document.getElementById('appearanceResetBtn');
 const DEFAULT_TAG_YOU = '#f0f0f0';
 const DEFAULT_TAG_OTHER = '#c7d2fe';
+
+/* ── Layout persistence (v3 — resizable panes) ────────────────────
+ *
+ * Per-device display preference, NOT exportable settings — a wide-
+ * monitor user's 600px captured pane is wrong on a 13" laptop, so
+ * pane sizes deliberately do NOT round-trip through src/settings.js.
+ * Stored under localStorage `twf.layout.v1`; bumping to v2 in a
+ * future plan lets us drop saved values cleanly if the shape
+ * changes.
+ *
+ * Shape:
+ *   {
+ *     railWidth: number,             // px on .coach__body --rail-w
+ *     capturedWidth: number,         // px on .coach__body --captured-w
+ *     drawerHeight: number | null,   // px on .transcript-pane
+ *                                    // --drawer-h; null = "auto"
+ *     lastNonZeroDrawerHeight: number // saved separately so a new
+ *                                    // coach:suggestion can auto-
+ *                                    // pop the drawer back open
+ *                                    // when the user collapsed it
+ *                                    // to 0 — explicit user ask:
+ *                                    // don't miss new suggestions.
+ *   }
+ *
+ * Clamp ranges (kept in sync with the .coach__body grid-template-
+ * columns rule in src/index.css):
+ *
+ *   --rail-w        60–240px   (default 60; collapsed icons; >~140px
+ *                                reveals .pillar__label via a
+ *                                container query on .rail)
+ *   --captured-w    160–dyn    (default 200; dyn-max =
+ *                                bodyWidth − rail − 360 − 8)
+ *   --drawer-h      0–280px    (default unset = auto / content-driven)
+ */
+const LAYOUT_STORAGE_KEY = 'twf.layout.v1';
+const LAYOUT_DEFAULTS = Object.freeze({
+  railWidth: 60,
+  capturedWidth: 200,
+});
+const RAIL_W_MIN = 60;
+const RAIL_W_MAX = 240;
+const CAPTURED_W_MIN = 160;
+const TRANSCRIPT_W_FLOOR = 360;
+const COL_SPLITTER_SLACK = 8; // 2 col-splitters × 4px
+const DRAWER_H_MIN = 0;
+const DRAWER_H_MAX = 280;
+/* Minimum visible transcript-list height the drawer is allowed to
+ * crowd down to. Pairs with the `max-height: calc(100% - 80px)`
+ * cap on .transcript-pane__footer in src/index.css — both numbers
+ * MUST stay in sync. ~80px ≈ 3 lines of transcript + the 4px row
+ * splitter, which is the minimum the user can still read while
+ * keeping the drawer pinned at the bottom. */
+const DRAWER_LIST_MIN_H = 80;
+/* Epsilon for "the drawer is effectively collapsed" — anything ≤1px
+ * counts as 0 so a hairline rounded-down value still triggers the
+ * auto-pop on the next coach:suggestion. */
+const DRAWER_COLLAPSE_EPSILON = 1;
+
+function loadLayout() {
+  try {
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLayout(patch) {
+  const next = { ...loadLayout(), ...patch };
+  try {
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    /* quota / disabled — non-fatal, sizes just won't persist */
+  }
+}
+
+/* Apply BEFORE first paint to avoid a width flash on boot. Runs
+ * synchronously here (script is type=module mounted at end of body
+ * so all referenced DOM nodes exist). The CSS defaults on
+ * .coach__body / .transcript-pane already render an indistinguishable
+ * layout if no values are stored. */
+(function applyLayoutFromStorage() {
+  if (!coachBodyEl) return;
+  const saved = loadLayout();
+  if (Number.isFinite(saved.railWidth)) {
+    const v = Math.max(RAIL_W_MIN, Math.min(RAIL_W_MAX, saved.railWidth));
+    coachBodyEl.style.setProperty('--rail-w', `${v}px`);
+  }
+  if (Number.isFinite(saved.capturedWidth)) {
+    /* Lower clamp only here; the dynamic upper clamp depends on the
+     * live body width which isn't reliable pre-paint, so we let the
+     * splitter re-clamp on its first drag. */
+    const v = Math.max(CAPTURED_W_MIN, saved.capturedWidth);
+    coachBodyEl.style.setProperty('--captured-w', `${v}px`);
+  }
+  if (transcriptPaneEl && Number.isFinite(saved.drawerHeight)) {
+    const v = Math.max(DRAWER_H_MIN, Math.min(DRAWER_H_MAX, saved.drawerHeight));
+    transcriptPaneEl.style.setProperty('--drawer-h', `${v}px`);
+  }
+})();
+
+/* Single-call splitter mounter. One DOM element per seam, identical
+ * mechanic for col-resize and row-resize.
+ *
+ * Behaviour:
+ *   - pointerdown  → snapshot start coord + start px, setPointerCapture,
+ *                    data-dragging='true' so the hover tint stays locked.
+ *   - pointermove  → compute delta (× invert), clamp to [min, max()],
+ *                    write the css var on targetEl.
+ *   - pointerup    → release capture, persist.
+ *   - dblclick     → reset to resetPx (or remove the var when
+ *                    resetPx is null, restoring "auto" behaviour for
+ *                    --drawer-h).
+ *   - keydown      → ArrowKeys ±16px (Shift ×4), Home/End → min/max.
+ *
+ * `getCurrentPx()` returns the LIVE px (read from DOM rather than
+ * the css var) so dragging always starts from what the user sees,
+ * even when the var is unset ("auto" drawer height) or being shaped
+ * by the container.
+ *
+ * `max` can be a callable: the captured splitter's upper bound
+ * depends on .coach__body.clientWidth − rail − transcript_floor − two
+ * col-splitter widths, all computed on each drag step.
+ *
+ * `invert` reverses the drag direction so the wiring stays
+ * consistent: ArrowRight / ArrowDown always means "move the
+ * separator that direction" — for the rail splitter that grows
+ * --rail-w; for the captured splitter that shrinks --captured-w;
+ * for the drawer splitter that shrinks --drawer-h. */
+function mountSplitter({
+  el,
+  axis, // 'col' | 'row'
+  cssVar, // '--rail-w' | '--captured-w' | '--drawer-h'
+  targetEl, // .coach__body for col, .transcript-pane for row
+  min,
+  max,
+  invert,
+  resetPx, // number | null (null = remove var → auto / content-driven)
+  persistKey, // 'railWidth' | 'capturedWidth' | 'drawerHeight'
+  getCurrentPx,
+}) {
+  if (!el || !targetEl) return;
+
+  const resolveMax = () => (typeof max === 'function' ? max() : max);
+  const clamp = (v) => Math.max(min, Math.min(resolveMax(), v));
+
+  function writePx(px) {
+    const rounded = Math.round(px);
+    targetEl.style.setProperty(cssVar, `${rounded}px`);
+    el.setAttribute('aria-valuenow', String(rounded));
+  }
+
+  function persist(px) {
+    const rounded = Math.round(px);
+    const patch = { [persistKey]: rounded };
+    /* Track the user's last expanded drawer height so a fresh
+     * coach:suggestion can auto-pop the drawer back open when it's
+     * currently collapsed to 0 — explicit user ask: don't miss new
+     * suggestions because the drawer is hidden. See
+     * autoPopDrawerIfCollapsed() below. */
+    if (cssVar === '--drawer-h' && rounded > DRAWER_COLLAPSE_EPSILON) {
+      patch.lastNonZeroDrawerHeight = rounded;
+    }
+    saveLayout(patch);
+  }
+
+  /* Initial ARIA attributes — min/max are stable, valuenow is
+   * written on every drag / reset / nudge. For callable maxes
+   * we hand back a stable absolute ceiling per axis (rather than
+   * the live dynamic value) so AT sees a meaningful range; the
+   * drawer needs its own branch now that its `max` is a function. */
+  el.setAttribute('aria-valuemin', String(min));
+  const ariaMax = typeof max === 'function'
+    ? (cssVar === '--drawer-h' ? DRAWER_H_MAX : RAIL_W_MAX)
+    : max;
+  el.setAttribute('aria-valuemax', String(ariaMax));
+  const initial = getCurrentPx?.() ?? 0;
+  if (Number.isFinite(initial)) el.setAttribute('aria-valuenow', String(Math.round(initial)));
+
+  let startCoord = 0;
+  let startPx = 0;
+  let activePointerId = null;
+
+  el.addEventListener('pointerdown', (ev) => {
+    if (ev.button != null && ev.button !== 0) return;
+    activePointerId = ev.pointerId;
+    try { el.setPointerCapture(ev.pointerId); } catch { /* swallow */ }
+    el.dataset.dragging = 'true';
+    startCoord = axis === 'col' ? ev.clientX : ev.clientY;
+    startPx = typeof getCurrentPx === 'function' ? getCurrentPx() : 0;
+    ev.preventDefault();
+  });
+
+  el.addEventListener('pointermove', (ev) => {
+    if (ev.pointerId !== activePointerId) return;
+    const cur = axis === 'col' ? ev.clientX : ev.clientY;
+    const rawDelta = cur - startCoord;
+    const delta = invert ? -rawDelta : rawDelta;
+    writePx(clamp(startPx + delta));
+  });
+
+  function endDrag(ev) {
+    if (ev.pointerId !== activePointerId) return;
+    activePointerId = null;
+    el.removeAttribute('data-dragging');
+    try { el.releasePointerCapture(ev.pointerId); } catch { /* swallow */ }
+    const live = typeof getCurrentPx === 'function' ? getCurrentPx() : 0;
+    persist(live);
+  }
+  el.addEventListener('pointerup', endDrag);
+  el.addEventListener('pointercancel', endDrag);
+
+  el.addEventListener('dblclick', () => {
+    if (resetPx === null || resetPx === undefined) {
+      /* Drawer-only path: remove the var so the footer falls back to
+       * its content-driven height ("auto" per the user decision). */
+      targetEl.style.removeProperty(cssVar);
+      saveLayout({ [persistKey]: null });
+      el.removeAttribute('aria-valuenow');
+      return;
+    }
+    const v = clamp(resetPx);
+    writePx(v);
+    persist(v);
+  });
+
+  el.addEventListener('keydown', (ev) => {
+    const big = ev.shiftKey ? 64 : 16;
+    if (ev.key === 'Home') {
+      writePx(min);
+      persist(min);
+      ev.preventDefault();
+      return;
+    }
+    if (ev.key === 'End') {
+      const m = resolveMax();
+      writePx(m);
+      persist(m);
+      ev.preventDefault();
+      return;
+    }
+    let raw = 0;
+    if (axis === 'col') {
+      if (ev.key === 'ArrowRight') raw = +big;
+      else if (ev.key === 'ArrowLeft') raw = -big;
+    } else {
+      if (ev.key === 'ArrowDown') raw = +big;
+      else if (ev.key === 'ArrowUp') raw = -big;
+    }
+    if (raw === 0) return;
+    ev.preventDefault();
+    const delta = invert ? -raw : raw;
+    const current = typeof getCurrentPx === 'function' ? getCurrentPx() : 0;
+    const next = clamp(current + delta);
+    writePx(next);
+    persist(next);
+  });
+}
+
+/* Captured-pane dynamic upper bound. Re-computed on every drag / End
+ * keystroke. Floor = TRANSCRIPT_W_FLOOR + two col-splitters; the
+ * remainder goes to the captured pane. With WINDOW_MIN_WIDTH=960 in
+ * src/main.js this guarantees a comfortable max of >=540 even at the
+ * window floor. */
+function dynamicCapturedMax() {
+  if (!coachBodyEl) return 600;
+  const bodyW = coachBodyEl.clientWidth || 0;
+  const railW = Number.parseFloat(getComputedStyle(coachBodyEl).getPropertyValue('--rail-w')) || RAIL_W_MIN;
+  const m = bodyW - railW - TRANSCRIPT_W_FLOOR - COL_SPLITTER_SLACK;
+  return Math.max(CAPTURED_W_MIN, m);
+}
+
+/* Rail dynamic upper bound mirrors the captured logic, but the rail
+ * has a hard CSS cap at RAIL_W_MAX so it's just the lesser of the
+ * two. Keeps the rail from eating the transcript when the user pulls
+ * it very wide on a narrow window. */
+function dynamicRailMax() {
+  if (!coachBodyEl) return RAIL_W_MAX;
+  const bodyW = coachBodyEl.clientWidth || 0;
+  const capturedW = Number.parseFloat(getComputedStyle(coachBodyEl).getPropertyValue('--captured-w')) || LAYOUT_DEFAULTS.capturedWidth;
+  const m = bodyW - capturedW - TRANSCRIPT_W_FLOOR - COL_SPLITTER_SLACK;
+  return Math.max(RAIL_W_MIN, Math.min(RAIL_W_MAX, m));
+}
+
+/* Drawer dynamic upper bound. The static DRAWER_H_MAX (=280) is a
+ * sane absolute ceiling on tall windows, but on a short window the
+ * footer would still push past the visible pane bottom if we let
+ * the user drag past `paneHeight - DRAWER_LIST_MIN_H`. This is
+ * exactly the same bound enforced by the
+ * `max-height: calc(100% - 80px)` rule on .transcript-pane__footer
+ * in src/index.css — having it in BOTH places means: the splitter
+ * never lets the user *try* to push the drawer past the cap (UI
+ * feels honest), and the CSS guards against any stale --drawer-h
+ * value that was saved when the window was tall. */
+function dynamicDrawerMax() {
+  if (!transcriptPaneEl) return DRAWER_H_MAX;
+  const paneH = transcriptPaneEl.clientHeight || 0;
+  const headroom = paneH - DRAWER_LIST_MIN_H;
+  return Math.max(DRAWER_H_MIN, Math.min(DRAWER_H_MAX, headroom));
+}
+
+/* Live DOM-driven readbacks for "where is the splitter currently".
+ * Read the rendered geometry rather than the CSS var so the value
+ * is correct even when the var is unset (drawer in its content-
+ * driven "auto" state). */
+const getRailCurrentPx = () => (railEl ? railEl.getBoundingClientRect().width : LAYOUT_DEFAULTS.railWidth);
+const getCapturedCurrentPx = () => (capturedPaneEl ? capturedPaneEl.getBoundingClientRect().width : LAYOUT_DEFAULTS.capturedWidth);
+const getDrawerCurrentPx = () => (transcriptFooterEl ? transcriptFooterEl.getBoundingClientRect().height : 0);
+
+mountSplitter({
+  el: splitterRailEl,
+  axis: 'col',
+  cssVar: '--rail-w',
+  targetEl: coachBodyEl,
+  min: RAIL_W_MIN,
+  max: dynamicRailMax,
+  invert: false, // drag right grows --rail-w
+  resetPx: LAYOUT_DEFAULTS.railWidth,
+  persistKey: 'railWidth',
+  getCurrentPx: getRailCurrentPx,
+});
+
+mountSplitter({
+  el: splitterCapturedEl,
+  axis: 'col',
+  cssVar: '--captured-w',
+  targetEl: coachBodyEl,
+  min: CAPTURED_W_MIN,
+  max: dynamicCapturedMax,
+  invert: true, // drag right shrinks --captured-w
+  resetPx: LAYOUT_DEFAULTS.capturedWidth,
+  persistKey: 'capturedWidth',
+  getCurrentPx: getCapturedCurrentPx,
+});
+
+mountSplitter({
+  el: splitterDrawerEl,
+  axis: 'row',
+  cssVar: '--drawer-h',
+  targetEl: transcriptPaneEl,
+  min: DRAWER_H_MIN,
+  /* Was the static DRAWER_H_MAX. Switched to a function so the
+   * upper bound contracts on short windows — see dynamicDrawerMax
+   * doc-block. Pairs with the `max-height: calc(100% - 80px)`
+   * rule on .transcript-pane__footer in src/index.css. */
+  max: dynamicDrawerMax,
+  invert: true, // drag down shrinks --drawer-h
+  resetPx: null, // dblclick → remove var → content-driven auto
+  persistKey: 'drawerHeight',
+  getCurrentPx: getDrawerCurrentPx,
+});
+
+/* If the user resizes the window smaller than the saved
+ * --drawer-h leaves room for, re-clamp the drawer height to the
+ * new dynamic max. Without this, the saved value (eg 280 saved on
+ * a 1200px window) would persist into a 440px window, the CSS
+ * max-height cap would silently shrink the visible drawer to
+ * pane-80, and the next drag-up would feel jumpy (the splitter
+ * thinks --drawer-h is 280 but the rendered height is much less).
+ * Re-clamping on resize keeps the cssVar honest. The window
+ * resize fires plenty during user drags too; the `if (next < cur)`
+ * guard makes this a one-way ratchet — we only ever shrink
+ * --drawer-h to fit, never auto-grow it. */
+if (typeof window !== 'undefined') {
+  window.addEventListener('resize', () => {
+    if (!transcriptPaneEl) return;
+    const cur = getDrawerCurrentPx();
+    if (cur <= DRAWER_COLLAPSE_EPSILON) return; // drawer is already collapsed
+    const cap = dynamicDrawerMax();
+    if (cur > cap) {
+      const next = Math.max(DRAWER_H_MIN, cap);
+      transcriptPaneEl.style.setProperty('--drawer-h', `${next}px`);
+      if (splitterDrawerEl) splitterDrawerEl.setAttribute('aria-valuenow', String(next));
+      saveLayout({ drawerHeight: next });
+    }
+  });
+}
+
+/* When a new coach:suggestion IPC lands and the drawer is currently
+ * collapsed (drag-shrunk to 0), restore the drawer to the user's
+ * last non-zero height so the new suggestion isn't hidden behind a
+ * 0px footer. Explicit user decision: don't miss new suggestions
+ * because the drawer is hidden. */
+function autoPopDrawerIfCollapsed() {
+  if (!transcriptPaneEl) return;
+  const cur = getDrawerCurrentPx();
+  if (cur > DRAWER_COLLAPSE_EPSILON) return; // not collapsed; no-op
+  const saved = loadLayout();
+  const last = Number.isFinite(saved.lastNonZeroDrawerHeight)
+    ? saved.lastNonZeroDrawerHeight
+    : null;
+  if (last && last > DRAWER_COLLAPSE_EPSILON) {
+    const v = Math.max(DRAWER_H_MIN, Math.min(DRAWER_H_MAX, last));
+    transcriptPaneEl.style.setProperty('--drawer-h', `${v}px`);
+    if (splitterDrawerEl) splitterDrawerEl.setAttribute('aria-valuenow', String(v));
+    saveLayout({ drawerHeight: v });
+  } else {
+    /* No last-non-zero remembered (user collapsed without ever
+     * expanding). Fall back to "auto" by removing the var so the
+     * footer at least pops to its content-driven natural size. */
+    transcriptPaneEl.style.removeProperty('--drawer-h');
+    if (splitterDrawerEl) splitterDrawerEl.removeAttribute('aria-valuenow');
+    saveLayout({ drawerHeight: null });
+  }
+}
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
@@ -997,6 +1450,18 @@ function makePillarButton(pillar) {
   glyph.textContent = pillar.glyph;
   btn.appendChild(glyph);
 
+  /* v3 resizable panes stretch goal: when the user widens the rail
+   * splitter past ~140px the container query on .rail reveals these
+   * labels next to the glyph. Always in DOM so the reveal/conceal is
+   * pure CSS — no DOM diff, no JS state. Below the threshold the
+   * label is `display: none` (also removes it from the a11y tree, so
+   * the existing aria-label on the button is the canonical name in
+   * collapsed mode). */
+  const label = document.createElement('span');
+  label.className = 'pillar__label';
+  label.textContent = pillar.name;
+  btn.appendChild(label);
+
   // Corner dot is retained ONLY for synthetic pillars (live_signals
   // shows "flags fired", logged_questions shows "items waiting to
   // circle back"). Real pillars use the glyph colour rollup above
@@ -1143,14 +1608,13 @@ function renderTranscriptPane() {
   }
   transcriptListEl.replaceChildren(...children);
 
-  // Auto-scroll to bottom unless the user has scrolled up (within 40px
-  // of the bottom counts as "tracking the live edge").
-  const nearBottom =
-    transcriptListEl.scrollHeight -
-      transcriptListEl.scrollTop -
-      transcriptListEl.clientHeight <
-    40;
-  if (nearBottom) {
+  /* Stick-to-bottom follow: the user's scroll listener (mounted
+   * below) maintains stickToBottomTranscript; here we just honour
+   * it. The old "recompute nearBottom after replaceChildren" block
+   * was unreliable — scrollHeight grew as part of the render so
+   * the post-render diff was always too large to trip the
+   * threshold. v1.3.0 regression fix. */
+  if (stickToBottomTranscript) {
     transcriptListEl.scrollTop = transcriptListEl.scrollHeight;
   }
 
@@ -1159,6 +1623,51 @@ function renderTranscriptPane() {
     transcriptErrorEl.hidden = false;
   } else {
     transcriptErrorEl.hidden = true;
+  }
+}
+
+/* One-time listeners + helpers for the stick-to-bottom follow on
+ * transcriptListEl. Mounted at module load (file is type=module
+ * loaded at end of body so the element exists). */
+
+/** Snap to the bottom if stickToBottomTranscript is currently true.
+ * Used by the ResizeObserver below (pane resize, splitter drag,
+ * window resize) so a stuck transcript stays stuck when its
+ * visible height changes. Renders themselves call this inline at
+ * the end of renderTranscriptPane.
+ */
+function snapTranscriptToBottomIfStuck() {
+  if (!transcriptListEl) return;
+  if (!stickToBottomTranscript) return;
+  transcriptListEl.scrollTop = transcriptListEl.scrollHeight;
+}
+
+if (transcriptListEl) {
+  transcriptListEl.addEventListener('scroll', () => {
+    /* Recompute on every scroll — both user-initiated wheel/drag/
+     * trackpad scrolls AND programmatic scrollTop writes from
+     * snapTranscriptToBottomIfStuck (those write distance ≈ 0 so
+     * the flag stays true). passive: omitted because we don't
+     * call preventDefault — Chromium treats omitted-passive on
+     * scroll as passive-by-default. */
+    const dist =
+      transcriptListEl.scrollHeight -
+      transcriptListEl.scrollTop -
+      transcriptListEl.clientHeight;
+    stickToBottomTranscript = dist < STICK_TO_BOTTOM_THRESHOLD_PX;
+  });
+
+  /* When the transcript list's visible height changes — splitter
+   * drag (drawer or captured), rail-width change, window resize —
+   * re-snap to bottom if we were stuck. Without this, growing the
+   * drawer or shrinking the captured pane would leave the user
+   * looking at stale middle-of-transcript text even though they
+   * were following the live edge a moment ago. */
+  if (typeof ResizeObserver === 'function') {
+    const ro = new ResizeObserver(() => {
+      snapTranscriptToBottomIfStuck();
+    });
+    ro.observe(transcriptListEl);
   }
 }
 
@@ -1203,16 +1712,19 @@ function renderCoachSuggestion() {
   // the coach:suggestion IPC, see onCoachSuggestion above) — one source
   // of truth instead of fuzzy text matching.
   //
-  // Gated on settings.coach.trackQuestionState so the feature is
-  // wholly opt-in: when the toggle is off, mark_question_asked never
-  // fires, the entry's `asked` flag stays false, and the pinned card
-  // styling stays neutral.
+  // Reads the entry's `asked` flag directly (not gated on
+  // trackQuestionState). The toggle now ONLY controls the AI's auto-
+  // detection path — the manual tick button (added alongside this
+  // change) is a deliberate rep action that should always result in
+  // the green styling regardless of whether the AI's auto-detection
+  // is enabled. The AI path stays gated server-side: when the toggle
+  // is off the model never fires mark_question_asked, so the only way
+  // for `asked` to flip is via the manual click — and in that case
+  // the rep explicitly opted in via the button.
   const historyEntry = sug.suggestionId
     ? state.suggestionHistory.find((e) => e.id === sug.suggestionId)
     : null;
-  const isAsked = Boolean(
-    state.coach.trackQuestionState && historyEntry && historyEntry.asked,
-  );
+  const isAsked = Boolean(historyEntry && historyEntry.asked);
 
   // --- label row -----------------------------------------------------
   // Kind chip on the left ("Suggest" / "Deeper" / "Pivot" / "Pause"),
@@ -1242,6 +1754,55 @@ function renderCoachSuggestion() {
       label.appendChild(pillarLabel);
     }
   }
+
+  // Mark-as-asked tick. Manual counterpart to the AI's
+  // `mark_question_asked` tool — the rep clicks it the moment they
+  // ask the suggested question, which flips the history entry to
+  // asked=true (greening the card) and signals to main to log the
+  // rubric item so the model doesn't resurface the same question on
+  // the next tick. Always rendered (independent of trackQuestionState)
+  // because the manual click is a deliberate rep action — we don't
+  // want the button to silently disappear when the AI-driven
+  // detection toggle is off.
+  //
+  // Idempotency: when the entry is already asked, the click resolves
+  // server-side as a no-op AND the renderer short-circuits before
+  // firing the IPC so we don't spam main with duplicate clicks /
+  // duplicate scoring:item-state broadcasts.
+  //
+  // Pressed-state styling keys off `data-asked='true'` so the button
+  // visually communicates the asked state alongside the parent card's
+  // green tint.
+  const markAskedBtn = document.createElement('button');
+  markAskedBtn.type = 'button';
+  markAskedBtn.className = 'suggestion__mark-asked';
+  if (sug.suggestionId) markAskedBtn.dataset.suggestionId = sug.suggestionId;
+  if (isAsked) {
+    markAskedBtn.dataset.asked = 'true';
+    markAskedBtn.setAttribute('aria-pressed', 'true');
+    markAskedBtn.title = 'Marked as asked';
+  } else {
+    markAskedBtn.setAttribute('aria-pressed', 'false');
+    markAskedBtn.title = 'Mark this question as asked';
+  }
+  markAskedBtn.setAttribute('aria-label', 'Mark this question as asked');
+  if (!sug.suggestionId) {
+    // No id means no server-side history entry to flip — disable the
+    // control rather than letting the click sail through as a no-op
+    // IPC roundtrip. This is a defensive branch; suggestionId is
+    // threaded through from main on every fresh suggestion.
+    markAskedBtn.disabled = true;
+    markAskedBtn.title = 'No tracking id for this suggestion';
+  }
+  markAskedBtn.innerHTML =
+    '<svg class="suggestion__mark-asked-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  markAskedBtn.addEventListener('click', () => {
+    if (!sug.suggestionId) return;
+    const entry = state.suggestionHistory.find((e) => e.id === sug.suggestionId);
+    if (entry?.asked) return;
+    window.gemini.markSuggestionAsked?.(sug.suggestionId);
+  });
+  label.appendChild(markAskedBtn);
 
   // Inline Skip pill on the active suggestion card. Clicking it
   // dismisses the suggestion AND triggers a fresh ask:
@@ -1618,17 +2179,22 @@ function renderLoggedRubricItem(itemId, entry) {
 /**
  * Build the suggestion-history block. Each entry renders the
  * question text plus a pillar tag (if the item id maps to a rubric
- * row), plus the asked / replaced badges keyed off
- * `state.coach.trackQuestionState`.
+ * row), plus the asked / replaced badges keyed off the entry's flags.
  *
- * When the toggle is OFF: entries render neutrally (no green
- * outline). The block heading reads "Suggested questions" and we
- * skip the badge column — the seller still gets a log of what the
- * coach pinned, but no AI-asked validation overlay.
+ * The asked/replaced styling used to be gated on
+ * `state.coach.trackQuestionState`, but with the manual tick button
+ * (and its always-on click path) the gating was relaxed so the visual
+ * tracks the data either path produces. `trackQuestionState` now only
+ * controls the AI's auto-detection (server-side gating in coach.js).
  *
- * When the toggle is ON: asked entries get .logged-entry--asked
- * (green outline + tint), replaced entries get .logged-entry--replaced
- * (muted opacity) plus a "Reformulated" badge.
+ * Asked entries get .logged-entry--asked (green outline + tint),
+ * replaced entries get .logged-entry--replaced (muted opacity) plus
+ * a "Reformulated" badge.
+ *
+ * The block heading copy ("Suggested questions" vs "Suggested
+ * questions (this call)") still leans on the toggle as a hint about
+ * whether AI validation is in play; keeping that copy split because
+ * the heading is descriptive context rather than a styling decision.
  */
 function renderSuggestionHistoryBlock(history) {
   const wrap = document.createElement('section');
@@ -1652,13 +2218,14 @@ function renderSuggestionHistoryBlock(history) {
 function renderSuggestionHistoryEntry(entry) {
   const div = document.createElement('div');
   div.className = 'logged-entry';
-  // Asked / replaced styling is gated on the trackQuestionState
-  // toggle so flipping it off rolls the drawer back to neutral
-  // visuals without re-rendering everything from scratch.
-  if (state.coach.trackQuestionState) {
-    if (entry.asked) div.classList.add('logged-entry--asked');
-    else if (entry.replaced) div.classList.add('logged-entry--replaced');
-  }
+  // Asked / replaced styling reads the entry's flags directly so the
+  // bottom-drawer's pinned card and the left-drawer's logged-questions
+  // list stay in lock-step. Used to be gated on trackQuestionState,
+  // but that's been relaxed alongside the manual tick button — the
+  // toggle now only controls the AI's auto-detection path, while the
+  // visual flags reflect the data either path produced.
+  if (entry.asked) div.classList.add('logged-entry--asked');
+  else if (entry.replaced) div.classList.add('logged-entry--replaced');
   if (entry.evidence) div.title = entry.evidence;
 
   const meta = entry.itemId && !SUGGESTION_SENTINEL_SET.has(entry.itemId)
@@ -1678,9 +2245,11 @@ function renderSuggestionHistoryEntry(entry) {
   q.textContent = entry.questionText || '(no question text)';
   div.appendChild(q);
 
-  // Asked / replaced annotations only when the toggle is on — without
-  // the AI validation signal the badges would be misleading.
-  if (state.coach.trackQuestionState && (entry.asked || entry.replaced)) {
+  // Asked / replaced annotations show whenever the entry's flags are
+  // set — the trackQuestionState gating used to live here as well but
+  // it's been relaxed alongside the manual tick button so the manual
+  // path renders its asked badge regardless of the AI-detection toggle.
+  if (entry.asked || entry.replaced) {
     const metaRow = document.createElement('span');
     metaRow.className = 'logged-entry__meta';
     const badge = document.createElement('span');
@@ -2055,6 +2624,53 @@ function renderQuickFix() {
     assumptionsEl.hidden = !assumptionsEl.children.length;
   }
 
+  // Export button — copies {exportedAt, rollup, entries} JSON to the
+  // clipboard so the rep can paste the full Stage-2 rollup + the
+  // underlying Stage-1 facts into post-call notes / CRM / Slack.
+  //
+  // Wired here (not at module init) so the click handler closes over
+  // state.quickFix / state.quickFixEntries at click time — and so we
+  // can reassign .onclick on every render (rather than
+  // addEventListener) to avoid accumulating duplicate handlers across
+  // re-renders. The button is hidden when state.quickFix is null
+  // (handled implicitly by hiding the whole card at line 1990).
+  const exportBtn = quickFixEl.querySelector('.quick-fix__export');
+  if (exportBtn instanceof HTMLButtonElement) {
+    exportBtn.hidden = false;
+    exportBtn.onclick = () => {
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        rollup: state.quickFix,
+        entries: state.quickFixEntries || [],
+      };
+      const json = JSON.stringify(payload, null, 2);
+      const flash = (label, status) => {
+        exportBtn.dataset.state = status;
+        exportBtn.textContent = label;
+        setTimeout(() => {
+          delete exportBtn.dataset.state;
+          exportBtn.textContent = 'Export';
+        }, 1500);
+      };
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(json)
+          .then(() => flash('Copied', 'copied'))
+          .catch((err) => {
+            console.warn('[quick-fix] clipboard write failed:', err);
+            flash('Copy failed', 'error');
+          });
+      } else {
+        // Fallback when the clipboard API is unavailable (sandbox
+        // restrictions, older Electron). Log the payload so the rep
+        // can still grab it from the dev-tools console rather than
+        // losing the export entirely.
+        console.warn('[quick-fix] clipboard API unavailable; logging JSON instead');
+        console.log(json);
+        flash('Logged', 'copied');
+      }
+    };
+  }
+
   // Status pill — visible when the worker is in a degraded state.
   // Two visual variants keyed off data-status:
   //   'error' → red "Rollup unavailable" (3+ consecutive failures)
@@ -2328,6 +2944,11 @@ function clearScoringState() {
     committed: [],
     pendingBySpeaker: { you: '', other: '' },
   };
+  /* A fresh call should always begin in follow-the-live-edge mode,
+   * even if the previous session ended with the user scrolled up.
+   * See the stickToBottomTranscript declaration near the
+   * transcript element refs for the full pattern. */
+  stickToBottomTranscript = true;
   // Drop stale cross-channel dedupe state; a fresh call shouldn't
   // inherit the previous session's last commits.
   recentRendererCommitBySpeaker.you = null;
@@ -2357,6 +2978,11 @@ function clearScoringState() {
   // hit Stop right after clicking Recap, the safety timer would still
   // be running and could surface a stale pill on the next call.
   hideRecapInProgressPill();
+  /* v3 progress overlay: same principle — wipe any in-flight ask
+   * button layers + their timers so a fresh session doesn't inherit
+   * the previous call's animations or fire a late "failed" tint on
+   * a button the user already moved on from. */
+  clearAskButtonProgress();
   // Reset the connection-status mirror so a previous session's
   // 'connected' / 'down' doesn't leak into the new session's pill
   // before the first connection:status broadcast lands. Main also
@@ -3089,9 +3715,21 @@ window.gemini.onScoringQuickFix?.((payload) => {
 
 window.gemini.onCoachSuggestion(({ itemId, question, rationale, anchorQuote, kind, suggestionId }) => {
   console.log('[coach] suggest:', itemId, '→', question, '(kind:', kind || 'next', ')');
+  /* v3 progress overlay: FIFO-complete the oldest in-flight layer
+   * for this kind. Safe before pushCoachSuggestion / pill clear — a
+   * 'targeted' kind (from the rail's +Ask buttons) will no-op
+   * because we never started a layer for it from this code path. */
+  const kindForLayer = typeof kind === 'string' ? kind : 'next';
+  completeAskProgressLayer(kindForLayer);
   // Recap finished — drop the in-progress pill the click handler
   // surfaced. Safe to call even if no pill is currently shown.
   if (kind === 'recap') hideRecapInProgressPill();
+  /* v3 resizable panes: if the user previously dragged the drawer
+   * splitter all the way down to 0, restore it to the last non-zero
+   * height so this new suggestion is actually visible. Explicit user
+   * decision in the resizable-panes plan: a hidden drawer must not
+   * eat new suggestions. */
+  autoPopDrawerIfCollapsed();
   pushCoachSuggestion({
     itemId: typeof itemId === 'string' ? itemId : null,
     question: typeof question === 'string' ? question : '',
@@ -3283,6 +3921,185 @@ for (const btn of coachModeBtnEls) {
   });
 }
 
+/* ── Ask-button progress overlay (v3) ─────────────────────────────
+ *
+ * See plan: ask_button_progress_overlay_7d3a9f1b. Per-click
+ * translucent fill layer on each .ask-btn. Each click stacks ANOTHER
+ * layer; FIFO-completes the oldest when the matching coach:suggestion
+ * IPC arrives. Stacking gives the rep "two in flight" as a visibly
+ * darker shade thanks to alpha compositing of white-at-10% layers.
+ *
+ * Per-kind durations (USER OVERRIDE — snappier than the plan's
+ * 6s / 9s defaults):
+ *   next / deeper / pivot  → 4000 ms ease-out to 92%
+ *   recap                  → 7000 ms ease-out to 92%
+ *
+ * Per-kind safety timeout (layer goes red-tinted if no response):
+ *   next / deeper / pivot  → 30000 ms
+ *   recap                  → 15000 ms  (matches the existing Recap
+ *                                       pill's 15s clear)
+ *
+ * Stack cap: 5 visible layers max. When the user clicks a 6th time
+ * while 5 are still active the IPC still fires (the rep wants the
+ * request sent) but the visual layer is skipped — see the gate in
+ * startAskProgressLayer below.
+ *
+ * Reduced motion: under prefers-reduced-motion: reduce the entire
+ * overlay block in src/index.css is gated off (the @media wraps the
+ * .ask-btn__progress rules), and startAskProgressLayer also short-
+ * circuits layer DOM creation so no nodes accumulate even though no
+ * animation would run. The existing 160ms .ask-btn[data-pulsing]
+ * flash and the textual "Recap in progress…" pill carry the
+ * affordance under reduced motion. */
+const ASK_PROGRESS_DURATION_MS = Object.freeze({
+  next: 4000,
+  deeper: 4000,
+  pivot: 4000,
+  recap: 7000,
+});
+const ASK_PROGRESS_FAIL_MS = Object.freeze({
+  next: 30_000,
+  deeper: 30_000,
+  pivot: 30_000,
+  recap: 15_000,
+});
+const ASK_PROGRESS_STACK_CAP = 5;
+const ASK_PROGRESS_SNAP_MS = 150;
+const ASK_PROGRESS_HOLD_MS = 250;
+const ASK_PROGRESS_FADE_MS = 200;
+const ASK_PROGRESS_FAIL_HOLD_MS = 1500;
+
+/* kind → Array<LayerHandle>. LayerHandle = { el, kind, btn, startedAt,
+ * failTimer, snapTimer, fadeTimer, removeTimer }. */
+const inFlightLayersByKind = new Map();
+
+function isReducedMotionPreferred() {
+  try {
+    return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+  } catch {
+    return false;
+  }
+}
+
+function clearLayerTimers(handle) {
+  if (handle.failTimer) clearTimeout(handle.failTimer);
+  if (handle.snapTimer) clearTimeout(handle.snapTimer);
+  if (handle.fadeTimer) clearTimeout(handle.fadeTimer);
+  if (handle.removeTimer) clearTimeout(handle.removeTimer);
+  handle.failTimer = handle.snapTimer = handle.fadeTimer = handle.removeTimer = null;
+}
+
+function removeLayer(handle) {
+  clearLayerTimers(handle);
+  if (handle.el && handle.el.parentNode) {
+    handle.el.parentNode.removeChild(handle.el);
+  }
+  handle.el = null;
+}
+
+/* Start a new in-flight visual layer on this button. Returns true if
+ * a layer was created, false if the stack cap was hit (the caller
+ * still fires the IPC either way). */
+function startAskProgressLayer(kind, btn) {
+  if (!btn) return false;
+  /* Reduced-motion path: skip the visual entirely. The CSS @media
+   * gate already neutralises any layer that did exist; this guard
+   * also avoids polluting inFlightLayersByKind with phantom handles
+   * a future visual change might pick up. */
+  if (isReducedMotionPreferred()) return false;
+  const existing = inFlightLayersByKind.get(kind);
+  /* Stack cap: silently skip the visual layer when 5 are already
+   * active for this kind. The caller still fires the IPC because the
+   * user explicitly wants the request sent — this is the snappiest
+   * "I clicked, the request is in flight" feedback we can provide
+   * without making the button unreadable behind 6+ stacked tints. */
+  if (existing && existing.length >= ASK_PROGRESS_STACK_CAP) return false;
+
+  const el = document.createElement('span');
+  el.className = 'ask-btn__progress';
+  el.dataset.state = 'active';
+  el.dataset.kind = kind;
+  el.setAttribute('aria-hidden', 'true');
+  btn.appendChild(el);
+  /* Force layout so the active-state animation always starts from a
+   * resolved scaleX(0) baseline, even when this click follows a
+   * rapid-fire previous one that left the previous layer mid-anim. */
+  // eslint-disable-next-line no-unused-expressions
+  el.offsetHeight;
+
+  const handle = {
+    el,
+    kind,
+    btn,
+    startedAt: Date.now(),
+    failTimer: null,
+    snapTimer: null,
+    fadeTimer: null,
+    removeTimer: null,
+  };
+  if (!existing) inFlightLayersByKind.set(kind, [handle]);
+  else existing.push(handle);
+
+  const failMs = ASK_PROGRESS_FAIL_MS[kind] ?? 30_000;
+  handle.failTimer = setTimeout(() => failLayer(kind, handle), failMs);
+  return true;
+}
+
+/* FIFO-complete the oldest in-flight layer for this kind. Called
+ * from onCoachSuggestion when the matching IPC arrives. Sequence:
+ * snap(150) → hold(250) → fade(200) → remove. Total wind-down ~600ms. */
+function completeAskProgressLayer(kind) {
+  const layers = inFlightLayersByKind.get(kind);
+  if (!layers || layers.length === 0) return;
+  const handle = layers.shift();
+  if (layers.length === 0) inFlightLayersByKind.delete(kind);
+  if (!handle || !handle.el) return;
+  clearLayerTimers(handle);
+
+  handle.el.dataset.state = 'completing';
+  handle.snapTimer = setTimeout(() => {
+    if (!handle.el) return;
+    handle.fadeTimer = setTimeout(() => {
+      if (!handle.el) return;
+      handle.el.dataset.state = 'fading';
+      handle.removeTimer = setTimeout(() => removeLayer(handle),
+        ASK_PROGRESS_FADE_MS + 50);
+    }, ASK_PROGRESS_HOLD_MS);
+  }, ASK_PROGRESS_SNAP_MS);
+}
+
+/* Failure path. Surfaced by the per-layer 30s / 15s safety timer.
+ * Asymmetric on purpose: success is FIFO (we can't tell which click
+ * triggered the response), but failure is per-layer (the timer
+ * fires on the specific click that timed out). */
+function failLayer(kind, handle) {
+  const layers = inFlightLayersByKind.get(kind);
+  if (!layers || !handle.el) return;
+  const idx = layers.indexOf(handle);
+  if (idx === -1) return; // already completed via the success path
+  layers.splice(idx, 1);
+  if (layers.length === 0) inFlightLayersByKind.delete(kind);
+  clearLayerTimers(handle);
+  handle.el.dataset.state = 'failing';
+  /* 350ms = the ask-progress-fail keyframe duration (snap+tint).
+   * Then hold the red tint 1500ms so the rep registers the failure,
+   * then 200ms fade. */
+  handle.removeTimer = setTimeout(
+    () => removeLayer(handle),
+    350 + ASK_PROGRESS_FAIL_HOLD_MS + ASK_PROGRESS_FADE_MS,
+  );
+}
+
+/* Wipe every in-flight layer + timer. Hooked into clearScoringState
+ * so a fresh session never inherits stale layers from the previous
+ * call. Safe to call when no layers exist. */
+function clearAskButtonProgress() {
+  for (const layers of inFlightLayersByKind.values()) {
+    for (const h of layers) removeLayer(h);
+  }
+  inFlightLayersByKind.clear();
+}
+
 /**
  * Wire up the transcript-footer ask buttons. Each fires
  * `window.gemini.askSuggestion(kind)` which lands as a `coach:ask-suggest`
@@ -3312,6 +4129,11 @@ for (const btn of askBtnEls) {
     // click registered even if the coach takes a tick to respond.
     btn.dataset.pulsing = 'true';
     setTimeout(() => { btn.dataset.pulsing = 'false'; }, 160);
+    /* v3 progress overlay: stack a translucent fill layer that
+     * animates while this request is in flight. Returns false when
+     * the per-kind 5-layer stack cap was hit; we still fire the IPC
+     * either way (explicit user decision in the override notes). */
+    startAskProgressLayer(kind, btn);
     if (kind === 'recap') {
       // Surface a "Recap in progress…" pill so the rep knows the
       // click registered and the coach is working — even though D7

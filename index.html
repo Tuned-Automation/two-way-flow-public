@@ -5,6 +5,15 @@
     <title>Two Way Flow</title>
   </head>
   <body>
+    <!-- Decorative resize-grip in the bottom-right of the window
+         gutter. Pair with body=no-drag + .coach__header=drag in
+         src/index.css so the OS edge-resize hit-tests through the
+         transparent margin around .coach. The grip itself does not
+         trigger the resize — it just signals affordance. See the
+         .resize-grip rule and the Drag-region discipline comment at
+         the top of src/index.css for the full rationale. -->
+    <div class="resize-grip" aria-hidden="true"></div>
+
     <main class="coach" id="coach" data-status="idle">
       <!-- Speaker-bleed hint banner. Surfaced once per session when
            the cross-channel dedup fires repeatedly — strong signal
@@ -192,6 +201,19 @@
           aria-label="Rubric pillars"
         ></nav>
 
+        <!-- v3 resizable panes: column splitter between rail and the
+             transcript column. Drag to widen the rail; cross ~140px
+             to reveal pillar labels via a container query on .rail. -->
+        <div
+          id="splitterRail"
+          class="splitter splitter--rail"
+          data-axis="col"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize pillar rail"
+          tabindex="0"
+        ></div>
+
         <section
           id="transcriptPane"
           class="transcript-pane"
@@ -207,6 +229,22 @@
             class="transcript-pane__error"
             hidden
           ></p>
+          <!-- v3 resizable panes: row splitter between the scrolling
+               transcript list and the pinned drawer (ask controls +
+               suggestion). Drag to grow / shrink the drawer; drag all
+               the way down to collapse to 0 (a fresh coach:suggestion
+               IPC will auto-pop the drawer back open to the user's
+               last non-zero height — see autoPopDrawerIfCollapsed in
+               src/renderer.js). -->
+          <div
+            id="splitterDrawer"
+            class="splitter splitter--drawer"
+            data-axis="row"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize coach drawer"
+            tabindex="0"
+          ></div>
           <div class="transcript-pane__footer">
             <!-- v2.5 redesign: rep-initiated suggestion controls. The
                  three buttons map 1:1 to the coach's three ask kinds
@@ -286,6 +324,23 @@
           </div>
         </section>
 
+        <!-- v3 resizable panes: column splitter between the transcript
+             column and the captured pane. Dragging right SHRINKS the
+             captured pane (invert axis). The captured pane has a
+             dynamic max — main.js's WINDOW_MIN_WIDTH guarantees there's
+             always >=360px left for the transcript at the window's
+             minimum size, but the splitter clamp recomputes the upper
+             bound from .coach__body.clientWidth on every drag. -->
+        <div
+          id="splitterCaptured"
+          class="splitter splitter--captured"
+          data-axis="col"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize captured pane"
+          tabindex="0"
+        ></div>
+
         <aside
           id="capturedPane"
           class="captured"
@@ -302,7 +357,21 @@
           <section id="quickFix" class="quick-fix" hidden>
             <header class="quick-fix__header">
               <span class="quick-fix__title">Total annual opportunity</span>
-              <span class="quick-fix__confidence" data-level="medium">medium</span>
+              <div class="quick-fix__controls">
+                <!-- Copies {exportedAt, rollup, entries} JSON to the
+                     clipboard so the rep can paste the full
+                     opportunity breakdown + underlying facts into
+                     post-call notes. Wired in renderQuickFix(). -->
+                <button
+                  type="button"
+                  class="quick-fix__export"
+                  title="Copy rollup + facts JSON to clipboard"
+                  hidden
+                >
+                  Export
+                </button>
+                <span class="quick-fix__confidence" data-level="medium">medium</span>
+              </div>
             </header>
             <div class="quick-fix__headline"></div>
             <ul class="quick-fix__breakdown"></ul>

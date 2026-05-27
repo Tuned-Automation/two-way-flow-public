@@ -1,26 +1,54 @@
 /* ─────────────────────────────────────────────────────────────────────
  *  2-Way Flow — transcript-first rubric coach overlay.
  *
- *  Layout (v2)
+ *  Layout (v3 — resizable panes)
  *  ─────────────────────────────────────────────────────────────────────
- *    .coach (root, 720x440 minus drag margin)
+ *    .coach (root, 1100x520 minus drag margin)
  *      ├── .coach__header           recording dot + speakers + controls
- *      └── .coach__body             3 cols: rail / transcript / captured
- *            ├── .rail              60px column of pillar icons
+ *      └── .coach__body             CSS GRID: rail / col-splitter /
+ *            │                      transcript / col-splitter / captured.
+ *            │                      Track widths driven by --rail-w (60px
+ *            │                      default) and --captured-w (200px
+ *            │                      default). Both vars live on
+ *            │                      .coach__body inline-style and are
+ *            │                      persisted under localStorage
+ *            │                      `twf.layout.v1`.
+ *            ├── .rail              left column of pillar icons. Width
+ *            │                      is resizable 60→240px via
+ *            │                      .splitter--rail. When wider than
+ *            │                      ~140px the icon labels reveal via a
+ *            │                      container query on .rail itself.
+ *            ├── .splitter          4px hit-target between adjacent
+ *            │                      panes. col-resize / row-resize cursors,
+ *            │                      pointer-drag + dblclick reset +
+ *            │                      keyboard arrow nudges. role=separator
+ *            │                      + aria-orientation announces it to AT.
  *            ├── .transcript-pane   flex column: always-visible transcript
- *            │                      list + pinned suggestion at the bottom
- *            ├── .captured          200px right column of captured fields
+ *            │                      list + pinned suggestion at the bottom.
+ *            │                      The drawer (footer) height is
+ *            │                      resizable via --drawer-h on
+ *            │                      .transcript-pane.
+ *            ├── .captured          right column of captured fields
+ *            │                      (default 200px, resizable 160→max).
  *            └── .rail-overlay      slide-over panel (absolute, hidden by
  *                                   default; slides in from the left over
  *                                   the transcript pane when a pillar is
- *                                   clicked)
+ *                                   clicked). Insets read --rail-w /
+ *                                   --captured-w so the overlay tracks
+ *                                   the live grid track widths.
  *
  *  Drag-region discipline
  *  ─────────────────────────────────────────────────────────────────────
- *  The body is draggable (`-webkit-app-region: drag`). Every interactive
- *  element MUST opt out with `-webkit-app-region: no-drag` or its clicks
- *  get swallowed. Centralised via the `.no-drag` utility + per-component
- *  rules where simpler.
+ *  Only `.coach__header` is `app-region: drag` — the rest of the
+ *  window (body gutter, .coach card body, drawer, etc.) is `no-drag`.
+ *  This keeps the transparent margin around .coach OPEN for the
+ *  macOS edge-resize handler so the user gets a forgiving grab zone
+ *  at the visible card edge rather than the OS-only 3-5px sliver at
+ *  the very window edge. (Prior versions had body=drag and the
+ *  gutter swallowed every click as a window-move, leaving the user
+ *  unable to find the resize affordance.) Interactive children of
+ *  the header still opt out via the `.no-drag` utility + button
+ *  selector below.
  * ───────────────────────────────────────────────────────────────────── */
 
 /* Palette is intentionally monotone: white at varying opacities for everything
@@ -65,14 +93,21 @@ body {
     sans-serif;
   font-size: 13px;
   line-height: 1.4;
-  -webkit-app-region: drag;
+  /* Body is NO-DRAG by default so the transparent margin/gutter
+   * around .coach lets the OS edge-resize handler hit-test through
+   * to the window edge. Only the header opts back into drag (see
+   * .coach__header rule below) so the user can still move the
+   * window by grabbing the title-bar area. */
+  -webkit-app-region: no-drag;
   -webkit-user-select: none;
   user-select: none;
   cursor: default;
   overflow: hidden;
 }
 
-/* Utility: opt an interactive region out of the drag layer. */
+/* Utility: opt an interactive region out of the drag layer. Still
+ * useful for any header children that need explicit no-drag (the
+ * button selector below covers the four <button>s in the header). */
 .no-drag,
 button,
 input,
@@ -83,21 +118,104 @@ a,
 
 /* ─── Root container ────────────────────────────────────────────────── */
 
+/* The .coach root paints a layered soft drop-shadow into the
+ * transparent gutter around it. The window is frame:false +
+ * transparent:true with hasShadow:false (see src/main.js →
+ * createWindow); the native macOS NSWindow shadow is explicitly
+ * disabled so it doesn't draw its own ring on top of this CSS
+ * shadow and produce a visible outline. The full story behind the
+ * hasShadow:false choice lives in the comment on createWindow.
+ *
+ * The two-layer recipe below covers three failure modes seen in
+ * earlier revisions:
+ *
+ *   1. Leave a generous transparent gutter — `margin: 20px 20px 28px`
+ *      so the shadow has room to render OUTSIDE .coach before the
+ *      window edge clips it. (The old 8px margin clipped the shadow
+ *      at ~8px out, producing the hard-edged dark line under the
+ *      window in v1.1.0.)
+ *
+ *   2. Stack a wide-soft + tight-deep shadow. The wide shadow gives
+ *      the soft macOS-style halo that floats the card off the
+ *      desktop; the tighter, deeper shadow grounds it so the rounded
+ *      corners don't look like they're hovering in space. An earlier
+ *      revision added a third 0.5px white-at-6% "rim" layer for a
+ *      Sequoia-style card edge, but on a frame:false + transparent
+ *      Electron window a 0.5px-spread shadow rasterises as a hard
+ *      1px ring around the whole bundle instead of blending into
+ *      the halo — so the rim was dropped and the two remaining
+ *      shadows were nudged wider/deeper to keep the card grounded
+ *      without it.
+ *
+ *   3. Don't rely on the native macOS shadow as a fallback. With
+ *      hasShadow:true the OS draws an NSWindow shadow around the
+ *      alpha mask of the rendered content; even the soft outer
+ *      pixels of this CSS shadow are enough to anchor a sharp ring
+ *      around them. main.js now sets hasShadow:false so the CSS
+ *      below is the sole source of elevation.
+ *
+ *  height: calc(100vh - 48px) accounts for margin: 20 top + 28 bottom. */
 .coach {
   position: relative;
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 16px);
-  margin: 8px;
+  height: calc(100vh - 48px);
+  margin: 20px 20px 28px;
   border-radius: var(--radius-card);
   background: var(--bg-card);
-  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.4);
+  box-shadow:
+    0 22px 56px -12px rgba(0, 0, 0, 0.55),
+    0 8px 20px -8px rgba(0, 0, 0, 0.35);
   overflow: hidden;
+}
+
+/* ─── Window-edge resize-grip affordance ────────────────────────────
+ *
+ * Decorative marker in the bottom-right of the window, sitting in
+ * the transparent gutter outside .coach. Pair with body=no-drag so
+ * the OS (Electron + frame:false + resizable:true) edge-resize
+ * hit-tests through the entire gutter, not just a 3–5px sliver at
+ * the very window edge. This element doesn't trigger the resize
+ * itself — it just signals that the corner is resizable so the
+ * user spots the affordance at a glance.
+ *
+ * Two faint diagonal stripes (via a repeating-linear-gradient)
+ * match the existing minimal monotone aesthetic — no accent colour.
+ * cursor: nwse-resize so the cursor flips when hovering the grip
+ * (belt-and-braces in case the OS edge-resize zone doesn't already
+ * paint the cursor over the grip's pixels). app-region: no-drag so
+ * the OS doesn't try to move the window from this corner. */
+.resize-grip {
+  -webkit-app-region: no-drag;
+  position: fixed;
+  right: 5px;
+  bottom: 5px;
+  width: 14px;
+  height: 14px;
+  background:
+    repeating-linear-gradient(
+      135deg,
+      transparent 0,
+      transparent 3px,
+      rgba(255, 255, 255, 0.12) 3px,
+      rgba(255, 255, 255, 0.12) 4px
+    );
+  cursor: nwse-resize;
+  z-index: 5;
+  opacity: 0.7;
+  transition: opacity 120ms ease;
+}
+
+.resize-grip:hover {
+  opacity: 1;
 }
 
 /* ─── Header ────────────────────────────────────────────────────────── */
 
+/* Header is the ONLY drag region. Buttons inside still opt out via
+ * the universal .no-drag/button selector so clicks reach them. */
 .coach__header {
+  -webkit-app-region: drag;
   display: grid;
   grid-template-columns: 1fr auto 1fr;
   align-items: center;
@@ -612,31 +730,117 @@ a,
   outline-offset: 2px;
 }
 
-/* ─── Body: three-column layout ──────────────────────────────────────
+/* ─── Body: 5-track CSS grid layout (v3 — resizable panes) ──────────
  *
- * Flex (not grid) so the rail-overlay can be positioned absolutely
- * within this container with stable insets (left = rail width, right =
- * captured width). `position: relative` makes the body the containing
- * block for the overlay. */
+ * Grid (not flex any more) so the user-draggable splitters can sit
+ * between adjacent panes as their own tracks rather than overlaid
+ * siblings. The 4px divider tracks ARE the splitter hit-targets:
+ * .splitter--rail / .splitter--captured grab on .coach__body and
+ * rewrite --rail-w / --captured-w; .splitter--drawer (inside the
+ * transcript-pane, not the body) writes --drawer-h.
+ *
+ * Clamp ranges (kept in sync with mountSplitter in src/renderer.js):
+ *
+ *   --rail-w        60–240px   (default 60; collapsed icons; >~140px
+ *                                reveals .pillar__label via a
+ *                                container query on .rail)
+ *   --captured-w    160px–dyn  (default 200; dyn-max =
+ *                                bodyWidth − rail − 360 (transcript
+ *                                floor) − 8 (two col-splitters))
+ *   --drawer-h      0–280px    (default auto / content-driven)
+ *
+ * `position: relative` makes the body the containing block for
+ * .rail-overlay; the overlay reads --rail-w / --captured-w directly
+ * so its insets track the live grid track widths. */
 
 .coach__body {
   position: relative;
-  display: flex;
+  display: grid;
+  grid-template-columns:
+    var(--rail-w, 60px)
+    var(--col-divider, 4px)
+    minmax(360px, 1fr)
+    var(--col-divider, 4px)
+    var(--captured-w, 200px);
+  /* Single row, but explicit `minmax(0, 1fr)` rather than the
+   * implicit `auto` so the row tracks the body's flex height
+   * instead of stretching to fit the transcript's content. Without
+   * this, a long transcript made the row grow past the body's
+   * visible bounds and pushed the bottom drawer off-screen (the
+   * .transcript-pane + .transcript-pane__list flex chain only
+   * resolves correctly when its grid-row parent has a definite
+   * height). v1.3.0 regression fix. */
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: 'rail rs-rail transcript rs-captured captured';
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
 }
 
+/* ─── Splitter (shared between col-resize and row-resize) ──────────
+ *
+ * One DOM element per seam (three total: rail/transcript,
+ * transcript/captured, list/footer). pointerdown → setPointerCapture
+ * → pointermove → write the var → pointerup; dblclick resets to the
+ * default; ArrowKeys nudge ±16px (Shift ×4, Home/End jump to clamp).
+ * Wired in src/renderer.js → mountSplitter().
+ *
+ * 4px hit-target is generous enough to grab with a trackpad but
+ * narrow enough to read as a divider rather than a column. The
+ * hover/dragging tint reuses the same `rgba(255, 255, 255, 0.08)`
+ * token used on .pillar:hover so the splitters feel native. */
+.splitter {
+  position: relative;
+  background: transparent;
+  transition: background 120ms ease;
+  -webkit-app-region: no-drag;
+}
+
+.splitter--rail {
+  grid-area: rs-rail;
+  cursor: col-resize;
+}
+.splitter--captured {
+  grid-area: rs-captured;
+  cursor: col-resize;
+}
+.splitter--drawer {
+  cursor: row-resize;
+  /* Sits between .transcript-pane__list (flex:1) and
+   * .transcript-pane__footer inside .transcript-pane. */
+  flex: 0 0 4px;
+}
+
+.splitter:hover,
+.splitter:focus-visible,
+.splitter[data-dragging='true'] {
+  background: rgba(255, 255, 255, 0.08);
+  outline: none;
+}
+
+.splitter:focus-visible {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+
 /* ─── Pillar rail (left column) ─────────────────────────────────────── */
 
+/* v3 (resizable panes): the rail is its own grid track on
+ * .coach__body, so flex-basis is gone. Width comes from --rail-w on
+ * .coach__body (default 60px, resizable 60–240). When the rail
+ * crosses ~140px the icon labels reveal via a container query on
+ * .rail itself (the rail IS the query container — no class toggle in
+ * JS). */
 .rail {
   -webkit-app-region: no-drag;
-  flex: 0 0 60px;
+  grid-area: rail;
+  container-type: inline-size;
+  container-name: rail;
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding: 10px 8px;
   border-right: 1px solid var(--border-soft);
+  overflow-x: hidden;
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
@@ -665,6 +869,39 @@ a,
   color: var(--text-med);
   cursor: pointer;
   transition: background 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+/* Icon label sibling of .pillar__glyph. Hidden by default (rail in
+ * its collapsed 60px state); revealed via the container query below
+ * when the rail crosses ~140px so the user can resize the rail wider
+ * for the "icons + labels" mode without flipping any JS state. */
+.pillar__label {
+  display: none;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  color: inherit;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Container query: the rail IS the @container, so the threshold is
+ * measured against the rail's own inline-size (which is exactly the
+ * --rail-w track on .coach__body). 140px was picked by inspection:
+ * collapsed=60, expanded=160 default — the threshold sits comfortably
+ * between the two so the user has to deliberately drag past the
+ * default expanded width before labels appear. */
+@container rail (min-width: 140px) {
+  .pillar {
+    width: auto;
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 0 10px;
+  }
+  .pillar__label {
+    display: inline;
+  }
 }
 
 .pillar:hover {
@@ -774,28 +1011,62 @@ a,
 
 /* ─── Transcript pane (middle column) ──────────────────────────────── */
 
-/* Two-row flex: a scrolling transcript list on top, a pinned footer at
- * the bottom that holds the coach's "ask this next" suggestion. Only
- * the list scrolls — the suggestion never gets cropped no matter how
- * long the conversation runs.
+/* Three-row flex: a scrolling transcript list on top, a 4px row
+ * splitter, then a pinned footer at the bottom that holds the
+ * coach's "ask this next" suggestion. Only the list scrolls — the
+ * suggestion never gets cropped no matter how long the conversation
+ * runs.
  *
- * `min-width: 0` is load-bearing inside the .coach__body flex container
- * — without it, no-wrap content forces the pane to auto-size to fit and
- * pushes the captured pane on the right off-screen. */
+ * `min-width: 0` is still load-bearing — without it, no-wrap content
+ * forces the column to auto-size and pushes the captured pane on the
+ * right off-screen even though grid sizes the track.
+ *
+ * v3 (resizable panes): a container query keys ask-button label
+ * collapse off the pane's own width rather than the viewport. */
 .transcript-pane {
   -webkit-app-region: no-drag;
   -webkit-user-select: text;
   user-select: text;
-  flex: 1 1 auto;
+  grid-area: transcript;
+  container-type: inline-size;
+  container-name: transcript;
   min-width: 0;
   min-height: 0;
+  /* Pane height is set by the parent grid row (.coach__body's
+   * minmax(0, 1fr) — see the comment on .coach__body). Making it
+   * an explicit `height: 100%` here forces the height to be
+   * *definite* for percentage-based max-height resolution inside
+   * the footer below (without this, some browsers treat the
+   * stretched grid item as having an indefinite height and
+   * `max-height: calc(100% - N)` collapses to 0 — i.e. drawer
+   * disappears). */
+  height: 100%;
   display: flex;
   flex-direction: column;
   background: rgba(0, 0, 0, 0.18);
+  /* Belt-and-braces clip. The flex children below are sized so
+   * nothing overflows in practice, but if something inside the
+   * pane ever exceeds the available height we clip at the pane
+   * edge rather than leaking into the captured pane or — worse —
+   * past the bottom of .coach__body and underneath the visible
+   * window edge (the v1.3.0 drawer-sinks-off-screen bug). */
+  overflow: hidden;
 }
 
+/* List takes ALL the remaining vertical space inside the pane
+ * after the footer (and the row-splitter between them) claim
+ * theirs. Crucial detail: flex-basis is `0`, not `auto`. With
+ * `auto` the basis equals the content's intrinsic height — and
+ * once the transcript exceeds the pane, flex distributes the
+ * negative free space proportionally to (flex-shrink × basis),
+ * so the list AND the footer both shrink, the footer's
+ * overflow:hidden clips its suggestion card, and the drawer's
+ * bottom rows disappear underneath what the user can see. With
+ * basis 0 the list contributes 0 to that distribution; the
+ * footer's flex-shrink:0 (below) then keeps the drawer at its
+ * intended height and the list scrolls internally instead. */
 .transcript-pane__list {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   padding: 12px 16px;
@@ -852,6 +1123,43 @@ a,
  * thinking dot sits inline at the top-left so the seller can tell
  * whether the coach is between roundtrips even when no suggestion is
  * currently displayed. */
+/* v3 (resizable panes): when --drawer-h is set on .transcript-pane
+ * the footer's height matches; otherwise it grows naturally with its
+ * children. The 0–280 clamp is enforced by mountSplitter so this
+ * rule just has to do whatever the var says. min-height: 0 lets the
+ * user drag the splitter down to fully collapse the drawer (0px).
+ *
+ * v1.3.2 drawer-anchor fix
+ * ─────────────────────────
+ * Two flex tweaks together GUARANTEE the drawer never sinks below
+ * the visible pane:
+ *
+ *   1. `flex: 0 0 auto` (flex-grow 0, flex-shrink 0, basis from
+ *      `height`). This is the load-bearing change: with the prior
+ *      default `flex: 0 1 auto`, a tall transcript would force the
+ *      flex algorithm to distribute negative free space across both
+ *      the list AND this footer (both flex-shrink:1) — the footer
+ *      shrank and overflow:hidden clipped the suggestion's bottom
+ *      rows out of view. flex-shrink:0 here pins the footer at its
+ *      `height` (which is `var(--drawer-h, auto)`, ie either the
+ *      user's drag-set height or the natural content height).
+ *
+ *   2. `max-height: calc(100% - 80px)` so the footer can NEVER
+ *      eat all the pane: it has to leave at least 80px for the
+ *      list + 4px row-splitter (~3 transcript lines). Belt-and-
+ *      braces for cases where the saved --drawer-h was set on a
+ *      tall window and the user later shrinks the window below
+ *      the saved size; without this cap, flex-shrink:0 + a stale
+ *      drawer-h would overflow the pane and push the bottom of
+ *      the drawer off-screen again. The runtime splitter clamp
+ *      (dynamicDrawerMax in src/renderer.js) recomputes the same
+ *      bound on every drag/resize, but this CSS cap is the
+ *      authoritative guard if state is ever ahead of the JS.
+ *
+ * Net effect: the footer's BOTTOM EDGE always sits flush with the
+ * pane's bottom (which itself sits flush with .coach__body's
+ * bottom thanks to the grid-template-rows: minmax(0, 1fr) above);
+ * the list scrolls internally above it. */
 .transcript-pane__footer {
   -webkit-user-select: text;
   user-select: text;
@@ -861,6 +1169,12 @@ a,
   padding: 8px 14px 10px;
   border-top: 1px solid var(--border-soft);
   background: rgba(255, 255, 255, 0.03);
+  height: var(--drawer-h, auto);
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: calc(100% - 80px);
+  overflow: hidden;
+  box-sizing: border-box;
 }
 
 /* If every footer child is hidden, drop the chrome so the empty area
@@ -869,6 +1183,24 @@ a,
   border-top-color: transparent;
   background: transparent;
   padding: 0;
+}
+
+/* v3 reflow: at narrow transcript widths the four ask buttons start
+ * truncating their labels before the buttons themselves shrink.
+ * Visually-hide the .ask-btn__label (kept screen-reader-readable) so
+ * the glyph + the existing `title=` tooltip carry the affordance. */
+@container transcript (max-width: 440px) {
+  .ask-btn__label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
 }
 
 /* ── v2.5: rep-initiated ask controls ─────────────────────────────
@@ -984,6 +1316,125 @@ a,
   }
 }
 
+/* ── Ask-button in-flight progress overlay (v3) ─────────────────────
+ *
+ * Per-click translucent fill that animates left-to-right while a
+ * coach:suggestion roundtrip is in flight. Each subsequent click
+ * before the first response stacks ANOTHER layer — the rep sees
+ * "two requests queued" as a darker shade thanks to alpha
+ * compositing of the white-at-10% layers.
+ *
+ * Per-kind duration is set via the `--progress-duration` custom
+ * property on the parent .ask-btn (driven by data-kind below). The
+ * stacking, snap, hold, fade, and failure tints all live in the
+ * helper functions in src/renderer.js — see startAskProgressLayer
+ * and completeAskProgressLayer.
+ *
+ * Reduced motion: under (prefers-reduced-motion: reduce) the entire
+ * overlay block is suppressed (no animation, no element). The
+ * existing 160ms .ask-btn[data-pulsing] flash and the textual
+ * "Recap in progress…" pill carry the affordance instead — explicit
+ * user decision per the user-decision overrides.
+ *
+ * Stacking cap: 5 visible layers max. A 6th click while 5 are still
+ * active fires the IPC anyway (the rep wants the request sent) but
+ * skips the visual layer to keep the button readable. See
+ * startAskProgressLayer for the gate. */
+.ask-btn {
+  position: relative;
+  overflow: hidden;
+}
+
+.ask-btn__glyph,
+.ask-btn__label,
+.ask-btn__status {
+  position: relative;
+  z-index: 1;
+}
+
+/* Per-kind default progress duration. SNAPPY per the user-decision
+ * override (the plan's defaults of 6 s / 9 s felt slow). The
+ * renderer reads `--progress-duration` from the live computed style
+ * on the layer's parent button if it ever needs the value at
+ * runtime, but the animation itself is driven straight from CSS
+ * via the custom property. */
+.ask-btn[data-kind='next'],
+.ask-btn[data-kind='deeper'],
+.ask-btn[data-kind='pivot'] {
+  --progress-duration: 4000ms;
+}
+.ask-btn[data-kind='recap'] {
+  --progress-duration: 7000ms;
+}
+
+/* Whole overlay block is gated on prefers-reduced-motion:
+ * no-preference — under reduce, none of these rules apply so the
+ * layer (even if accidentally created) is invisible. The renderer
+ * additionally short-circuits layer creation under reduced motion
+ * for belt-and-braces. */
+@media (prefers-reduced-motion: no-preference) {
+  .ask-btn__progress {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    transform-origin: left center;
+    transform: scaleX(0);
+    background: rgba(255, 255, 255, 0.10);
+    opacity: 1;
+    border-radius: inherit;
+    will-change: transform, opacity, background;
+  }
+
+  /* Phase 1 — fill (0 → 0.92) over the kind's --progress-duration
+   * with a smooth ease-out that visibly decelerates near 92%, giving
+   * the rep a "still working" feel without claiming completion. */
+  .ask-btn__progress[data-state='active'] {
+    animation: ask-progress-fill var(--progress-duration, 4000ms)
+      cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  @keyframes ask-progress-fill {
+    from { transform: scaleX(0); }
+    to   { transform: scaleX(0.92); }
+  }
+
+  /* Phase 2 — completion snap (150ms linear). Triggered when the
+   * matching coach:suggestion IPC lands; reads as "and… landed". */
+  .ask-btn__progress[data-state='completing'] {
+    animation: ask-progress-snap 150ms linear forwards;
+  }
+
+  @keyframes ask-progress-snap {
+    from { transform: scaleX(0.92); }
+    to   { transform: scaleX(1.0); }
+  }
+
+  /* Phase 4 — fade. Phase 3 (hold) is implemented in JS as a
+   * 250ms setTimeout between completing and fading so it doesn't
+   * need its own keyframe. */
+  .ask-btn__progress[data-state='fading'] {
+    animation: none;
+    transform: scaleX(1.0);
+    transition: opacity 200ms linear;
+    opacity: 0;
+  }
+
+  /* Failure path (per-layer timeout). 30s for next/deeper/pivot,
+   * 15s for recap (matches the existing Recap pill safety timer).
+   * Cross-fades to an --accent-red tint at ~25% alpha, holds for
+   * 1500ms, then the renderer removes the node. */
+  .ask-btn__progress[data-state='failing'] {
+    animation: ask-progress-fail 350ms linear forwards;
+  }
+
+  @keyframes ask-progress-fail {
+    0%   { transform: scaleX(0.92); background: rgba(255, 255, 255, 0.10); }
+    43%  { transform: scaleX(1.0);  background: rgba(255, 255, 255, 0.10); }
+    100% { transform: scaleX(1.0);  background: rgba(248, 113, 113, 0.25); }
+  }
+}
+
 /* Coach suggestion card — the "ask this next" surface. */
 .suggestion {
   display: flex;
@@ -1003,12 +1454,97 @@ a,
 /* v2.5 redesign: pinned card greens the moment the coach validates
  * the seller actually asked the pinned question. Mirrors the drawer's
  * .logged-entry--asked treatment so the two surfaces read as the same
- * signal. Gated in the renderer on settings.coach.trackQuestionState
- * so when the feature is off the card stays in the neutral .suggestion
- * skin even if a stale data-asked='true' attribute lingers. */
+ * signal. Two paths can flip the underlying `asked` flag:
+ *   1. The AI's `mark_question_asked` tool (gated on
+ *      settings.coach.trackQuestionState server-side — when the toggle
+ *      is off the tool is never declared, so the model can't fire it).
+ *   2. The manual tick button (.suggestion__mark-asked, added with the
+ *      mark-as-asked feature) — always available, independent of the
+ *      toggle.
+ * Either way the renderer keys the visual off `data-asked='true'`. */
 .suggestion[data-asked='true'] {
   border-color: rgba(74, 222, 128, 0.45);
   background: rgba(74, 222, 128, 0.08);
+}
+
+/* Mark-as-asked tick button. Sits in .suggestion__label between the
+ * kind/pillar chips and the Skip pill. Visual register: same compact
+ * pill chrome as .suggestion__skip so the two controls read as the
+ * same family, but with a checkmark icon instead of text and a green
+ * tint in the active (pressed / asked) state so it doubles as a
+ * status badge once the entry is flipped.
+ *
+ * Reuses the green palette from .suggestion[data-asked='true'] so the
+ * pressed state matches the parent card's tint when both apply. */
+.suggestion__mark-asked {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: var(--radius-pill);
+  padding: 1px 6px;
+  font: inherit;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+/* When the .suggestion__mark-asked button is the FIRST right-aligned
+ * control in the label row, the tick claims the auto margin and pushes
+ * the cluster to the right; Skip drops its own auto margin so it sits
+ * directly after the tick (letting both auto-margins fight would shove
+ * Skip past the right edge and leave a visual gap between the two).
+ * The label row order is:
+ *   [kind] [pillar] ...... [✓ tick] [Skip]
+ * Spacing between tick and Skip falls out of the parent flex `gap:6px`. */
+.suggestion__mark-asked + .suggestion__skip {
+  margin-left: 0;
+}
+
+.suggestion__mark-asked:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: var(--text-strong);
+}
+
+.suggestion__mark-asked:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 2px;
+}
+
+.suggestion__mark-asked:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Pressed / asked state — keys off the same data-asked attribute the
+ * parent card uses, so the toggle button and the card greens together
+ * via a single source of truth. The matching colour palette echoes
+ * .logged-entry--asked from the left-drawer rendering. */
+.suggestion__mark-asked[data-asked='true'] {
+  background: rgba(74, 222, 128, 0.18);
+  border-color: rgba(74, 222, 128, 0.5);
+  color: rgba(74, 222, 128, 0.95);
+  cursor: default;
+}
+
+.suggestion__mark-asked[data-asked='true']:hover {
+  background: rgba(74, 222, 128, 0.22);
+  border-color: rgba(74, 222, 128, 0.6);
+  color: rgba(74, 222, 128, 1);
+}
+
+/* Icon sits inline with the pill chrome. Fixed size so the button's
+ * footprint stays predictable as the suggestion card's question
+ * length changes. */
+.suggestion__mark-asked-icon {
+  width: 12px;
+  height: 12px;
+  display: block;
 }
 
 /* Pulsing "thinking" dot — visible while a coach tick is in-flight.
@@ -1173,11 +1709,14 @@ a,
   position: absolute;
   top: 0;
   bottom: 0;
-  /* Inset so the rail stays clickable on the left and the captured
-   * pane stays visible on the right. Values match .rail flex-basis
-   * and .captured flex-basis below. */
-  left: 60px;
-  right: 200px;
+  /* v3 (resizable panes): insets track the live grid track widths via
+   * --rail-w / --captured-w on .coach__body. The overlay is a child
+   * of .coach__body so cascade resolves them with no extra plumbing.
+   * Test: drag the captured splitter to its widest setting and click
+   * a pillar — the overlay's right edge should sit flush against the
+   * captured pane's left edge, not 200px in from the window edge. */
+  left: var(--rail-w, 60px);
+  right: var(--captured-w, 200px);
   background: rgba(0, 0, 0, 0);
   transition: background 200ms ease;
   pointer-events: none;
@@ -1640,11 +2179,18 @@ a,
 
 /* ─── Captured pane (right column) ──────────────────────────────────── */
 
+/* v3 (resizable panes): width comes from --captured-w on .coach__body
+ * (default 200, resizable 160–dyn). Container queries below key
+ * reflow rules off the pane's own inline-size rather than the
+ * viewport so the rules track the user's pane width, not the window.
+ */
 .captured {
   -webkit-app-region: no-drag;
   -webkit-user-select: text;
   user-select: text;
-  flex: 0 0 200px;
+  grid-area: captured;
+  container-type: inline-size;
+  container-name: captured;
   padding: 14px 14px;
   border-left: 1px solid var(--border-soft);
   overflow-y: auto;
@@ -1653,6 +2199,36 @@ a,
   gap: 12px;
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+}
+
+/* Narrow (< 220px — below the 200px default, only reached if the
+ * user drags the splitter narrower): tighten quick-fix typography
+ * and ellipsis the breakdown rows so labels never wrap onto a
+ * second line. */
+@container captured (max-width: 219px) {
+  .quick-fix__row-label,
+  .quick-fix__row-notes {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .quick-fix__title {
+    font-size: 11px;
+  }
+}
+
+/* Wide (≥ 320px): the captured pane has enough room for two columns
+ * of (label, value) pairs without .captured__value getting cramped.
+ * Promote .captured__group to a 2-col grid and roomier headline. */
+@container captured (min-width: 320px) {
+  .captured__group {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+  }
+  .quick-fix__headline {
+    font-size: 16px;
+  }
 }
 
 .captured::-webkit-scrollbar {
@@ -2254,6 +2830,61 @@ a,
   text-transform: uppercase;
   letter-spacing: 0.6px;
   color: var(--text-dim);
+}
+
+/* Right-side cluster of header controls (export button + confidence
+ * pill). Wraps the two so they sit together against the right edge
+ * of the header while the title still anchors to the left. */
+.quick-fix__controls {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+/* Export button — small text affordance that copies the full rollup +
+ * facts payload to the clipboard. Visual register matches the existing
+ * confidence pill (compact pill chrome, uppercase microcopy) so the
+ * two read as a pair rather than competing elements. Three runtime
+ * states keyed off data-state:
+ *   default  → muted outline
+ *   'copied' → green flash (1.5s, then back to default)
+ *   'error'  → red flash for clipboard permission failures */
+.quick-fix__export {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+  font-family: inherit;
+}
+
+.quick-fix__export:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-strong);
+  border-color: var(--border-strong, rgba(255, 255, 255, 0.18));
+}
+
+.quick-fix__export:focus-visible {
+  outline: 2px solid rgba(74, 222, 128, 0.6);
+  outline-offset: 2px;
+}
+
+.quick-fix__export[data-state='copied'] {
+  background: rgba(74, 222, 128, 0.16);
+  border-color: rgba(74, 222, 128, 0.4);
+  color: #4ade80;
+}
+
+.quick-fix__export[data-state='error'] {
+  background: rgba(248, 113, 113, 0.16);
+  border-color: rgba(248, 113, 113, 0.4);
+  color: var(--accent-red);
 }
 
 /* Confidence pill — three colour variants. Sits to the right of the

@@ -607,6 +607,61 @@ export class Coach {
   }
 
   /**
+   * Record that the rep has asked a previously-pinned item — used by
+   * main's manual mark-asked path when the seller clicks the tick
+   * button on the pinned suggestion card. This is the COACH-SIDE
+   * counterpart to flipping `entry.asked = true` in suggestionHistory:
+   * the history flag drives the renderer's green tint, but the
+   * suppression of "model picks this item again on the next tick"
+   * lives here in the skip set.
+   *
+   * Why skippedItemIds (and not e.g. a new "askedItemIds" set):
+   *   - formatCoachState() already filters candidates by both
+   *     coveredSet AND skippedSet, so stamping the skip set is the
+   *     cheapest way to drop the item out of the model's selection
+   *     pool. The TTL pruning (SKIPPED_TTL_MS, 60s) gives us a
+   *     reasonable hide window — long enough that an aggressive
+   *     model can't immediately re-pin it, short enough that a
+   *     conversation that genuinely needs to revisit the topic isn't
+   *     locked out forever.
+   *   - Reusing the existing set keeps the prompt's RECENTLY SKIPPED
+   *     diagnostic stable; the model already understands "don't
+   *     re-suggest these unless boosted".
+   *
+   * Side-effects:
+   *   - Stamps `itemId` in `skippedItemIds` with `Date.now()`.
+   *   - If the current pin's itemId matches, clears `lastSuggestion`
+   *     so a subsequent rep-click → requestSuggestion gets a fresh
+   *     selection rather than treating the asked pin as still-live
+   *     (which would also stamp it AGAIN, no-op but noisy in logs).
+   *
+   * Idempotent: calling repeatedly with the same id just refreshes
+   * the skip timestamp. Calling with a missing / non-string id is a
+   * no-op so callers don't have to validate first.
+   *
+   * Notes:
+   *   - Freeform sentinels (`freeform.deeper`, `freeform.recap`)
+   *     are filtered out so a freeform sentinel id doesn't end up
+   *     in the prompt's RECENTLY SKIPPED line. Those sentinels
+   *     aren't in `ITEMS` and would never appear as candidates
+   *     anyway; stamping them buys nothing and just clutters the
+   *     diagnostic.
+   *   - Does NOT fire a tick. Manual mark-asked is a passive state
+   *     mutation — the rep isn't asking for a new suggestion, just
+   *     declaring the current pin done. A fresh suggestion will
+   *     arrive when the rep next clicks Suggest/Deeper/Pivot/Recap.
+   */
+  markItemAsAsked(itemId) {
+    if (typeof itemId !== 'string' || !itemId) return;
+    if (itemId.startsWith('freeform.')) return;
+    this.skippedItemIds.set(itemId, Date.now());
+    if (this.lastSuggestion?.itemId === itemId) {
+      this.lastSuggestion = null;
+    }
+    console.log('[coach] manual mark-asked → suppressed for', SKIPPED_TTL_MS, 'ms:', itemId);
+  }
+
+  /**
    * True iff there is a currently-pinned suggestion. Used by the main
    * process's pause detector to gate "fire a pause suggestion" — we
    * don't want to overwrite a live pin just because the room went
@@ -638,10 +693,45 @@ export class Coach {
     // ticks still queue behind in-flight as before — the gate is the
     // load-bearing constraint that prevents overlapping periodic
     // tool dispatches racing on shared coachContext state.
-    if (this.state !== 'running') return;
-    if (!priority && this.inFlight) return;
+    //
+    // Silent-failure logging: each early return that prevents a
+    // queued suggestion from firing logs a `[coach-silent-failure]`
+    // line so post-call debugging can answer "why didn't my Suggest
+    // button do anything?" by grepping the renderer console. We only
+    // log when a kind was actually queued (queuedSuggestionKind !== null)
+    // so the high-frequency "passive periodic tick" path stays silent.
+    if (this.state !== 'running') {
+      if (this.queuedSuggestionKind !== null) {
+        console.warn(
+          '[coach-silent-failure] _tick: skipped because state is',
+          this.state,
+          '— queued kind was',
+          this.queuedSuggestionKind,
+        );
+      }
+      return;
+    }
+    if (!priority && this.inFlight) {
+      if (this.queuedSuggestionKind !== null) {
+        console.warn(
+          '[coach-silent-failure] _tick: skipped because a previous tick is in-flight — queued kind was',
+          this.queuedSuggestionKind,
+        );
+      }
+      return;
+    }
     const ctx = this.getContext();
-    if (!ctx || !ctx.transcriptWindow || ctx.transcriptWindow.length < 25) return;
+    if (!ctx || !ctx.transcriptWindow || ctx.transcriptWindow.length < 25) {
+      if (this.queuedSuggestionKind !== null) {
+        console.warn(
+          '[coach-silent-failure] _tick: skipped because transcript window has',
+          ctx?.transcriptWindow?.length || 0,
+          'chars (<25 required) — queued kind was',
+          this.queuedSuggestionKind,
+        );
+      }
+      return;
+    }
 
     // itemStates is the source of truth for the coach prompt's "what's
     // already covered" block; main.js mirrors it from the dispatched

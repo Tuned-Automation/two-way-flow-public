@@ -50,6 +50,21 @@ import { contextBridge, ipcRenderer } from 'electron';
  *                                (localStorage); main holds a live
  *                                copy because the pause detector keys
  *                                off it.
+ *     coach:mark-suggestion-asked
+ *                              — { suggestionId } — rep clicked the
+ *                                tick button on a pinned suggestion.
+ *                                Mirrors the side-effects of the AI's
+ *                                `mark_question_asked` tool (flips
+ *                                the history entry's `asked` flag +
+ *                                broadcasts), and additionally
+ *                                transitions the corresponding rubric
+ *                                item to 'logged' so the model
+ *                                naturally avoids re-suggesting it
+ *                                on the next tick. Idempotent — a
+ *                                second click on an already-asked
+ *                                entry resolves with
+ *                                { ok: true, alreadyAsked: true }
+ *                                and is a no-op server-side.
  *     summary:save             — { format, content } — open Save dialog
  *                                and write the summary to disk.
  *                                (Refactored in Phase 1 to route
@@ -312,6 +327,14 @@ contextBridge.exposeInMainWorld('gemini', {
   // every time the user flips the header toggle so the pause detector
   // can light up / dim live.
   setCoachMode: (mode) => ipcRenderer.invoke('coach:set-mode', { mode }),
+  // Manual mark-as-asked. Fired by the tick button on the pinned
+  // suggestion card. Mirrors the AI's `mark_question_asked` side-
+  // effects (flips entry.asked) and additionally transitions the
+  // rubric item to 'logged' so the next coach tick's candidate list
+  // drops it. Idempotent — repeated clicks on an already-asked entry
+  // resolve without re-running the side-effects.
+  markSuggestionAsked: (suggestionId) =>
+    ipcRenderer.invoke('coach:mark-suggestion-asked', { suggestionId }),
   // ArrayBuffer / Uint8Array survives structured clone across the bridge.
   sendMicAudio: (pcmChunk) => ipcRenderer.send('gemini:audio:channel1', pcmChunk),
   sendSystemAudio: (pcmChunk) => ipcRenderer.send('gemini:audio:channel2', pcmChunk),

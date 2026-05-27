@@ -66,7 +66,30 @@ const DEFAULT_INTERVAL_MS = 12_000;
 
 /* Enums kept in lockstep with the legacy `record_meeting_fact` tool
  * shape so existing entries from older call snapshots still validate
- * if a future migration ever replays them. */
+ * if a future migration ever replays them.
+ *
+ * The first seven kinds (current_spend through other) feed the Stage-2
+ * rollup. The last three (context_only, hypothetical_fix_cost,
+ * stated_total) are post-test-call additions:
+ *
+ *   - `context_only` — base salaries, hourly rates, headcount stated
+ *     for context. Stage-2 filters these out before sending the FACTS
+ *     list to the rollup model; they exist purely so the renderer can
+ *     surface them for drill-through if needed. Heuristic: would the
+ *     prospect RECOVER this dollar figure if their problem were
+ *     solved? If no, it's context.
+ *
+ *   - `hypothetical_fix_cost` — prospective hires or tool purchases
+ *     the prospect mentions as a hypothetical fix. Stage-2 filters
+ *     these out too. Heuristic: would this expense only happen IF the
+ *     prospect adopted a fix?
+ *
+ *   - `stated_total` — the speaker's own bottom-line sum of their
+ *     opportunity ("we're talking $120-130K all in"). Stage-2 uses the
+ *     LATEST stated_total as a headline ANCHOR so the rollup stays
+ *     within ±20% of what the prospect said. Without this, the model
+ *     re-derives a number that drifts away from ground truth (the
+ *     $341K wobble seen on the 2026-05-26 test call). */
 const KIND_VALUES = [
   'current_spend',
   'pain_cost',
@@ -75,9 +98,30 @@ const KIND_VALUES = [
   'time_cost',
   'headcount_cost',
   'other',
+  'context_only',
+  'hypothetical_fix_cost',
+  'stated_total',
 ];
 const UNIT_VALUES = ['usd', 'hours', 'people', 'percent'];
 const PERIOD_VALUES = ['one_time', 'weekly', 'monthly', 'quarterly', 'annual'];
+
+/* Monetary kinds where a bare amount under $5K is almost certainly a
+ * transcription artefact, not a real $30 line item. The Stage-1 scanner
+ * drops these rather than letting them through to Stage-2 where they
+ * compound into a wrong rollup. `time_cost`, `other`, `context_only`,
+ * and `hypothetical_fix_cost` are deliberately EXCLUDED — they have
+ * legitimate small-amount usages (e.g. "$150 hourly rate", "$500
+ * one-time setup fee"). `stated_total` IS included because a bottom-
+ * line opportunity stated as "$30" is virtually always meant to be
+ * "$30 grand". */
+const IMPLAUSIBILITY_USD_KINDS = new Set([
+  'current_spend',
+  'pain_cost',
+  'savings_opportunity',
+  'revenue_uplift',
+  'headcount_cost',
+  'stated_total',
+]);
 
 /**
  * Stage-1 system prompt. The scanner's job is narrowly scoped:
@@ -100,11 +144,25 @@ const FACTS_SYSTEM_PROMPT = [
   '  {',
   '    "kind":          one of "current_spend" | "pain_cost" |',
   '                     "savings_opportunity" | "revenue_uplift" |',
-  '                     "time_cost" | "headcount_cost" | "other".',
-  '                     Pick the closest match; prefer "other" over',
-  '                     guessing.',
-  '    "amount":        the raw number AS STATED (do not convert units),',
-  '                     e.g. "$50K/yr" → 50000; "10 hours a week" → 10.',
+  '                     "time_cost" | "headcount_cost" | "other" |',
+  '                     "context_only" | "hypothetical_fix_cost" |',
+  '                     "stated_total". See KIND CLASSIFICATION below',
+  '                     — check the three new kinds (context_only,',
+  '                     hypothetical_fix_cost, stated_total) FIRST,',
+  '                     since they take priority when they apply.',
+  '    "amount":        the number in BASE UNITS. ALWAYS apply',
+  '                     thousands / millions multipliers from the',
+  '                     speaker\'s words; never store a small bare',
+  '                     integer when the speaker clearly meant',
+  '                     thousands. Examples:',
+  '                       "$50K/yr"             → 50000',
+  '                       "thirty grand a year" → 30000',
+  '                       "$15.20 grand"        → 15200',
+  '                       "$4M ARR"             → 4000000',
+  '                       "10 hours a week"     → 10',
+  '                       "5%"                  → 5',
+  '                     Do not convert period — hours/week stays',
+  '                     weekly; Stage-2 handles annualisation.',
   '    "unit":          one of "usd" | "hours" | "people" | "percent".',
   '                     Pick the unit that matches "amount".',
   '    "period":        one of "one_time" | "weekly" | "monthly" |',
@@ -133,6 +191,61 @@ const FACTS_SYSTEM_PROMPT = [
   '                     still use the `correction` flag to relax its',
   '                     monotonic constraint.',
   '  }',
+  '',
+  'KIND CLASSIFICATION (check in priority order, top down):',
+  '',
+  '  a. `stated_total` — the speaker explicitly sums their own',
+  '     opportunity in one breath. Cues: "all in", "so we\'re talking",',
+  '     "we\'re looking at", "add it all up", followed by a single',
+  '     bottom-line number that covers their whole problem. Examples:',
+  '       Prospect: "all in, we\'re probably leaving 70-80 grand on',
+  '                 the table every year, just from disorganization."',
+  '         → stated_total, amount: 75000, period: annual',
+  '           (use mid-point when the speaker gives a range)',
+  '       Prospect: "so we\'re talking $100K or more when you really',
+  '                 add it up."',
+  '         → stated_total, amount: 100000, period: annual',
+  '     Only emit for explicit roll-ups — NOT for individual line',
+  '     items. Multiple stated_totals can exist in one call (the',
+  '     speaker may revise their estimate); Stage-2 uses the LATEST.',
+  '',
+  '  b. `context_only` — base salaries, hourly rates, headcount, or',
+  '     any other figure volunteered as REFERENCE INFO rather than as',
+  '     a waste/opportunity. Heuristic: would the speaker RECOVER this',
+  '     dollar figure if their problem were solved? If NO →',
+  '     context_only. Examples:',
+  '       Prospect: "I pay myself around $80K a year"',
+  '         → context_only, amount: 80000, unit: usd, period: annual',
+  '       Prospect: "my hourly rate is around $150"',
+  '         → context_only, amount: 150, unit: usd, period: one_time',
+  '       Prospect: "we have 12 people on the team"',
+  '         → context_only, amount: 12, unit: people, period: one_time',
+  '',
+  '  c. `hypothetical_fix_cost` — prospective hires, tool purchases,',
+  '     or other expenses the speaker mentions as a hypothetical fix',
+  '     to their problem. Heuristic: would this expense only happen',
+  '     IF the prospect adopted a fix? If yes → hypothetical_fix_cost.',
+  '     Examples:',
+  '       Prospect: "another 30-40 grand a year in payroll if I',
+  '                 hired an ops person"',
+  '         → hypothetical_fix_cost, amount: 35000, period: annual',
+  '       Prospect: "the tool itself would be maybe $5K a year"',
+  '         → hypothetical_fix_cost, amount: 5000, period: annual',
+  '',
+  '  d. The existing seven kinds, when none of the above apply:',
+  '       - current_spend       — what the prospect is paying today',
+  '                               for the problem area.',
+  '       - pain_cost           — money/time wasted by the broken',
+  '                               status quo.',
+  '       - savings_opportunity — would-be savings if the problem',
+  '                               were solved.',
+  '       - revenue_uplift      — additional revenue if the problem',
+  '                               were solved.',
+  '       - time_cost           — hours/people wasted in the status',
+  '                               quo.',
+  '       - headcount_cost      — team size or salary cost burden.',
+  '       - other               — catch-all for anything monetary that',
+  '                               doesn\'t fit cleanly above.',
   '',
   'Critical rules:',
   '  1. ADD-ONLY semantics. The scanner is the source of new facts on',
@@ -187,12 +300,64 @@ const FACTS_SCHEMA = {
 };
 
 /**
+ * Coerce a monetary amount when the anchor_quote indicates a thousands
+ * / millions multiplier that the model failed to apply.
+ *
+ * Background: Deepgram occasionally drops the "grand"/"K" suffix from
+ * sales-call audio ("$30 a year" instead of "$30 grand a year"). The
+ * Stage-1 model dutifully stores `30`, which compounds into a wrong
+ * Stage-2 rollup. This post-processor reads the anchor_quote for
+ * "grand"/"thousand"/"K"/"M"/"million" tokens and multiplies the
+ * amount accordingly when it's too small to plausibly be the literal
+ * value.
+ *
+ * Only applied to monetary facts (unit === 'usd'). Hours, percent, and
+ * people don't share the same magnitude ambiguity.
+ *
+ * Conservative on purpose: only scales UP when the amount is below the
+ * relevant threshold (1000 for thousands, 100_000 for millions). A
+ * model that already correctly returned 30000 with anchor "30 grand"
+ * is not double-scaled.
+ *
+ * @param {number} amount      The amount the model returned.
+ * @param {string} anchorQuote The quote it claims to come from.
+ * @param {string} unit        Validated unit string.
+ * @returns {number} Adjusted amount.
+ */
+function normaliseMagnitude(amount, anchorQuote, unit) {
+  if (unit !== 'usd') return amount;
+  if (!Number.isFinite(amount)) return amount;
+  const quote = String(anchorQuote || '').toLowerCase();
+  // "30k" / "$30 k" / "thirty k" — \b matching catches a bare K that
+  // isn't part of a larger word (e.g. "okay"). "$30K" with no space
+  // also matches because \b sits between the digit and the letter.
+  const hasThousands =
+    /\bgrand\b/.test(quote)
+    || /\bthousand\b/.test(quote)
+    || /\d\s*k\b/.test(quote);
+  const hasMillions =
+    /\bmillion\b/.test(quote)
+    || /\d\s*m\b/.test(quote);
+  if (hasMillions && amount < 100_000) {
+    return amount * 1_000_000;
+  }
+  if (hasThousands && amount < 1_000) {
+    return amount * 1_000;
+  }
+  return amount;
+}
+
+/**
  * Lightweight per-entry validator. Mirrors the schema constants
  * above so a malformed model response (missing fields, bad enum
  * value, non-finite amount) is dropped before reaching the
  * factsSheet. Returns `null` when the entry is unusable (caller
  * skips silently) or a normalised entry object when it's safe to
  * append.
+ *
+ * Magnitude normalisation + implausibility drop run AFTER the
+ * structural checks: if any field is malformed we drop unconditionally;
+ * only well-formed amounts get the suffix-scaling treatment.
  *
  * Kept hand-rolled to match the rest of the codebase's "no new npm
  * deps" rule.
@@ -203,8 +368,8 @@ function validateFact(raw) {
   const kind = typeof raw.kind === 'string' ? raw.kind : '';
   if (!KIND_VALUES.includes(kind)) return null;
 
-  const amount = Number(raw.amount);
-  if (!Number.isFinite(amount)) return null;
+  const rawAmount = Number(raw.amount);
+  if (!Number.isFinite(rawAmount)) return null;
 
   const unit = typeof raw.unit === 'string' ? raw.unit : '';
   if (!UNIT_VALUES.includes(unit)) return null;
@@ -220,6 +385,31 @@ function validateFact(raw) {
   // through is dead and Stage-2 can't tell apart the two times the
   // same number was stated. Drop facts without one.
   if (!anchorQuote) return null;
+
+  // Apply the magnitude post-processor before any plausibility check —
+  // a fact that scales 30 → 30000 via the "grand" suffix is the
+  // expected case, not a drop.
+  const amount = normaliseMagnitude(rawAmount, anchorQuote, unit);
+
+  // Implausibility drop: monetary kinds that should be in thousands
+  // but came in below $5K (after normalisation) are almost always
+  // transcription artefacts ("$30 a year" where the speaker said "$30
+  // grand a year" but Deepgram lost the suffix AND the anchor lost it
+  // too). We'd rather lose the fact than feed Stage-2 a corrupting $30
+  // line item. Logged so we can audit false-positives later.
+  if (unit === 'usd'
+      && amount < 5000
+      && IMPLAUSIBILITY_USD_KINDS.has(kind)) {
+    console.warn(
+      '[facts-scanner] dropped implausible monetary amount',
+      amount,
+      'for kind',
+      kind,
+      '— anchor:',
+      anchorQuote.slice(0, 80),
+    );
+    return null;
+  }
 
   const correction = raw.correction === true;
   const supersedesId =
