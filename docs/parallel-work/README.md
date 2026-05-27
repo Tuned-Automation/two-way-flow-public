@@ -16,6 +16,7 @@ If you're an AI agent starting work in this repo, **read this file first**, then
 | Spec docs | `docs/superpowers/specs/` |
 | **Live coordination log (outside repo)** | `~/.cursor/parallel-coordination/2-Way-Flow/ACTIVE.md` |
 | Kickoff prompt template (for spawning new threads) | `docs/parallel-work/KICKOFF-PROMPT.md` |
+| Save-plan prompt (paste into each existing thread to capture its plan) | `docs/parallel-work/SAVE-PLAN-PROMPT.md` |
 
 > The coordination log lives **outside the repo on purpose** so every worktree reads/writes the same file in real time, without needing a git sync.
 
