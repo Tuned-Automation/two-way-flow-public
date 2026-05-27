@@ -97,3 +97,6 @@ out/
 
 # Superpowers brainstorming session files
 .superpowers/
+
+# Git worktrees for parallel feature development
+.worktrees/
