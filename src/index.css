@@ -141,6 +141,21 @@ a,
   -webkit-app-region: no-drag;
 }
 
+/* Utility: visually hidden but exposed to assistive tech. Used by
+ * #coachHeaderStateLive (and any future live region) so screen
+ * readers announce state changes without taking visual space. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* ─── Root container ────────────────────────────────────────────────── */
 
 /* The .coach root paints a layered soft drop-shadow into the

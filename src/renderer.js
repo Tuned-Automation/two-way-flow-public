@@ -4161,6 +4161,33 @@ function setHeaderCollapsed(next, { persist = true } = {}) {
    * recording-status. renderGhostPill() handles the combination. */
   renderGhostPill();
 
+  /* Polite live-region announcement so VoiceOver / NVDA / Narrator
+   * users hear the state change even when focus is elsewhere. */
+  const liveEl = document.getElementById('coachHeaderStateLive');
+  if (liveEl) {
+    liveEl.textContent = collapsed ? 'Toolbar hidden.' : 'Toolbar shown.';
+  }
+
+  /* Focus management:
+   *   - If the user just collapsed VIA the chevron, that button is now
+   *     inside an aria-hidden region and translated off-screen. Move
+   *     focus to the reveal strip (temporary tabindex) so Tab continues
+   *     forward into the body.
+   *   - On expand, return focus to the chevron — the user invoked the
+   *     toggle, they see the button reappear, focus lands there.
+   * Wrapped in try/catch because focus() can throw on detached nodes. */
+  try {
+    if (collapsed && document.activeElement === headerCollapseBtnEl) {
+      if (coachRevealStripEl) {
+        coachRevealStripEl.setAttribute('tabindex', '-1');
+        coachRevealStripEl.focus({ preventScroll: true });
+      }
+    } else if (!collapsed) {
+      coachRevealStripEl?.removeAttribute('tabindex');
+      headerCollapseBtnEl?.focus({ preventScroll: true });
+    }
+  } catch { /* detached or unfocusable; safe to ignore */ }
+
   if (persist) {
     persistHeaderState({
       collapsed,

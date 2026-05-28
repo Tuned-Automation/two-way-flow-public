@@ -45,6 +45,13 @@
            0-height invisible spacer, in collapsed mode it grows to 8px
            and hosts the drag region + a hover-revealed mini controls
            cluster + an optional ghost status pill while recording. -->
+      <!-- Screen-reader-only live region. setHeaderCollapsed() writes
+           'Toolbar hidden.' / 'Toolbar shown.' here so VoiceOver / NVDA
+           / Narrator announce the state change without requiring focus
+           to be on the chevron. Polite + atomic to avoid interrupting
+           the user mid-transcript. -->
+      <div id="coachHeaderStateLive" class="sr-only" aria-live="polite"
+           aria-atomic="true"></div>
       <div id="coachRevealStrip" class="coach__reveal-strip" aria-hidden="true">
         <div id="coachGhostPill" class="coach__ghost-pill" hidden>
           <span class="coach__ghost-pill__dot" aria-hidden="true"></span>
