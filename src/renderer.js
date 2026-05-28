@@ -6373,6 +6373,10 @@ const rubricsBtnSaveEl = document.getElementById('rubricsBtnSave');
 const rubricsDirtyHintEl = document.getElementById('rubricsDirtyHint');
 const rubricsValidationEl = document.getElementById('rubricsValidation');
 const rubricsValidationListEl = document.getElementById('rubricsValidationList');
+const rubricsDeleteConfirmEl = document.getElementById('rubricsDeleteConfirm');
+const rubricsDeleteConfirmNameEl = document.getElementById('rubricsDeleteConfirmName');
+const rubricsDeleteConfirmCancelEl = document.getElementById('rubricsDeleteConfirmCancel');
+const rubricsDeleteConfirmBtnEl = document.getElementById('rubricsDeleteConfirmBtn');
 
 const rubricsTabState = {
   hydrated: false,
@@ -7861,6 +7865,205 @@ function formatRubricTimestamp(value) {
   return d.toLocaleString();
 }
 
+async function handleRubricsNew() {
+  if (!window.rubrics?.create) return;
+  // Auto-generated name keeps the action one-click. The user can
+  // rename via the Identity section immediately after the editor
+  // loads. The copy-from base is NOT passed — the IPC handler
+  // returns a minimal starter rubric so renaming the seed shape
+  // doesn't surprise the user later.
+  setRubricsLibraryHint('', null);
+  try {
+    const existingNames = new Set(rubricsTabState.list.map((r) => r.name));
+    let name = 'New rubric';
+    let n = 1;
+    while (existingNames.has(name)) {
+      n += 1;
+      name = `New rubric ${n}`;
+    }
+    const result = await window.rubrics.create({ name });
+    if (!result?.ok) {
+      setRubricsLibraryHint('Failed to create rubric: ' + (result?.reason || 'unknown'), 'error');
+      return;
+    }
+    await hydrateRubricsTab();
+    if (result.id) await loadRubricIntoEditor(result.id);
+    setRubricsLibraryHint('Rubric created. Edit and save when ready.', 'info', { autoClearMs: 5000 });
+  } catch (err) {
+    setRubricsLibraryHint('Failed to create rubric: ' + (err?.message || err), 'error');
+  }
+}
+
+async function handleRubricsDuplicate() {
+  if (!window.rubrics?.duplicate) return;
+  const id = rubricsTabState.selectedId;
+  if (!id) return;
+  const source = rubricsTabState.currentRubric;
+  const baseName = source?.name || id;
+  // Compose a non-colliding new name. Backend will also enforce id
+  // uniqueness, so this is just for nicer-looking labels.
+  const existingNames = new Set(rubricsTabState.list.map((r) => r.name));
+  let newName = `${baseName} (copy)`;
+  let n = 2;
+  while (existingNames.has(newName)) {
+    newName = `${baseName} (copy ${n})`;
+    n += 1;
+  }
+  setRubricsLibraryHint('', null);
+  try {
+    const result = await window.rubrics.duplicate(id, { newName });
+    if (!result?.ok) {
+      setRubricsLibraryHint('Failed to duplicate: ' + (result?.reason || 'unknown'), 'error');
+      return;
+    }
+    await hydrateRubricsTab();
+    if (result.id) await loadRubricIntoEditor(result.id);
+    setRubricsLibraryHint('Rubric duplicated.', 'info', { autoClearMs: 5000 });
+  } catch (err) {
+    setRubricsLibraryHint('Failed to duplicate: ' + (err?.message || err), 'error');
+  }
+}
+
+function handleRubricsDelete() {
+  if (!rubricsDeleteConfirmEl) return;
+  const id = rubricsTabState.selectedId;
+  if (!id) return;
+  // Active-rubric deletion is blocked server-side and the library
+  // bar disables the Delete button when an active rubric is
+  // selected; this is a belt-and-braces guard for any race where the
+  // active id changed between renders.
+  if (id === rubricsTabState.activeId) {
+    setRubricsLibraryHint('Cannot delete the active rubric. Set a different rubric active first.', 'warn');
+    return;
+  }
+  const r = rubricsTabState.currentRubric;
+  if (rubricsDeleteConfirmNameEl) {
+    rubricsDeleteConfirmNameEl.textContent = r?.name || id;
+  }
+  try {
+    rubricsDeleteConfirmEl.showModal();
+  } catch (err) {
+    console.warn('[rubrics] delete confirm showModal failed:', err?.message || err);
+  }
+}
+
+async function handleRubricsDeleteConfirm() {
+  if (!window.rubrics?.remove) return;
+  const id = rubricsTabState.selectedId;
+  if (!id) return;
+  // Close the dialog first so any subsequent error toast surfaces
+  // against the library bar rather than the modal that's about to
+  // disappear.
+  try { rubricsDeleteConfirmEl?.close(); } catch { /* not open */ }
+  setRubricsLibraryHint('', null);
+  try {
+    const result = await window.rubrics.remove(id);
+    if (!result?.ok) {
+      const reason = result?.reason || 'unknown';
+      if (reason === 'is_active') {
+        setRubricsLibraryHint('Cannot delete the active rubric.', 'warn');
+      } else if (reason === 'not_found') {
+        setRubricsLibraryHint('Rubric no longer exists.', 'warn');
+      } else {
+        setRubricsLibraryHint('Failed to delete: ' + reason, 'error');
+      }
+      return;
+    }
+    // Clear the selection then re-hydrate to load a fallback rubric.
+    rubricsTabState.selectedId = null;
+    rubricsTabState.currentRubric = null;
+    rubricsTabState.originalRubric = null;
+    clearRubricsDirty();
+    await hydrateRubricsTab();
+    setRubricsLibraryHint('Rubric deleted.', 'info', { autoClearMs: 5000 });
+  } catch (err) {
+    setRubricsLibraryHint('Failed to delete: ' + (err?.message || err), 'error');
+  }
+}
+
+async function handleRubricsExport() {
+  if (!window.rubrics?.export) return;
+  const id = rubricsTabState.selectedId;
+  if (!id) return;
+  setRubricsLibraryHint('', null);
+  try {
+    const result = await window.rubrics.export(id);
+    if (!result?.ok || typeof result.json !== 'string') {
+      setRubricsLibraryHint('Failed to export: ' + (result?.reason || 'unknown'), 'error');
+      return;
+    }
+    // Route through the shared dialog:save helper so the file write
+    // happens in main (no fs from the renderer).
+    if (!window.gemini?.dialog?.save) {
+      setRubricsLibraryHint('Save dialog unavailable.', 'error');
+      return;
+    }
+    const slug = (rubricsTabState.currentRubric?.id || id).replace(/[^\w.-]+/g, '_');
+    const saveResult = await window.gemini.dialog.save({
+      title: 'Export rubric',
+      defaultName: `${slug}.rubric.json`,
+      filters: [
+        { name: 'Rubric JSON', extensions: ['json'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+      content: result.json,
+    });
+    if (saveResult?.canceled) return;
+    if (saveResult?.wrote) {
+      setRubricsLibraryHint('Rubric exported.', 'info', { autoClearMs: 5000 });
+    } else if (saveResult?.error) {
+      setRubricsLibraryHint('Export write failed: ' + saveResult.error, 'error');
+    }
+  } catch (err) {
+    setRubricsLibraryHint('Failed to export: ' + (err?.message || err), 'error');
+  }
+}
+
+async function handleRubricsImport() {
+  if (!window.rubrics?.import) return;
+  if (!window.gemini?.dialog?.open) {
+    setRubricsLibraryHint('Open dialog unavailable.', 'error');
+    return;
+  }
+  setRubricsLibraryHint('', null);
+  try {
+    const openResult = await window.gemini.dialog.open({
+      title: 'Import rubric',
+      filters: [
+        { name: 'Rubric JSON', extensions: ['json'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+      readAs: 'utf8',
+    });
+    if (openResult?.canceled) return;
+    if (openResult?.error) {
+      setRubricsLibraryHint('Read failed: ' + openResult.error, 'error');
+      return;
+    }
+    const content = openResult?.content;
+    if (typeof content !== 'string' || content.length === 0) {
+      setRubricsLibraryHint('Selected file is empty.', 'warn');
+      return;
+    }
+    const result = await window.rubrics.import(content);
+    if (!result?.ok) {
+      const errs = Array.isArray(result?.errors) && result.errors.length
+        ? result.errors.join('; ')
+        : (result?.reason || 'unknown error');
+      setRubricsLibraryHint('Import failed: ' + errs, 'error');
+      return;
+    }
+    await hydrateRubricsTab();
+    if (result.id) await loadRubricIntoEditor(result.id);
+    const warnPart = Array.isArray(result.warnings) && result.warnings.length
+      ? ` (${result.warnings.length} warning${result.warnings.length === 1 ? '' : 's'})`
+      : '';
+    setRubricsLibraryHint('Rubric imported.' + warnPart, 'info', { autoClearMs: 6000 });
+  } catch (err) {
+    setRubricsLibraryHint('Import failed: ' + (err?.message || err), 'error');
+  }
+}
+
 async function handleSetActiveRubric() {
   const id = rubricsTabState.selectedId;
   if (!id) return;
@@ -7956,12 +8159,42 @@ if (rubricsBtnSetActiveEl) {
   rubricsBtnSetActiveEl.addEventListener('click', handleSetActiveRubric);
 }
 
+if (rubricsBtnNewEl) {
+  rubricsBtnNewEl.addEventListener('click', handleRubricsNew);
+}
+
+if (rubricsBtnDuplicateEl) {
+  rubricsBtnDuplicateEl.addEventListener('click', handleRubricsDuplicate);
+}
+
+if (rubricsBtnDeleteEl) {
+  rubricsBtnDeleteEl.addEventListener('click', handleRubricsDelete);
+}
+
+if (rubricsBtnExportEl) {
+  rubricsBtnExportEl.addEventListener('click', handleRubricsExport);
+}
+
+if (rubricsBtnImportEl) {
+  rubricsBtnImportEl.addEventListener('click', handleRubricsImport);
+}
+
 if (rubricsBtnSaveEl) {
   rubricsBtnSaveEl.addEventListener('click', handleRubricsSave);
 }
 
 if (rubricsBtnDiscardEl) {
   rubricsBtnDiscardEl.addEventListener('click', handleRubricsDiscard);
+}
+
+if (rubricsDeleteConfirmBtnEl) {
+  rubricsDeleteConfirmBtnEl.addEventListener('click', handleRubricsDeleteConfirm);
+}
+
+if (rubricsDeleteConfirmCancelEl) {
+  rubricsDeleteConfirmCancelEl.addEventListener('click', () => {
+    try { rubricsDeleteConfirmEl?.close(); } catch { /* not open */ }
+  });
 }
 
 // Subscribe to main's rubrics:changed broadcast so any out-of-band
