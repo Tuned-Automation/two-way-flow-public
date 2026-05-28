@@ -672,6 +672,26 @@ const coachContext = {
    * with a clean slate.
    */
   suggestionHistory: new Map(),
+
+  /**
+   * Per-item reformulate attempt counter. Increments only when a new
+   * pin lands with `kind === 'reformulate'` AND the same `itemId` as
+   * the previous pin. Resets to 0 on every other transition (different
+   * item, different kind, asked, session reset).
+   *
+   * Read at fire time inside the `armReformulateTimer` setTimeout
+   * callback to decide between firing another `kind: 'reformulate'`
+   * (count === 0) and firing `kind: 'pivot_within_pillar'` (count >= 1).
+   * The Coach itself stays dumb about counts — main owns the cap.
+   *
+   * NOTE on field placement: this lives at the end of the literal on
+   * purpose. Wave-2 `feature/cost-tracking` also inserts a new
+   * coachContext field; both branches append at the END so the diffs
+   * land in pure-addition territory and git's 3-way merge can usually
+   * keep both lines without manual resolution. See ACTIVE.md (Notes
+   * on `feature/reform-cap-pivot` / `feature/cost-tracking`).
+   */
+  currentItemReformulateCount: 0,
 };
 
 const COACH_TRANSCRIPT_WINDOW_LINES = 40; // cap context size
@@ -977,6 +997,12 @@ function resetCoachContext() {
     clearTimeout(reformulateTimer);
     reformulateTimer = null;
   }
+  // Per-item reformulate cap (see coachContext.currentItemReformulateCount
+  // doc-block). Reset placement is at the end of the function for the
+  // same merge-friendliness reason the field declaration is at the end
+  // of the coachContext literal — Wave-2 `feature/cost-tracking` also
+  // appends a reset line here.
+  coachContext.currentItemReformulateCount = 0;
 }
 
 /**
@@ -3071,6 +3097,16 @@ function registerIpcHandlers() {
           payload.anchorQuote ? `"${payload.anchorQuote.slice(0, 48)}…"` : '(none)',
           ']',
         );
+        // Capture the OUTGOING pin's itemId before registerSuggestion
+        // overwrites `currentPinnedSuggestionId`. Read by the
+        // increment/reset block below to decide whether this is a
+        // reformulate-on-the-same-item (cap counter ticks up) or a
+        // genuine transition (cap counter resets to 0). Null when
+        // there was no prior pin (first suggestion of the session).
+        const previousPinnedItemId = (() => {
+          if (!currentPinnedSuggestionId) return null;
+          return coachContext.suggestionHistory.get(currentPinnedSuggestionId)?.itemId ?? null;
+        })();
         // Register the suggestion in history BEFORE the renderer IPC
         // so the broadcast that follows already carries the new
         // entry. The id is purely internal — the renderer keys off
@@ -3081,6 +3117,18 @@ function registerIpcHandlers() {
           questionText: payload.question,
           kind: payload.kind,
         });
+        // Per-item reformulate-cap counter (see
+        // coachContext.currentItemReformulateCount doc-block). Tick up
+        // only when the same item gets another reformulate-kind pin —
+        // every other transition (different item, different kind,
+        // genuine `next` from auto-advance, skip, boost, asked-flip)
+        // resets to 0. Read at fire time by armReformulateTimer's
+        // setTimeout callback.
+        if (payload.kind === 'reformulate' && payload.itemId === previousPinnedItemId) {
+          coachContext.currentItemReformulateCount += 1;
+        } else {
+          coachContext.currentItemReformulateCount = 0;
+        }
         // Arm the auto-reformulate timer for this pin. The function
         // itself bails when the Advanced toggles are off.
         armReformulateTimer(currentPinnedSuggestionId);
@@ -3101,6 +3149,14 @@ function registerIpcHandlers() {
         const changed = applyMarkAsked({ suggestionId, evidence });
         if (!changed) return;
         broadcastSuggestionHistory();
+        // Reset the per-item reformulate-cap counter (mode-agnostic).
+        // If the rep finally asks the question, the next pin — whatever
+        // it is, whoever fires it — starts with a clean counter. Sits
+        // alongside the auto-advance trigger below but is NOT
+        // mode-gated: the counter is also relevant in Signalled mode
+        // for any subsequent automated reformulate fired after a mode
+        // flip.
+        coachContext.currentItemReformulateCount = 0;
         // Auto-advance-on-green: in Automated mode, fire a fresh
         // 'next' the moment the model spots the seller asking a
         // pinned question. The pin greens via the broadcast above,
@@ -3742,6 +3798,11 @@ function registerIpcHandlers() {
     if (result.alreadyAsked) return { ok: true, alreadyAsked: true };
     if (result.changed) {
       broadcastSuggestionHistory();
+      // Reset the per-item reformulate-cap counter (mode-agnostic).
+      // Mirrors the AI path in `onQuestionAsked` — see that callback
+      // for the rationale. Sits alongside the auto-advance trigger
+      // below but is NOT mode-gated.
+      coachContext.currentItemReformulateCount = 0;
       // Auto-advance-on-green: in Automated mode, mirror the AI
       // path's behaviour so a manual tick also triggers a fresh
       // next-kind suggestion. The rep has already touched the
