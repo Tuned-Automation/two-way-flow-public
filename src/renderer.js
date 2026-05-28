@@ -51,6 +51,59 @@ function persistCoachMode(mode) {
   try { localStorage.setItem(COACH_MODE_LS_KEY, mode); } catch { /* private mode */ }
 }
 
+/* ─── Header collapse state (separate from 'twf.layout.v1') ──────────
+ * Persists whether the user wants the top toolbar hidden between
+ * launches. Kept out of 'twf.layout.v1' so it can be reasoned about
+ * (and migrated / rolled back) independently of the pane-sizing schema.
+ *
+ * Shape:
+ *   {
+ *     "collapsed":     boolean,   // user wants chrome hidden
+ *     "pinned":        boolean,   // when true and collapsed=false, the
+ *                                 //   header stays open and ignores
+ *                                 //   the hover-leave auto-collapse
+ *                                 //   timer. Default true (no auto-
+ *                                 //   collapse for first-launch users).
+ *     "schemaVersion": 1
+ *   }
+ *
+ * Reads tolerate missing/corrupt values and fall back to
+ * { collapsed: false, pinned: true }. Writes are fire-and-forget;
+ * a private-mode localStorage failure falls back silently.
+ * ─────────────────────────────────────────────────────────────────── */
+const HEADER_STATE_LS_KEY = 'twf.header.v1';
+const HEADER_STATE_DEFAULT = Object.freeze({
+  collapsed: false,
+  pinned: true,
+  schemaVersion: 1,
+});
+
+function loadHeaderState() {
+  try {
+    const raw = localStorage.getItem(HEADER_STATE_LS_KEY);
+    if (!raw) return { ...HEADER_STATE_DEFAULT };
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.schemaVersion === 1) {
+      return {
+        collapsed: parsed.collapsed === true,
+        pinned: parsed.pinned !== false,
+        schemaVersion: 1,
+      };
+    }
+  } catch { /* corrupt JSON or private mode */ }
+  return { ...HEADER_STATE_DEFAULT };
+}
+
+function persistHeaderState(next) {
+  try {
+    localStorage.setItem(HEADER_STATE_LS_KEY, JSON.stringify({
+      collapsed: next.collapsed === true,
+      pinned: next.pinned !== false,
+      schemaVersion: 1,
+    }));
+  } catch { /* private mode */ }
+}
+
 /** Set of sentinel item ids the coach can emit for non-rubric
  *  suggestions. Currently only 'freeform.deeper' (Deeper-kind asks
  *  whose natural follow-up doesn't map to any rubric item). The
@@ -112,6 +165,16 @@ const versionBadgeEl = document.getElementById('versionBadge');
 const recToggleEl = document.getElementById('recToggle');
 const minButtonEl = document.getElementById('minButton');
 const closeButtonEl = document.getElementById('closeButton');
+/* Header-collapse feature (see plan: 2026-05-27-collapsible-top-toolbar.md).
+ * Every use guards with `if (el)` to tolerate older HTML or a future
+ * DOM refactor that drops one of these. */
+const coachRevealStripEl = document.getElementById('coachRevealStrip');
+const coachGhostPillEl = document.getElementById('coachGhostPill');
+const coachGhostPillTimerEl = document.getElementById('coachGhostPillTimer');
+const coachMiniMinButtonEl = document.getElementById('coachMiniMinButton');
+const coachMiniCloseButtonEl = document.getElementById('coachMiniCloseButton');
+const headerCollapseBtnEl = document.getElementById('headerCollapseBtn');
+const coachHeaderEl = document.querySelector('.coach__header');
 const railEl = document.getElementById('pillarRail');
 const transcriptPaneEl = document.getElementById('transcriptPane');
 const transcriptListEl = document.getElementById('transcriptList');
@@ -943,6 +1006,17 @@ const state = {
    *  main on session start AND on every flip. */
   coachMode: readSavedCoachMode(),
 
+  /* Header collapse state (see 'twf.header.v1' schema doc-block above).
+   *   headerCollapsed  — current visible state, mirrors persisted value
+   *   headerPinned     — disables auto-collapse-on-mouseleave when true
+   *   headerRevealing  — transient: hover-revealed while collapsed
+   *   headerRevealTimer — setTimeout handle for the leave-grace period
+   */
+  headerCollapsed: false,
+  headerPinned: true,
+  headerRevealing: false,
+  headerRevealTimer: null,
+
   /**
    * "Cover remaining" queue. Active when the seller clicks the
    * Cover-remaining button at the bottom of the pillar drawer — we
@@ -1192,6 +1266,11 @@ function setStatus(next) {
   // here so the pill appears / disappears with every status flip
   // without each call site having to remember to invalidate it.
   if (typeof renderConnectionStatus === 'function') renderConnectionStatus();
+  // Ghost status pill (collapsed-mode recording indicator) is also
+  // gated by call status. Re-render so it appears the moment we go
+  // listening and disappears when we go idle, regardless of where the
+  // status flip came from.
+  if (typeof renderGhostPill === 'function') renderGhostPill();
 }
 
 function formatTimer(ms) {
@@ -1437,6 +1516,25 @@ function renderTimer() {
     ? Date.now() - state.recordingStartedAt
     : 0;
   recTimerEl.textContent = formatTimer(ms);
+  /* Mirror the ticking timer into the collapsed-mode ghost pill so the
+   * user keeps awareness of recording duration even when .coach__header
+   * is translated out of view. The pill itself is shown/hidden by
+   * renderGhostPill(). */
+  if (coachGhostPillTimerEl) coachGhostPillTimerEl.textContent = recTimerEl.textContent;
+}
+
+/* See plan: 2026-05-27-collapsible-top-toolbar.md, Task 4 Step 2.
+ * Ghost-pill visibility is jointly gated by collapsed-state AND
+ * recording-status. Called from setHeaderCollapsed() (on collapse/
+ * expand) AND setStatus() (on idle ↔ listening transitions). */
+function renderGhostPill() {
+  if (!coachGhostPillEl) return;
+  const isRecording = state.status === 'listening' || state.status === 'starting';
+  const shouldShow = state.headerCollapsed && isRecording;
+  coachGhostPillEl.hidden = !shouldShow;
+  if (shouldShow && coachGhostPillTimerEl) {
+    coachGhostPillTimerEl.textContent = recTimerEl.textContent;
+  }
 }
 
 function renderSpeakers() {
@@ -4011,6 +4109,119 @@ for (const btn of coachModeBtnEls) {
   });
 }
 
+/* ── Header collapse (see plan: 2026-05-27-collapsible-top-toolbar.md) ──
+ *
+ * setHeaderCollapsed(next, { persist }) is the single source of truth
+ * for the data-collapsed attribute, aria bookkeeping, ghost-pill
+ * sync, and persistence. Both the click handler on #headerCollapseBtn
+ * and the Cmd/Ctrl+Shift+T shortcut route through here. The boot-time
+ * restore also calls it (with persist:false) so the same effects run.
+ *
+ * Wave 1 note: the rule that hides .coach__header in CSS also hides
+ * the #rubricSwitcher pill from feature/rubric-editor, because the
+ * pill lives inside .coach__header > .speakers. No extra wiring.
+ */
+function setHeaderCollapsed(next, { persist = true } = {}) {
+  const collapsed = next === true;
+  if (state.headerCollapsed === collapsed) return;
+
+  state.headerCollapsed = collapsed;
+  coachEl.dataset.collapsed = String(collapsed);
+
+  /* Always clear the transient reveal state on an explicit collapse
+   * change so the new state takes effect immediately. */
+  state.headerRevealing = false;
+  if (state.headerRevealTimer) {
+    clearTimeout(state.headerRevealTimer);
+    state.headerRevealTimer = null;
+  }
+  coachEl.removeAttribute('data-revealing');
+
+  /* Keep the header's aria-hidden in sync. Buttons inside an aria-
+   * hidden region are not announced — that's exactly the behaviour we
+   * want for screen-reader users while collapsed. The visual focus
+   * ring is also suppressed by the translate transform. */
+  if (coachHeaderEl) coachHeaderEl.setAttribute('aria-hidden', String(collapsed));
+
+  /* The collapse button's aria-expanded mirrors the inverse — true
+   * when the toolbar IS expanded. */
+  if (headerCollapseBtnEl) {
+    headerCollapseBtnEl.setAttribute('aria-expanded', String(!collapsed));
+    headerCollapseBtnEl.setAttribute(
+      'aria-label',
+      collapsed ? 'Show toolbar' : 'Hide toolbar',
+    );
+    headerCollapseBtnEl.setAttribute(
+      'title',
+      collapsed ? 'Show toolbar (⌘⇧T)' : 'Hide toolbar (⌘⇧T)',
+    );
+  }
+
+  /* Ghost-pill visibility is jointly gated by collapsed-state AND
+   * recording-status. renderGhostPill() handles the combination. */
+  renderGhostPill();
+
+  /* Polite live-region announcement so VoiceOver / NVDA / Narrator
+   * users hear the state change even when focus is elsewhere. */
+  const liveEl = document.getElementById('coachHeaderStateLive');
+  if (liveEl) {
+    liveEl.textContent = collapsed ? 'Toolbar hidden.' : 'Toolbar shown.';
+  }
+
+  /* Focus management:
+   *   - If the user just collapsed VIA the chevron, that button is now
+   *     inside an aria-hidden region and translated off-screen. Move
+   *     focus to the reveal strip (temporary tabindex) so Tab continues
+   *     forward into the body.
+   *   - On expand, return focus to the chevron — the user invoked the
+   *     toggle, they see the button reappear, focus lands there.
+   * Wrapped in try/catch because focus() can throw on detached nodes. */
+  try {
+    if (collapsed && document.activeElement === headerCollapseBtnEl) {
+      if (coachRevealStripEl) {
+        coachRevealStripEl.setAttribute('tabindex', '-1');
+        coachRevealStripEl.focus({ preventScroll: true });
+      }
+    } else if (!collapsed) {
+      coachRevealStripEl?.removeAttribute('tabindex');
+      headerCollapseBtnEl?.focus({ preventScroll: true });
+    }
+  } catch { /* detached or unfocusable; safe to ignore */ }
+
+  if (persist) {
+    persistHeaderState({
+      collapsed,
+      pinned: state.headerPinned,
+    });
+  }
+}
+
+/* Hover-reveal: while collapsed, hovering the reveal strip or the
+ * (now-revealed) header keeps the chrome visible. Leaving for >300ms
+ * collapses it again. The grace period prevents the toolbar from
+ * flickering when the cursor briefly exits to click something. */
+const HEADER_REVEAL_LEAVE_MS = 300;
+
+function startHeaderReveal() {
+  if (!state.headerCollapsed) return;
+  if (state.headerRevealTimer) {
+    clearTimeout(state.headerRevealTimer);
+    state.headerRevealTimer = null;
+  }
+  state.headerRevealing = true;
+  coachEl.dataset.revealing = 'true';
+}
+
+function scheduleHeaderRevealEnd() {
+  if (!state.headerCollapsed || !state.headerRevealing) return;
+  if (state.headerRevealTimer) clearTimeout(state.headerRevealTimer);
+  state.headerRevealTimer = setTimeout(() => {
+    state.headerRevealing = false;
+    coachEl.removeAttribute('data-revealing');
+    state.headerRevealTimer = null;
+  }, HEADER_REVEAL_LEAVE_MS);
+}
+
 /* ── Ask-button progress overlay (v3) ─────────────────────────────
  *
  * See plan: ask_button_progress_overlay_7d3a9f1b. Per-click
@@ -6310,6 +6521,44 @@ closeButtonEl.addEventListener('click', async () => {
   await window.gemini.window.close();
 });
 
+/* ── Header collapse: button + hover + mini controls wiring ─────────
+ *
+ * The chevron toggles between collapsed and expanded. The reveal
+ * strip and the (revealed) header both drive the hover-peek timer.
+ * Mini controls duplicate the header minimise/close handlers — kept
+ * literally identical so the two paths can't drift. */
+
+if (headerCollapseBtnEl) {
+  headerCollapseBtnEl.addEventListener('click', () => {
+    setHeaderCollapsed(!state.headerCollapsed);
+  });
+}
+
+if (coachRevealStripEl) {
+  coachRevealStripEl.addEventListener('mouseenter', startHeaderReveal);
+  coachRevealStripEl.addEventListener('mouseleave', scheduleHeaderRevealEnd);
+}
+
+if (coachHeaderEl) {
+  coachHeaderEl.addEventListener('mouseenter', startHeaderReveal);
+  coachHeaderEl.addEventListener('mouseleave', scheduleHeaderRevealEnd);
+}
+
+if (coachMiniMinButtonEl) {
+  coachMiniMinButtonEl.addEventListener('click', () => {
+    window.gemini.window.minimize();
+  });
+}
+
+if (coachMiniCloseButtonEl) {
+  coachMiniCloseButtonEl.addEventListener('click', async () => {
+    if (state.status === 'listening' || state.status === 'starting') {
+      await stopCapture();
+    }
+    await window.gemini.window.close();
+  });
+}
+
 /* ── Permission modal (Phase 4) ────────────────────────────────────── */
 
 /**
@@ -6760,6 +7009,22 @@ document.addEventListener('keydown', (e) => {
   // handles Esc itself, and we don't want Enter to accidentally fire
   // Start while a modal is open.
   if (permissionModalEl?.open || summaryModalEl?.open || settingsModalEl?.open) return;
+
+  // Cmd/Ctrl+Shift+T toggles the persisted header-collapse state.
+  // Distinct from Cmd/Ctrl+Shift+H (whole-window hide; src/main.js)
+  // so users can chord the two independently — show window but hide
+  // toolbar, etc. Renderer-only keydown (not Electron globalShortcut)
+  // so it can't conflict with other apps.
+  if (
+    (e.key === 'T' || e.key === 't') &&
+    e.shiftKey &&
+    (e.metaKey || e.ctrlKey) &&
+    !e.altKey
+  ) {
+    e.preventDefault();
+    setHeaderCollapsed(!state.headerCollapsed);
+    return;
+  }
 
   if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
     e.preventDefault();
@@ -8779,6 +9044,15 @@ if (window.rubrics?.onChanged) {
 // startCapture → setCoachMode). Notifying earlier risks a race with
 // session teardown when reloading during dev.
 applyCoachMode(state.coachMode, { persist: false, notifyMain: false });
+
+/* Restore persisted header collapse state. Default is uncollapsed +
+ * pinned (no auto-collapse) so first-launch users see the full
+ * toolbar — discoverability beats minimalism. */
+const persistedHeader = loadHeaderState();
+state.headerPinned = persistedHeader.pinned;
+if (persistedHeader.collapsed) {
+  setHeaderCollapsed(true, { persist: false });
+}
 
 renderTimer();
 renderSpeakers();
