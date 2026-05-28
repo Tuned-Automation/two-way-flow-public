@@ -188,7 +188,30 @@ const VALID_KINDS = new Set(['next', 'deeper', 'pivot', 'pause', 'recap', 'targe
 
 /* ────────────────────────────────────────────────────────────────────────
  * Tool declarations
- * ──────────────────────────────────────────────────────────────────────── */
+ * ────────────────────────────────────────────────────────────────────────
+ * The four tool schemas (update_item_state, record_field,
+ * suggest_next_question, mark_question_asked) used to live as module-
+ * level `const`s here. They've moved inside `Coach._buildTools()` so
+ * each Coach instance picks up the active rubric's enums on
+ * construction — required by the editable-rubric feature, because a
+ * module-level capture of ITEM_IDS / FIELD_IDS / SUGGESTABLE_ITEM_IDS
+ * would freeze the schemas at first-import time and a rubric swap
+ * wouldn't reach the model.
+ *
+ * What still lives at module level here:
+ *   - ITEM_STATES — the 4-state lifecycle is static (model contract,
+ *                   not derived from rubric data).
+ *
+ * `record_meeting_fact` was removed in post-test-call fixes batch 2.
+ * The Coach used to own this tool here, running every 1.5 s alongside
+ * item-state tracking and field capture. The coupling produced the
+ * headline-wobble symptom — the model would re-classify duplicates
+ * and re-fire similar facts every tick, which the Stage-2 worker
+ * then re-summed differently each time. Quantitative fact extraction
+ * now lives in the dedicated Stage-1 scanner (src/facts-scanner.js)
+ * running on its own ~12 s cadence; the Coach is back to rubric
+ * scoring + ask suggestions + mark_question_asked.
+ */
 
 /* The 4-state lifecycle (pending → in_progress → covered, plus the
  * branch state `logged` for partially-addressed items) is documented in
@@ -196,124 +219,6 @@ const VALID_KINDS = new Set(['next', 'deeper', 'pivot', 'pause', 'recap', 'targe
  * ever sets the three non-pending states; absence from the state map
  * IS pending. */
 const ITEM_STATES = ['in_progress', 'covered', 'logged'];
-
-const UPDATE_ITEM_STATE = {
-  name: 'update_item_state',
-  description:
-    "Update the lifecycle state of a rubric checklist item based on transcript evidence. Item ids are namespaced as '<pillarId>.<localId>'. Call this whenever an item transitions between states; absence from the state map is implicit `pending`.",
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      item_id: { type: Type.STRING, enum: ITEM_IDS, description: "Namespaced item id, e.g. 'finance.annual_cost'." },
-      state: { type: Type.STRING, enum: ITEM_STATES, description: "New state. 'in_progress' = seller is approaching; 'covered' = asked + answered + moved on (terminal positive); 'logged' = partially addressed but not closed out." },
-      evidence: { type: Type.STRING, description: 'Short quote or paraphrase (≤120 chars) from the transcript supporting this transition.' },
-      confidence: { type: Type.NUMBER, description: 'Confidence in this transition, 0-100. Below 40 should be rare — prefer not firing over firing low-confidence transitions.' },
-    },
-    required: ['item_id', 'state', 'evidence', 'confidence'],
-  },
-};
-
-const RECORD_FIELD = {
-  name: 'record_field',
-  description:
-    "Record a captured key/value pair extracted from the transcript. Field ids are namespaced as '<group>.<localId>'. Calling again with the same field_id replaces the value. Use this for non-aggregable text descriptors only; dollar amounts and other quantitative opportunity figures are handled by a separate background scanner — do NOT try to record them here.",
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      field_id: { type: Type.STRING, enum: FIELD_IDS },
-      value: { type: Type.STRING, description: "Short display string for the value (e.g. '40% YoY', '8 marketers, 3 sellers')." },
-      evidence: { type: Type.STRING, description: 'Short quote or paraphrase (≤120 chars) from the transcript.' },
-    },
-    required: ['field_id', 'value', 'evidence'],
-  },
-};
-
-/*
- * NOTE — record_meeting_fact removed in post-test-call fixes batch 2.
- *
- * The Coach used to own a `record_meeting_fact` tool here that ran
- * every 1.5 s alongside item-state tracking and field capture. That
- * coupling produced the headline-wobble symptom: on every Coach tick
- * the model would re-classify duplicates and re-fire similar facts,
- * which the Stage-2 worker then re-summed differently each time.
- *
- * The new pipeline moves quantitative-fact extraction OUT of the
- * Coach into a dedicated Stage-1 scanner (src/facts-scanner.js) that
- * runs on its own cadence (~12 s) and appends directly to
- * `coachContext.factsSheet.entries`. The Coach is no longer in the
- * monetary-extraction business — its focus is back to rubric scoring
- * + ask suggestions + mark_question_asked.
- *
- * The system prompt in src/rubric.js has been updated accordingly
- * (the section describing record_meeting_fact has been replaced with
- * a "leave money to the scanner" note).
- */
-
-const SUGGEST_NEXT_QUESTION = {
-  name: 'suggest_next_question',
-  description:
-    'Suggest the next question for the seller to ask. Only call this when the tool is present in your tool list (the seller has asked for a suggestion, or a natural pause was detected in Automated mode). Read the last 2-3 transcript turns first and let the conversational beat — not the rubric checklist — drive the choice. An anchor_quote from the transcript is REQUIRED so the rep can see what the suggestion is responding to.',
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      item_id: {
-        type: Type.STRING,
-        // Strict allow-list: only items the model is allowed to surface as
-        // a question. Excludes behaviour items like
-        // `opening_agenda.intro_name_company` or
-        // `questioning.open_ended` so the model can't return a meta
-        // instruction like "Could you introduce yourself?" addressed at
-        // the seller. Scoring (update_item_state) still uses the full
-        // ITEM_IDS enum, so those items keep getting marked covered.
-        enum: [...SUGGESTABLE_ITEM_IDS, ...SUGGESTION_SENTINEL_ITEM_IDS],
-        description:
-          "Namespaced rubric item id this question would surface (e.g. 'finance.annual_cost'), or the sentinel 'freeform.deeper' when the natural follow-up does not map to any rubric item — only legal in 'deeper' mode.",
-      },
-      question: {
-        type: Type.STRING,
-        description: "One-sentence question the seller could ask next, in the seller's voice.",
-      },
-      rationale: {
-        type: Type.STRING,
-        description: 'One-sentence explanation of why this is the best next move RIGHT NOW given the conversational beat.',
-      },
-      anchor_quote: {
-        type: Type.STRING,
-        description:
-          'Short quote (≤120 chars) from the transcript showing the moment this suggestion is responding to — include the speaker label when it matters (e.g. \'Prospect: "we lose two days a week on this"\'). If you cannot find an anchor, do NOT call this tool.',
-      },
-    },
-    required: ['item_id', 'question', 'anchor_quote'],
-  },
-};
-
-/**
- * mark_question_asked — gated tool. Only present in the per-tick
- * declarations when (a) the user has Advanced → Track question state
- * toggled on AND (b) main has supplied at least one unresolved
- * suggestion in the PENDING SUGGESTIONS context block.
- *
- * Semantics: when the seller actually asks one of the previously-
- * pinned suggestions (with the same intent, even if the wording
- * differs), the model fires this tool with the suggestion's id +
- * a short evidence quote. Main flips the history entry's `asked`
- * flag to true and broadcasts the updated history to the renderer,
- * which surfaces the question with a green outline + tint under
- * the `logged_questions` synthetic pillar.
- */
-const MARK_QUESTION_ASKED = {
-  name: 'mark_question_asked',
-  description:
-    'Mark a previously-suggested question as actually asked by the seller, based on what was said in the transcript. Only call this when you can quote the seller asking the same intent (possibly with different words).',
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      suggestion_id: { type: Type.STRING, description: 'The id of the suggestion entry from the PENDING SUGGESTIONS list in the user message.' },
-      evidence: { type: Type.STRING, description: 'The exact (or near-exact) quote (≤120 chars) from the transcript where the seller asked it.' },
-    },
-    required: ['suggestion_id', 'evidence'],
-  },
-};
 
 /* ────────────────────────────────────────────────────────────────────────
  * Coach
@@ -451,6 +356,134 @@ export class Coach {
      *  Cleared once the tick has dispatched (one-shot, same lifecycle
      *  as queuedSuggestionKind). */
     this.queuedTargetedItemId = null;
+
+    /**
+     * Per-instance tool declarations. Built once at construction
+     * from the current `ITEM_IDS` / `FIELD_IDS` / `SUGGESTABLE_ITEM_IDS`
+     * / `SUGGESTION_SENTINEL_ITEM_IDS` bindings out of src/rubric.js.
+     *
+     * Per the editable-rubric design (architecture invariant #2 in
+     * the plan), a rubric swap requires Coach teardown + reconstruction,
+     * so each new Coach instance captures the freshly-active rubric's
+     * enums at construction time. A live session can't observe a
+     * mid-flight tool-schema mutation — the swap is gated on the
+     * session being idle and the new Coach is built on the next
+     * Start.
+     */
+    this._tools = this._buildTools();
+  }
+
+  /**
+   * Build the four tool declarations against the currently-active
+   * rubric's enums. Called exactly once, from the constructor.
+   *
+   * Reads `ITEM_IDS`, `FIELD_IDS`, `SUGGESTABLE_ITEM_IDS`, and
+   * `SUGGESTION_SENTINEL_ITEM_IDS` from the live ESM bindings exposed
+   * by src/rubric.js. Those bindings are `let`s populated by
+   * `_applyRubric` on the active rubric — so this method always
+   * reflects the rubric the Coach is being asked to coach against.
+   *
+   * @returns {{ UPDATE_ITEM_STATE: object, RECORD_FIELD: object, SUGGEST_NEXT_QUESTION: object, MARK_QUESTION_ASKED: object }}
+   */
+  _buildTools() {
+    const UPDATE_ITEM_STATE = {
+      name: 'update_item_state',
+      description:
+        "Update the lifecycle state of a rubric checklist item based on transcript evidence. Item ids are namespaced as '<pillarId>.<localId>'. Call this whenever an item transitions between states; absence from the state map is implicit `pending`.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          item_id: { type: Type.STRING, enum: ITEM_IDS, description: "Namespaced item id, e.g. 'finance.annual_cost'." },
+          state: { type: Type.STRING, enum: ITEM_STATES, description: "New state. 'in_progress' = seller is approaching; 'covered' = asked + answered + moved on (terminal positive); 'logged' = partially addressed but not closed out." },
+          evidence: { type: Type.STRING, description: 'Short quote or paraphrase (≤120 chars) from the transcript supporting this transition.' },
+          confidence: { type: Type.NUMBER, description: 'Confidence in this transition, 0-100. Below 40 should be rare — prefer not firing over firing low-confidence transitions.' },
+        },
+        required: ['item_id', 'state', 'evidence', 'confidence'],
+      },
+    };
+
+    const RECORD_FIELD = {
+      name: 'record_field',
+      description:
+        "Record a captured key/value pair extracted from the transcript. Field ids are namespaced as '<group>.<localId>'. Calling again with the same field_id replaces the value. Use this for non-aggregable text descriptors only; dollar amounts and other quantitative opportunity figures are handled by a separate background scanner — do NOT try to record them here.",
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          field_id: { type: Type.STRING, enum: FIELD_IDS },
+          value: { type: Type.STRING, description: "Short display string for the value (e.g. '40% YoY', '8 marketers, 3 sellers')." },
+          evidence: { type: Type.STRING, description: 'Short quote or paraphrase (≤120 chars) from the transcript.' },
+        },
+        required: ['field_id', 'value', 'evidence'],
+      },
+    };
+
+    const SUGGEST_NEXT_QUESTION = {
+      name: 'suggest_next_question',
+      description:
+        'Suggest the next question for the seller to ask. Only call this when the tool is present in your tool list (the seller has asked for a suggestion, or a natural pause was detected in Automated mode). Read the last 2-3 transcript turns first and let the conversational beat — not the rubric checklist — drive the choice. An anchor_quote from the transcript is REQUIRED so the rep can see what the suggestion is responding to.',
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          item_id: {
+            type: Type.STRING,
+            // Strict allow-list: only items the model is allowed to surface as
+            // a question. Excludes behaviour items like
+            // `opening_agenda.intro_name_company` or
+            // `questioning.open_ended` so the model can't return a meta
+            // instruction like "Could you introduce yourself?" addressed at
+            // the seller. Scoring (update_item_state) still uses the full
+            // ITEM_IDS enum, so those items keep getting marked covered.
+            enum: [...SUGGESTABLE_ITEM_IDS, ...SUGGESTION_SENTINEL_ITEM_IDS],
+            description:
+              "Namespaced rubric item id this question would surface (e.g. 'finance.annual_cost'), or the sentinel 'freeform.deeper' when the natural follow-up does not map to any rubric item — only legal in 'deeper' mode.",
+          },
+          question: {
+            type: Type.STRING,
+            description: "One-sentence question the seller could ask next, in the seller's voice.",
+          },
+          rationale: {
+            type: Type.STRING,
+            description: 'One-sentence explanation of why this is the best next move RIGHT NOW given the conversational beat.',
+          },
+          anchor_quote: {
+            type: Type.STRING,
+            description:
+              'Short quote (≤120 chars) from the transcript showing the moment this suggestion is responding to — include the speaker label when it matters (e.g. \'Prospect: "we lose two days a week on this"\'). If you cannot find an anchor, do NOT call this tool.',
+          },
+        },
+        required: ['item_id', 'question', 'anchor_quote'],
+      },
+    };
+
+    /**
+     * mark_question_asked — gated tool. Only present in the per-tick
+     * declarations when (a) the user has Advanced → Track question state
+     * toggled on AND (b) main has supplied at least one unresolved
+     * suggestion in the PENDING SUGGESTIONS context block.
+     *
+     * Semantics: when the seller actually asks one of the previously-
+     * pinned suggestions (with the same intent, even if the wording
+     * differs), the model fires this tool with the suggestion's id +
+     * a short evidence quote. Main flips the history entry's `asked`
+     * flag to true and broadcasts the updated history to the renderer,
+     * which surfaces the question with a green outline + tint under
+     * the `logged_questions` synthetic pillar.
+     */
+    const MARK_QUESTION_ASKED = {
+      name: 'mark_question_asked',
+      description:
+        'Mark a previously-suggested question as actually asked by the seller, based on what was said in the transcript. Only call this when you can quote the seller asking the same intent (possibly with different words).',
+      parameters: {
+        type: Type.OBJECT,
+        properties: {
+          suggestion_id: { type: Type.STRING, description: 'The id of the suggestion entry from the PENDING SUGGESTIONS list in the user message.' },
+          evidence: { type: Type.STRING, description: 'The exact (or near-exact) quote (≤120 chars) from the transcript where the seller asked it.' },
+        },
+        required: ['suggestion_id', 'evidence'],
+      },
+    };
+
+    return { UPDATE_ITEM_STATE, RECORD_FIELD, SUGGEST_NEXT_QUESTION, MARK_QUESTION_ASKED };
   }
 
   start() {
@@ -782,9 +815,9 @@ export class Coach {
     // doc-block above the now-removed RECORD_MEETING_FACT constant
     // for the rationale. The Coach no longer participates in
     // monetary fact extraction.
-    const functionDeclarations = [UPDATE_ITEM_STATE, RECORD_FIELD];
-    if (wantSuggest) functionDeclarations.push(SUGGEST_NEXT_QUESTION);
-    if (wantMarkAsked) functionDeclarations.push(MARK_QUESTION_ASKED);
+    const functionDeclarations = [this._tools.UPDATE_ITEM_STATE, this._tools.RECORD_FIELD];
+    if (wantSuggest) functionDeclarations.push(this._tools.SUGGEST_NEXT_QUESTION);
+    if (wantMarkAsked) functionDeclarations.push(this._tools.MARK_QUESTION_ASKED);
 
     // Concurrency model:
     //   - Normal periodic ticks are mutually exclusive — only one

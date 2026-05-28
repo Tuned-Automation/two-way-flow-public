@@ -277,6 +277,14 @@ import { contextBridge, ipcRenderer } from 'electron';
  * the next-question advisory output. They share a producer (the text
  * coach in src/coach.js) but are split so the renderer can subscribe to
  * each surface independently.
+ *
+ * The `rubrics:*` channels (list / load / save / create / duplicate /
+ * delete / set-active / export / import / validate / get-default-prompts
+ * renderer→main, plus `rubrics:changed` main→renderer) belong to the
+ * editable-rubric feature and are exposed via a SEPARATE top-level
+ * `window.rubrics.*` namespace rather than nested under `gemini.*`.
+ * See the doc block on that contextBridge.exposeInMainWorld call below
+ * for the full per-channel contract.
  */
 
 const RENDERER_EVENTS = [
@@ -296,6 +304,12 @@ const RENDERER_EVENTS = [
   'summary:ready',
   'settings:changed',
   'connection:status',
+  // Editable-rubric feature: broadcast on rubrics:set-active and on
+  // rubrics:save when the saved rubric is active AND the session is
+  // idle. The renderer re-runs `rubrics.list()` to refresh the
+  // switcher pill + library bar, then re-renders the rail/captured
+  // pane against the new active rubric.
+  'rubrics:changed',
 ];
 
 function subscribe(channel) {
@@ -608,4 +622,101 @@ contextBridge.exposeInMainWorld('gemini', {
 
   // Escape hatch for renderer-side teardown / hot reload.
   _events: RENDERER_EVENTS,
+});
+
+/**
+ * Editable-rubric feature — `window.rubrics.*` bridge.
+ *
+ * Separate top-level namespace (not nested under `gemini.*`) because
+ * the rubric library is a peer concept to the call-side runtime: a
+ * user can manage rubrics without a call in progress. Keeping them
+ * at sibling scope makes the consumer surface read clearly in the
+ * renderer:
+ *
+ *     await window.rubrics.list()
+ *     await window.rubrics.setActive('tuned_automation')
+ *
+ * Channel ↔ method mapping (every method round-trips one IPC):
+ *
+ *   list()                          → rubrics:list
+ *       Returns { ok, rubrics: [{ id, name, description, isActive,
+ *       updatedAt }], active: { id, name } } — feeds the library bar
+ *       dropdown and the switcher pill title.
+ *
+ *   load(id)                        → rubrics:load
+ *       Returns { ok, rubric } | { ok: false, reason: 'not_found' }.
+ *       Full rubric object for the editor panel.
+ *
+ *   save(id, rubric)                → rubrics:save
+ *       Returns { ok, errors[], warnings[], applied } where
+ *       `applied: true` means the saved rubric was the active one
+ *       AND the session was idle, so main reloaded the live bindings
+ *       and broadcast `rubrics:changed`. `applied: false` means the
+ *       save persisted to disk but the live state was left alone
+ *       (a call is in progress or this isn't the active rubric).
+ *
+ *   create({ name, copyFrom? })     → rubrics:create
+ *       Returns { ok, id } | { ok: false, reason }.
+ *
+ *   duplicate(id, { newName })      → rubrics:duplicate
+ *       Returns { ok, id } | { ok: false, reason }.
+ *
+ *   remove(id)                      → rubrics:delete
+ *       Returns { ok } | { ok: false, reason: 'is_active' | 'not_found' }.
+ *       NB: the method is named `remove` rather than `delete` only
+ *       because `delete` is a reserved word and the codebase prefers
+ *       not to lean on JS's grace-period support for reserved names
+ *       in property positions. The IPC channel itself is `rubrics:delete`.
+ *
+ *   setActive(id)                   → rubrics:set-active
+ *       Returns { ok } | { ok: false, reason: 'call_in_progress'
+ *       | 'not_found' | ... }. The renderer surfaces 'call_in_progress'
+ *       as "End the current call before switching rubrics."
+ *
+ *   export(id)                      → rubrics:export
+ *       Returns { ok, json } — pretty-printed JSON ready to feed
+ *       into window.gemini.dialog.save for a Save-as-file flow.
+ *
+ *   import(json)                    → rubrics:import
+ *       Validates, generates a non-colliding id if needed, persists.
+ *       Returns { ok, id, warnings } | { ok: false, errors[] }.
+ *
+ *   validate(rubric)                → rubrics:validate
+ *       Synchronous validation pass. Returns { ok, errors[],
+ *       warnings[] }. Used by the editor's live "show pending
+ *       errors" surface so the user can spot a malformed shape
+ *       BEFORE clicking Save.
+ *
+ *   getDefaultPrompts()             → rubrics:get-default-prompts
+ *       Returns { ok, coachSystemInstruction, liveSystemInstruction,
+ *       voiceAndTone } — the DEFAULT_RUBRIC's prompt templates.
+ *       Used by the editor's "Reset to default" buttons under the
+ *       Coach Prompt section.
+ *
+ *   onChanged(callback)             ← rubrics:changed
+ *       Subscribe to active-rubric / saved-active-rubric broadcasts.
+ *       Callback receives { activeId, reason: 'set-active' | 'save' }.
+ *       Returns an unsubscribe function. Renderers should subscribe
+ *       once at boot and re-render rail / captured / switcher pill /
+ *       library bar in response to every event.
+ *
+ * Architecture invariant honoured here: NO direct fs access from the
+ * renderer. Every rubric mutation routes through main so the
+ * call-active gate (`rubrics:set-active` refusing while a session is
+ * running) is enforceable centrally — a renderer that bypassed the
+ * bridge would defeat that invariant.
+ */
+contextBridge.exposeInMainWorld('rubrics', {
+  list: () => ipcRenderer.invoke('rubrics:list'),
+  load: (id) => ipcRenderer.invoke('rubrics:load', { id }),
+  save: (id, rubric) => ipcRenderer.invoke('rubrics:save', { id, rubric }),
+  create: (opts) => ipcRenderer.invoke('rubrics:create', opts || {}),
+  duplicate: (id, opts) => ipcRenderer.invoke('rubrics:duplicate', { id, ...(opts || {}) }),
+  remove: (id) => ipcRenderer.invoke('rubrics:delete', { id }),
+  setActive: (id) => ipcRenderer.invoke('rubrics:set-active', { id }),
+  export: (id) => ipcRenderer.invoke('rubrics:export', { id }),
+  import: (json) => ipcRenderer.invoke('rubrics:import', { json }),
+  validate: (rubric) => ipcRenderer.invoke('rubrics:validate', { rubric }),
+  getDefaultPrompts: () => ipcRenderer.invoke('rubrics:get-default-prompts'),
+  onChanged: subscribe('rubrics:changed'),
 });

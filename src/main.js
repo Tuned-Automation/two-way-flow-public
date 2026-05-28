@@ -259,6 +259,9 @@ import {
   getFactsScanner,
 } from './settings.js';
 import { getProvider } from './providers/index.js';
+import * as rubricStore from './rubric-store.js';
+import { reloadActiveRubric } from './rubric.js';
+import { DEFAULT_RUBRIC } from './rubric-defaults.js';
 
 if (started) {
   app.quit();
@@ -2113,12 +2116,44 @@ function send(channel, payload) {
  *
  * Safe to call before either window is alive — each branch no-ops
  * when its ref is null or destroyed.
+ *
+ * Sibling broadcaster: `broadcastRubricsChanged` (below) uses the
+ * `getAllWindows()` pattern instead — that's intentional, see the
+ * comment block there.
  */
 function broadcastSettings(payload) {
   const m = mainWindowRef;
   if (m && !m.isDestroyed()) m.webContents.send('settings:changed', payload);
   const p = previewWindowRef;
   if (p && !p.isDestroyed()) p.webContents.send('settings:changed', payload);
+}
+
+/**
+ * Broadcast `rubrics:changed` to every live BrowserWindow.
+ *
+ * The Rubrics tab + rubric-switcher pill subscribe via the
+ * `window.rubrics.onChanged` preload bridge. A broadcast fires whenever:
+ *   - `rubrics:set-active` succeeds (the rail / captured pane re-render
+ *     against the new active rubric)
+ *   - `rubrics:save` mutates the currently-active rubric AND the
+ *     session is idle (a save while a call is running stays on disk
+ *     but doesn't notify, because the live Coach owns its tool schemas
+ *     for the duration of the call)
+ *
+ * Single-window today, but iterating `getAllWindows()` is the
+ * forward-compatible choice — a future tray window or detached panel
+ * picks up the events for free. Diverges intentionally from
+ * `broadcastSettings` (above), which targets specific window refs
+ * because it has a narrow two-window contract.
+ *
+ * @param {{ activeId: string, reason: 'set-active' | 'save' }} payload
+ */
+function broadcastRubricsChanged(payload) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      win.webContents.send('rubrics:changed', payload);
+    }
+  }
 }
 
 /**
@@ -3777,6 +3812,175 @@ function registerIpcHandlers() {
     return { ok: true };
   });
 
+  /* ────────────────────────────────────────────────────────────────
+   * Rubric library — 10 invoke channels + 1 event channel.
+   *
+   * The renderer talks to the rubric library exclusively through these
+   * channels via the `window.rubrics.*` preload bridge (src/preload.js).
+   * Direct fs access from the renderer is intentionally NOT supported.
+   *
+   * Lifecycle gating
+   * ────────────────
+   * `rubrics:set-active` checks the call-active flag — both
+   * `liveSession` and `coachSession` must be null. The "either is
+   * non-null" predicate is the same one teardownSession checks (see
+   * line 1103-ish), so the gate stays in sync with the rest of main's
+   * idle/running distinction.
+   *
+   * Idle path of `rubrics:set-active`:
+   *   1. store.setActiveRubric(id)           — persist the swap
+   *   2. reloadActiveRubric()                — re-pull catalogues into
+   *                                            src/rubric.js's live
+   *                                            bindings
+   *   3. coachSession?.stop() + null         — defensive (should be
+   *                                            null already when idle)
+   *   4. broadcastRubricsChanged             — renderers re-render
+   *
+   * Save path:
+   *   - Always persists.
+   *   - If the saved rubric is the active one AND the session is idle,
+   *     reload + broadcast so the rail, captured pane, and switcher
+   *     pill pick up the edit immediately.
+   *   - If the session is running, the edit stays on disk but doesn't
+   *     take effect until the next session start (the live Coach owns
+   *     its tool schemas for the duration of the call — see Task 4's
+   *     per-instance _buildTools).
+   * ──────────────────────────────────────────────────────────────── */
+  ipcMain.handle('rubrics:list', () => {
+    try {
+      return {
+        ok: true,
+        rubrics: rubricStore.listRubrics(),
+        active: rubricStore.getActiveRubricMeta(),
+      };
+    } catch (err) {
+      console.warn('[rubrics:list]', err?.message || err);
+      return { ok: false, reason: err?.message || 'list_failed' };
+    }
+  });
+
+  ipcMain.handle('rubrics:load', (_event, payload = {}) => {
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    if (!id) return { ok: false, reason: 'id_required' };
+    const rubric = rubricStore.loadRubric(id);
+    if (!rubric) return { ok: false, reason: 'not_found' };
+    return { ok: true, rubric };
+  });
+
+  ipcMain.handle('rubrics:save', (_event, payload = {}) => {
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    if (!id) return { ok: false, errors: ['id_required'], warnings: [] };
+    const result = rubricStore.saveRubric(id, payload.rubric);
+    if (!result.ok) return result;
+
+    // Idle-active save → reload + broadcast.
+    const meta = rubricStore.getActiveRubricMeta();
+    const isActive = meta.id === id;
+    const idle = !liveSession && !coachSession;
+    let applied = false;
+    if (isActive && idle) {
+      try {
+        reloadActiveRubric();
+        broadcastRubricsChanged({ activeId: id, reason: 'save' });
+        applied = true;
+      } catch (err) {
+        // Save succeeded on disk; the reload failure is logged but
+        // doesn't roll back. Worst case the renderer's next list call
+        // shows the edit and the user re-saves to retry the reload.
+        console.warn('[rubrics:save] reload after save failed:', err?.message || err);
+      }
+    }
+    return { ok: true, errors: [], warnings: result.warnings || [], applied };
+  });
+
+  ipcMain.handle('rubrics:create', (_event, payload = {}) => {
+    return rubricStore.createRubric({
+      name: typeof payload.name === 'string' ? payload.name : '',
+      copyFrom: typeof payload.copyFrom === 'string' ? payload.copyFrom : undefined,
+    });
+  });
+
+  ipcMain.handle('rubrics:duplicate', (_event, payload = {}) => {
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    return rubricStore.duplicateRubric(id, {
+      newName: typeof payload.newName === 'string' ? payload.newName : '',
+    });
+  });
+
+  ipcMain.handle('rubrics:delete', (_event, payload = {}) => {
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    return rubricStore.deleteRubric(id);
+  });
+
+  ipcMain.handle('rubrics:set-active', (_event, payload = {}) => {
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    if (!id) return { ok: false, reason: 'id_required' };
+
+    // Refuse mid-call swaps. Architecture invariant #2: the active
+    // rubric is loaded once at session start; mid-call hot-swap is
+    // forbidden. The renderer surfaces this as "End the current call
+    // before switching rubrics."
+    if (liveSession || coachSession) return { ok: false, reason: 'call_in_progress' };
+
+    const result = rubricStore.setActiveRubric(id);
+    if (!result.ok) return result;
+
+    try {
+      reloadActiveRubric();
+    } catch (err) {
+      console.warn('[rubrics:set-active] reloadActiveRubric failed:', err?.message || err);
+      return { ok: false, reason: 'reload_failed' };
+    }
+
+    // Defensive Coach teardown. When the session is idle (the only
+    // path through this branch) coachSession is already null, but
+    // mirror the claim-and-stop pattern from teardownSession so a
+    // future code path that leaves a stale Coach reference around
+    // doesn't leak its old tool schemas into the next call.
+    const c = coachSession;
+    coachSession = null;
+    if (c) {
+      try { c.stop(); } catch { /* ignore */ }
+    }
+
+    broadcastRubricsChanged({ activeId: id, reason: 'set-active' });
+    return { ok: true };
+  });
+
+  ipcMain.handle('rubrics:export', (_event, payload = {}) => {
+    const id = typeof payload.id === 'string' ? payload.id : '';
+    return rubricStore.exportRubric(id);
+  });
+
+  ipcMain.handle('rubrics:import', (_event, payload = {}) => {
+    const json = typeof payload.json === 'string' ? payload.json : payload;
+    return rubricStore.importRubric(json);
+  });
+
+  ipcMain.handle('rubrics:validate', (_event, payload = {}) => {
+    return rubricStore.validateRubric(payload.rubric);
+  });
+
+  /**
+   * Return the built-in default Coach prompt + live-session prompt
+   * templates. Used by the Rubrics tab's "Reset to default" buttons
+   * under the Coach prompt section — lets the user revert a prompt
+   * edit without having to re-create the whole rubric.
+   *
+   * Not in the v1 plan's "11 channels" list — added when Task 9
+   * surfaced a real UX need for it. Returns templates only (no
+   * catalogue blocks); the runtime composer re-emits the catalogue
+   * sections at concat time.
+   */
+  ipcMain.handle('rubrics:get-default-prompts', () => {
+    return {
+      ok: true,
+      coachSystemInstruction: DEFAULT_RUBRIC.prompts.coachSystemInstruction,
+      liveSystemInstruction: DEFAULT_RUBRIC.prompts.liveSystemInstruction,
+      voiceAndTone: DEFAULT_RUBRIC.prompts.voiceAndTone,
+    };
+  });
+
   // Audio chunks are high-frequency and fire-and-forget — use `send` not `invoke`.
   //
   // Channel 1 = salesperson mic. Fan out to BOTH consumers:
@@ -3798,6 +4002,24 @@ function registerIpcHandlers() {
 }
 
 app.whenReady().then(async () => {
+  /**
+   * Seed the on-disk rubric library on first launch.
+   *
+   * Defence-in-depth: src/rubric.js already calls loadActiveRubric() at
+   * module init time, and the store falls back to ensureSeeded() if
+   * the directory is missing. But because the explicit seed is cheap
+   * (idempotent, single-file existsSync check) and the failure mode of
+   * silently shipping an empty rubric library would be hard to debug,
+   * we run it again here BEFORE registerIpcHandlers wires up the
+   * `rubrics:list` channel. By the time the renderer can call that
+   * channel the seed has run.
+   */
+  try {
+    rubricStore.ensureSeeded();
+  } catch (err) {
+    console.warn('[main] rubricStore.ensureSeeded threw:', err?.message || err);
+  }
+
   // Auto-grant media (mic/camera) permission requests from the renderer.
   // The OS-level prompt still gates real access on macOS/Windows.
   //

@@ -116,6 +116,28 @@
             title=""
             hidden
           ></span>
+
+          <!-- Active-rubric pill (Task 10). Painted once at boot from
+               window.rubrics.list() and refreshed on every
+               `rubrics:changed` broadcast. Click opens the Settings
+               modal scrolled to the Rubrics tab so the user can pick
+               a different rubric or edit the current one. The pill
+               carries the active rubric's name as its visible label
+               and (until Task 11 lands the scoped pill styling) sits
+               in the same row as the other status pills.
+               Hidden until populated so a "Rubric:" placeholder
+               never flashes pre-IPC. -->
+          <button
+            id="rubricSwitcher"
+            type="button"
+            class="rubric-switcher"
+            aria-label="Active rubric — click to edit"
+            title=""
+            hidden
+          >
+            <span class="rubric-switcher__caption" aria-hidden="true">Rubric:</span>
+            <span class="rubric-switcher__label">—</span>
+          </button>
         </div>
 
         <div class="coach__controls">
@@ -598,13 +620,20 @@
             >×</button>
           </header>
           <nav class="settings-modal__tabs" role="tablist" aria-label="Settings sections">
-            <!-- Six tabs in stable order. Audio / General / Help are
+            <!-- Seven tabs in stable order. Audio / General / Help are
                  Phase 1 stubs that the corresponding phases populate
                  (2 / 5 / 6). The order is deliberate: providers first
                  because that's the gating step for a new install, then
                  capture (Audio), then look-and-feel (Appearance), then
-                 behaviour (Coach), then workflow + data (General), then
-                 onboarding (Help). -->
+                 behaviour (Coach), then the rubric *definition* the
+                 Coach operates against (Rubrics), then workflow + data
+                 (General), then onboarding (Help). Rubrics is placed
+                 adjacent to Coach because the two are paired concepts —
+                 Coach configures the runtime tick / suggestion knobs,
+                 Rubrics configures the catalogue those knobs operate
+                 against.
+                 Wave-2 plans that add tabs (feature/cost-tracking,
+                 feature/error-log) will need to choose a slot on merge. -->
             <button
               type="button"
               class="settings-modal__tab"
@@ -637,6 +666,14 @@
               aria-selected="false"
               aria-controls="settingsTabCoach"
             >Coach</button>
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="rubrics"
+              role="tab"
+              aria-selected="false"
+              aria-controls="settingsTabRubrics"
+            >Rubrics</button>
             <button
               type="button"
               class="settings-modal__tab"
@@ -1499,6 +1536,298 @@
                 </div>
               </div>
             </section>
+            <!-- Rubrics tab. Phase 1 of the editable-rubric feature.
+                 Renderer behaviour lands in Tasks 8 (read-only library
+                 bar + section navigation), 9 (writeable editor sections
+                 + save/discard/validation), and 10 (the rubric-switcher
+                 header pill that opens this tab on click). Static
+                 markup is the skeleton only — the section panels are
+                 empty containers that the renderer populates from
+                 `window.rubrics.load(id)` on tab open. The library
+                 select #rubricsLibrarySelect is populated from
+                 `window.rubrics.list()`. -->
+            <section
+              id="settingsTabRubrics"
+              class="settings-tab rubrics-tab"
+              data-tab-content="rubrics"
+              role="tabpanel"
+              aria-label="Rubrics"
+              hidden
+            >
+              <!-- Library bar. Picks which rubric the editor below is
+                   bound to. The "Active" badge tells the user which
+                   rubric the call rail will render against on the next
+                   session start. The Set-as-active button is gated
+                   server-side: if a call is in progress, the IPC
+                   returns { ok: false, reason: 'call_in_progress' }
+                   and the renderer surfaces the
+                   #rubricsLibraryHint message. -->
+              <div class="settings-section rubrics-tab__library">
+                <h4 class="settings-section__title">Rubric library</h4>
+                <p class="settings-section__subtitle">
+                  Pick a rubric to edit, duplicate, or set as active.
+                  The active rubric determines which pillars appear in
+                  the call rail and which fields the coach captures.
+                </p>
+
+                <div class="rubrics-tab__library-row">
+                  <label
+                    class="rubrics-tab__library-select-label"
+                    for="rubricsLibrarySelect"
+                  >
+                    <span class="rubrics-tab__library-select-caption">Editing</span>
+                    <select
+                      id="rubricsLibrarySelect"
+                      class="rubrics-tab__library-select"
+                      aria-describedby="rubricsLibraryHint"
+                    ></select>
+                  </label>
+                  <span
+                    id="rubricsActiveBadge"
+                    class="rubrics-tab__active-badge"
+                    hidden
+                  >
+                    <span
+                      class="rubrics-tab__active-badge-dot"
+                      aria-hidden="true"
+                    ></span>
+                    Active
+                  </span>
+                </div>
+
+                <div
+                  class="rubrics-tab__library-actions"
+                  role="group"
+                  aria-label="Rubric library actions"
+                >
+                  <button
+                    type="button"
+                    id="rubricsBtnSetActive"
+                    class="rubrics-tab__btn rubrics-tab__btn--primary"
+                  >Set as active</button>
+                  <button
+                    type="button"
+                    id="rubricsBtnNew"
+                    class="rubrics-tab__btn"
+                  >New…</button>
+                  <button
+                    type="button"
+                    id="rubricsBtnDuplicate"
+                    class="rubrics-tab__btn"
+                  >Duplicate</button>
+                  <button
+                    type="button"
+                    id="rubricsBtnExport"
+                    class="rubrics-tab__btn"
+                  >Export…</button>
+                  <button
+                    type="button"
+                    id="rubricsBtnImport"
+                    class="rubrics-tab__btn"
+                  >Import…</button>
+                  <button
+                    type="button"
+                    id="rubricsBtnDelete"
+                    class="rubrics-tab__btn rubrics-tab__btn--danger"
+                  >Delete</button>
+                </div>
+
+                <p
+                  id="rubricsLibraryHint"
+                  class="rubrics-tab__hint"
+                  role="status"
+                  aria-live="polite"
+                  hidden
+                ></p>
+              </div>
+
+              <!-- Editor. Each section is a native <details> accordion
+                   so the user can keep several sections expanded at
+                   once for cross-referencing (e.g. Pillars + Items
+                   side-by-side while building a new pillar). Identity
+                   opens by default; everything else collapsed by
+                   default. Advanced — System prompts is sticky-closed
+                   on every load because it's a power-user surface that
+                   should never be opened by mistake.
+
+                   Section bodies are intentionally empty here — the
+                   renderer (Tasks 8 / 9) builds their contents from the
+                   loaded rubric so a future schema change doesn't
+                   require an index.html edit. The CSS task (Task 11)
+                   styles `details.rubrics-tab__section` as a rounded
+                   card with a hairline divider between the summary
+                   and the body. -->
+              <div
+                id="rubricsEditor"
+                class="rubrics-tab__editor"
+                hidden
+              >
+                <details
+                  id="rubricsSectionIdentity"
+                  class="rubrics-tab__section"
+                  data-section="identity"
+                  open
+                >
+                  <summary class="rubrics-tab__section-summary">Identity</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="identity"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionVoiceTone"
+                  class="rubrics-tab__section"
+                  data-section="voice-tone"
+                >
+                  <summary class="rubrics-tab__section-summary">Voice &amp; tone</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="voice-tone"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionPillars"
+                  class="rubrics-tab__section"
+                  data-section="pillars"
+                >
+                  <summary class="rubrics-tab__section-summary">Pillars</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="pillars"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionItems"
+                  class="rubrics-tab__section"
+                  data-section="items"
+                >
+                  <summary class="rubrics-tab__section-summary">Items</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="items"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionFields"
+                  class="rubrics-tab__section"
+                  data-section="fields"
+                >
+                  <summary class="rubrics-tab__section-summary">Captured fields</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="fields"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionFlags"
+                  class="rubrics-tab__section"
+                  data-section="flags"
+                >
+                  <summary class="rubrics-tab__section-summary">Live flags</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="flags"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionScoring"
+                  class="rubrics-tab__section"
+                  data-section="scoring"
+                >
+                  <summary class="rubrics-tab__section-summary">Scoring</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="scoring"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionAdvancedPrompts"
+                  class="rubrics-tab__section rubrics-tab__section--advanced"
+                  data-section="advanced-prompts"
+                >
+                  <summary class="rubrics-tab__section-summary">Advanced — System prompts</summary>
+                  <div
+                    class="rubrics-tab__warning rubrics-tab__warning--advanced"
+                    role="note"
+                  >
+                    These prompts drive the AI's behaviour. Only edit if
+                    you understand the existing instructions. Use
+                    <strong>Reset to default</strong> to restore.
+                  </div>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="advanced-prompts"
+                  ></div>
+                </details>
+              </div>
+
+              <!-- Save bar. Sticks to the bottom of the scrolling tab
+                   body so even from deep inside a long pillars list
+                   the user can see what they're about to commit.
+                   Validation messages render above the action row;
+                   if any errors exist the Save button stays disabled
+                   (#rubricsBtnSave). The dirty-hint pill mirrors the
+                   form-dirty state so the user knows a discard would
+                   throw work away. -->
+              <div
+                id="rubricsSaveBar"
+                class="rubrics-tab__save-bar"
+                hidden
+              >
+                <div
+                  id="rubricsValidation"
+                  class="rubrics-tab__validation"
+                  role="status"
+                  aria-live="polite"
+                  hidden
+                >
+                  <ul
+                    id="rubricsValidationList"
+                    class="rubrics-tab__validation-list"
+                  ></ul>
+                </div>
+                <div class="rubrics-tab__save-actions">
+                  <span
+                    id="rubricsDirtyHint"
+                    class="rubrics-tab__dirty-hint"
+                    hidden
+                  >Unsaved changes</span>
+                  <button
+                    type="button"
+                    id="rubricsBtnDiscard"
+                    class="rubrics-tab__btn"
+                  >Discard</button>
+                  <button
+                    type="button"
+                    id="rubricsBtnSave"
+                    class="rubrics-tab__btn rubrics-tab__btn--primary"
+                    disabled
+                  >Save</button>
+                </div>
+              </div>
+
+              <!-- Empty state. Shown when no rubric is selected for
+                   editing (e.g. immediately after deleting the
+                   currently-edited rubric, or on first open before
+                   the library list has resolved). -->
+              <div
+                id="rubricsEmptyState"
+                class="rubrics-tab__empty"
+                hidden
+              >
+                <p>
+                  No rubric selected. Pick one from the dropdown above
+                  to edit, or click <strong>New…</strong> to create one.
+                </p>
+              </div>
+            </section>
             <!-- General tab. Phase 1 ships the Data subsection
                  (export / import / reset). Phase 5 will add workflow
                  controls above it (auto-test API key, transcript /
@@ -1646,6 +1975,54 @@
               id="settingsResetConfirmBtn"
               class="modal__btn modal__btn--danger"
             >Reset settings</button>
+          </footer>
+        </div>
+      </dialog>
+
+      <!-- Settings → Rubrics: confirmation dialog for Delete.
+           Sibling of #settingsModal so its .showModal() puts it on
+           the top layer above the open settings dialog (same pattern
+           as #settingsResetConfirm above). The renderer populates
+           #rubricsDeleteConfirmName with the rubric name on open;
+           the action is irreversible from the user's perspective so
+           the destructive button stays as the right-most action with
+           the danger variant. Active-rubric deletion is blocked
+           server-side (rubrics:delete returns
+           { ok: false, reason: 'is_active' }) — the renderer should
+           disable the Delete button + surface a library hint when
+           the selected rubric is active, but this dialog still acts
+           as the second confirmation for everything else. -->
+      <dialog
+        id="rubricsDeleteConfirm"
+        class="modal"
+        aria-labelledby="rubricsDeleteConfirmTitle"
+      >
+        <div class="modal__panel">
+          <header class="modal__header">
+            <h2
+              id="rubricsDeleteConfirmTitle"
+              class="modal__title"
+            >Delete this rubric?</h2>
+          </header>
+          <div class="modal__body">
+            <p>
+              You're about to delete
+              <strong id="rubricsDeleteConfirmName">this rubric</strong>.
+              This removes the rubric from your library on disk. There
+              is no undo.
+            </p>
+          </div>
+          <footer class="modal__actions">
+            <button
+              type="button"
+              id="rubricsDeleteConfirmCancel"
+              class="modal__btn modal__btn--ghost"
+            >Cancel</button>
+            <button
+              type="button"
+              id="rubricsDeleteConfirmBtn"
+              class="modal__btn modal__btn--danger"
+            >Delete rubric</button>
           </footer>
         </div>
       </dialog>
