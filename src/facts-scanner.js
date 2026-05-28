@@ -108,18 +108,28 @@ const PERIOD_VALUES = ['one_time', 'weekly', 'monthly', 'quarterly', 'annual'];
 /* Monetary kinds where a bare amount under $5K is almost certainly a
  * transcription artefact, not a real $30 line item. The Stage-1 scanner
  * drops these rather than letting them through to Stage-2 where they
- * compound into a wrong rollup. `time_cost`, `other`, `context_only`,
- * and `hypothetical_fix_cost` are deliberately EXCLUDED — they have
- * legitimate small-amount usages (e.g. "$150 hourly rate", "$500
- * one-time setup fee"). `stated_total` IS included because a bottom-
- * line opportunity stated as "$30" is virtually always meant to be
- * "$30 grand". */
+ * compound into a wrong rollup.
+ *
+ * `time_cost` and `other` are included as of 2026-05-27 — a test call
+ * showed phrases like "twenty grand in wasted time" producing $20
+ * `time_cost` line items when Deepgram lost "grand" from the audio
+ * AND the LLM didn't multiply. Losing the fact entirely is the right
+ * outcome.
+ *
+ * `context_only` and `hypothetical_fix_cost` remain EXCLUDED — they
+ * have legitimate small-amount usages ("$150 hourly rate", "$500
+ * one-time setup fee") AND they're filtered out of the Stage-2
+ * rollup anyway (see EXCLUDED_FROM_HEADLINE_KINDS in quick-fix.js),
+ * so a wrong-magnitude entry in these kinds can't corrupt the
+ * headline. */
 const IMPLAUSIBILITY_USD_KINDS = new Set([
   'current_spend',
   'pain_cost',
   'savings_opportunity',
   'revenue_uplift',
+  'time_cost',
   'headcount_cost',
+  'other',
   'stated_total',
 ]);
 
@@ -155,12 +165,23 @@ const FACTS_SYSTEM_PROMPT = [
   '                     speaker\'s words; never store a small bare',
   '                     integer when the speaker clearly meant',
   '                     thousands. Examples:',
-  '                       "$50K/yr"             → 50000',
-  '                       "thirty grand a year" → 30000',
-  '                       "$15.20 grand"        → 15200',
-  '                       "$4M ARR"             → 4000000',
-  '                       "10 hours a week"     → 10',
-  '                       "5%"                  → 5',
+  '                       "$50K/yr"                    → 50000',
+  '                       "thirty grand a year"        → 30000',
+  '                       "$15.20 grand"               → 15200',
+  '                       "two hundred grand"          → 200000',
+  '                       "fifteen hundred dollars"    → 1500   (no multiplier)',
+  '                       "fifteen hundred grand"      → 1500000 (1500 × 1000)',
+  '                       "thirty, forty grand a year" → 35000  (range — emit the',
+  '                                                              MIDPOINT)',
+  '                       "ten, fifteen, twenty grand" → 15000  (range — midpoint;',
+  '                                                              do NOT emit one',
+  '                                                              fact per number)',
+  '                       "$4M ARR"                    → 4000000',
+  '                       "1.5 mil"                    → 1500000',
+  '                       "two mil"                    → 2000000',
+  '                       "one point five to two mil"  → 1750000 (range midpoint)',
+  '                       "10 hours a week"            → 10',
+  '                       "5%"                         → 5',
   '                     Do not convert period — hours/week stays',
   '                     weekly; Stage-2 handles annualisation.',
   '    "unit":          one of "usd" | "hours" | "people" | "percent".',
@@ -248,6 +269,15 @@ const FACTS_SYSTEM_PROMPT = [
   '                               doesn\'t fit cleanly above.',
   '',
   'Critical rules:',
+  '  0. RANGES — when the speaker gives two numbers connected by',
+  '     a comma, "or", "to", or "between … and …", emit ONE fact for the',
+  '     MIDPOINT. Do not emit one fact per endpoint, and do not interpret',
+  '     a comma between two spoken numbers as a decimal. Examples:',
+  '       "thirty, forty grand"          → ONE fact, amount: 35000',
+  '       "ten to fifteen grand a month" → ONE fact, amount: 12500',
+  '       "between 100K and 150K"        → ONE fact, amount: 125000',
+  '     Reference the midpoint in the `basis` (e.g. "midpoint of the',
+  '     30-40 grand range stated").',
   '  1. ADD-ONLY semantics. The scanner is the source of new facts on',
   '     every tick. Stage-2 does the de-duplication across the full',
   '     list — your job is just to surface what was stated in the',
@@ -307,17 +337,19 @@ const FACTS_SCHEMA = {
  * sales-call audio ("$30 a year" instead of "$30 grand a year"). The
  * Stage-1 model dutifully stores `30`, which compounds into a wrong
  * Stage-2 rollup. This post-processor reads the anchor_quote for
- * "grand"/"thousand"/"K"/"M"/"million" tokens and multiplies the
- * amount accordingly when it's too small to plausibly be the literal
- * value.
+ * "grand"/"thousand"/"K" (thousands) and "million"/"millions"/"mil"/
+ * "mill"/"M" (millions) tokens and multiplies the amount accordingly
+ * when it's too small to plausibly be the literal value.
  *
  * Only applied to monetary facts (unit === 'usd'). Hours, percent, and
  * people don't share the same magnitude ambiguity.
  *
  * Conservative on purpose: only scales UP when the amount is below the
- * relevant threshold (1000 for thousands, 100_000 for millions). A
- * model that already correctly returned 30000 with anchor "30 grand"
- * is not double-scaled.
+ * relevant threshold (10_000 for thousands — catches "two hundred
+ * grand" → 200 and "fifteen hundred grand" → 1500 even when the LLM
+ * forgot to multiply; 100_000 for millions). A model that already
+ * correctly returned 30000 with anchor "30 grand" is not double-
+ * scaled.
  *
  * @param {number} amount      The amount the model returned.
  * @param {string} anchorQuote The quote it claims to come from.
@@ -337,11 +369,14 @@ function normaliseMagnitude(amount, anchorQuote, unit) {
     || /\d\s*k\b/.test(quote);
   const hasMillions =
     /\bmillion\b/.test(quote)
+    || /\bmillions\b/.test(quote)
+    || /\bmil\b/.test(quote)
+    || /\bmill\b/.test(quote)
     || /\d\s*m\b/.test(quote);
   if (hasMillions && amount < 100_000) {
     return amount * 1_000_000;
   }
-  if (hasThousands && amount < 1_000) {
+  if (hasThousands && amount < 10_000) {
     return amount * 1_000;
   }
   return amount;
