@@ -181,10 +181,26 @@ const DIRECTIVES = {
     '- Anchor on whichever speaker most recently moved the',
     '  conversation.',
   ].join('\n'),
+  pivot_within_pillar: [
+    'DIRECTIVE (this turn only):',
+    '- mode: pivot_within_pillar',
+    '- The auto-coach has already reformulated the previous question once without it',
+    '  being asked. Pick a DIFFERENT not-yet-covered item from the pillar named on the',
+    '  TARGETED_PILLAR line and write a question for it. Read the last 2-3 turns first',
+    '  so the choice lands naturally.',
+    '- The item_id you return MUST be namespaced under TARGETED_PILLAR (e.g. for',
+    '  TARGETED_PILLAR=finance, use finance.<localId>). Do NOT use freeform sentinels.',
+    '- Fallback: if no items in TARGETED_PILLAR are eligible (all covered, logged, or',
+    '  in RECENTLY SKIPPED), apply pivot semantics — pick a low-coverage pillar that',
+    '  has not been touched in the recent transcript, and tag the question with a',
+    '  real rubric item id from that pillar.',
+    '- Rationale rules from the system prompt still apply (no stage directions; explain',
+    '  WHY this question fits the moment).',
+  ].join('\n'),
 };
 
 /** Set of legal kind tokens for requestSuggestion. */
-const VALID_KINDS = new Set(['next', 'deeper', 'pivot', 'pause', 'recap', 'targeted', 'reformulate']);
+const VALID_KINDS = new Set(['next', 'deeper', 'pivot', 'pause', 'recap', 'targeted', 'reformulate', 'pivot_within_pillar']);
 
 /* ────────────────────────────────────────────────────────────────────────
  * Tool declarations
@@ -356,6 +372,16 @@ export class Coach {
      *  Cleared once the tick has dispatched (one-shot, same lifecycle
      *  as queuedSuggestionKind). */
     this.queuedTargetedItemId = null;
+
+    /** Companion to queuedSuggestionKind for `pivot_within_pillar` asks:
+     *  the rubric pillar id the auto-pivot should stay within. Read by
+     *  _tick() and appended to the user message as
+     *  `TARGETED_PILLAR: <id>` right after the DIRECTIVE block.
+     *  Cleared once the tick has dispatched (one-shot, same lifecycle
+     *  as queuedTargetedItemId). Set exclusively by
+     *  requestSuggestion({ kind: 'pivot_within_pillar', pillarId }).
+     */
+    this.queuedPillarId = null;
 
     /**
      * Per-instance tool declarations. Built once at construction
@@ -571,7 +597,7 @@ export class Coach {
    * one. Calling with different kinds back-to-back overwrites the
    * earlier — the rep's most recent click wins.
    */
-  requestSuggestion({ kind, itemId } = {}) {
+  requestSuggestion({ kind, itemId, pillarId } = {}) {
     const normalised = typeof kind === 'string' && VALID_KINDS.has(kind) ? kind : 'next';
     // Stamp the previous pin's itemId into the skip set so the model
     // doesn't immediately re-suggest it on the next tick.
@@ -583,6 +609,11 @@ export class Coach {
     // recently-skipped item is being targeted. We deliberately skip
     // the stamp for reformulate so the next tick can land on the
     // same item with a new phrasing.
+    //
+    // pivot_within_pillar DOES stamp the previous itemId — the entire
+    // point of this kind is to abandon the old item and pick a
+    // different one in the same pillar, so the skip-set entry helps
+    // the model drop the old candidate.
     if (this.lastSuggestion?.itemId && normalised !== 'reformulate') {
       this.skippedItemIds.set(this.lastSuggestion.itemId, Date.now());
     }
@@ -603,6 +634,15 @@ export class Coach {
       this.queuedTargetedItemId = itemId;
     } else {
       this.queuedTargetedItemId = null;
+    }
+    // Carry the requested pillarId for pivot_within_pillar — the
+    // auto-pivot fired by armReformulateTimer once the per-item
+    // reformulate cap is exceeded. Cleared on every other kind so a
+    // stray pillarId can't leak across kinds.
+    if (normalised === 'pivot_within_pillar' && typeof pillarId === 'string' && pillarId) {
+      this.queuedPillarId = pillarId;
+    } else {
+      this.queuedPillarId = null;
     }
     // Recap clicks bypass the in-flight gate so the rep's click latency
     // is bounded by the provider roundtrip alone (no waiting for a
@@ -870,10 +910,14 @@ export class Coach {
       }
 
       const targetedItemId = this.queuedTargetedItemId;
+      const targetedPillarId = this.queuedPillarId;
       if (wantSuggest) {
         parts.push('', DIRECTIVES[requestedKind] || DIRECTIVES.next);
         if ((requestedKind === 'targeted' || requestedKind === 'reformulate') && targetedItemId) {
           parts.push(`TARGETED_ITEM: ${targetedItemId}`);
+        }
+        if (requestedKind === 'pivot_within_pillar' && targetedPillarId) {
+          parts.push(`TARGETED_PILLAR: ${targetedPillarId}`);
         }
       }
 
@@ -932,7 +976,8 @@ export class Coach {
       for (const id of boostedThisTick) this.boostedItemIds.delete(id);
       // Clear the queued kind only on success. If the API call threw we
       // leave it in place so the next tick retries. The companion
-      // queuedTargetedItemId travels with the kind — also one-shot.
+      // queuedTargetedItemId / queuedPillarId travel with the kind —
+      // also one-shot.
       if (this.queuedSuggestionKind === requestedKind) {
         this.queuedSuggestionKind = null;
         if (
@@ -940,6 +985,9 @@ export class Coach {
           this.queuedTargetedItemId === targetedItemId
         ) {
           this.queuedTargetedItemId = null;
+        }
+        if (requestedKind === 'pivot_within_pillar' && this.queuedPillarId === targetedPillarId) {
+          this.queuedPillarId = null;
         }
       }
     } catch (err) {
