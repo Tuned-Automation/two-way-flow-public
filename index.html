@@ -1046,7 +1046,7 @@
                       max="100"
                       step="1"
                       class="transparency-slider__input"
-                      aria-describedby="transparencyOutlineValue"
+                      aria-describedby="transparencyOutlineValue transparencyOutlineHint"
                     />
                     <span
                       id="transparencyOutlineValue"
@@ -1054,6 +1054,12 @@
                       data-channel="outline"
                       aria-live="polite"
                     >0%</span>
+                    <p
+                      id="transparencyOutlineHint"
+                      class="transparency-hint"
+                      data-channel="outline"
+                      hidden
+                    >Very low outline alpha may show a faint macOS shadow ring around the surface — this is expected.</p>
                   </div>
                   <div class="transparency-slider">
                     <label for="transparencyBody">Body</label>
@@ -1084,7 +1090,7 @@
                       max="100"
                       step="1"
                       class="transparency-slider__input"
-                      aria-describedby="transparencyTextValue"
+                      aria-describedby="transparencyTextValue transparencyTextHint"
                     />
                     <span
                       id="transparencyTextValue"
@@ -1092,6 +1098,12 @@
                       data-channel="text"
                       aria-live="polite"
                     >0%</span>
+                    <p
+                      id="transparencyTextHint"
+                      class="transparency-hint"
+                      data-channel="text"
+                      hidden
+                    >Text below 40% alpha may be hard to read on busy backgrounds.</p>
                   </div>
                 </div>
 

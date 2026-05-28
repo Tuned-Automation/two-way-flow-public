@@ -4393,10 +4393,15 @@ function applySettingsToForm(settings) {
   // vars (so the main overlay re-skins on Reset / Import) and
   // hydrate the editor's sliders + preset cards. Sliders show
   // values for whichever surface the dropdown currently points at;
-  // a fresh boot points at 'coach' by default.
+  // a fresh boot points at 'coach' by default. Hints also re-
+  // evaluate so a Reset that crosses the low-alpha threshold
+  // re-surfaces the inline warning.
   applyTransparencyBlock(settings.appearance?.transparency || DEFAULT_TRANSPARENCY);
   hydrateTransparencySliders(settings.appearance?.transparency || DEFAULT_TRANSPARENCY);
   hydrateTransparencyPresetCards(settings.appearance?.transparencyPresets);
+  if (transparencySurfaceEl instanceof HTMLSelectElement) {
+    updateTransparencyHints(transparencySurfaceEl.value);
+  }
 
   applyCoachToForm(settings.coach);
   applyAudioToForm(settings.audio);
@@ -5653,13 +5658,56 @@ wireTransparencySlider(transparencySliderEls.outline);
 wireTransparencySlider(transparencySliderEls.body);
 wireTransparencySlider(transparencySliderEls.text);
 
-/* Low-alpha hint placeholder. Task 9 fills this with the real
- * data-channel hint toggles; for now it's a no-op so the slider
- * handler above can call it unconditionally without breaking.
- * Defined here so the slider handler doesn't ReferenceError on
- * first load — Task 9 replaces the body, not the signature. */
-function updateTransparencyHints(/* surface */) {
-  /* Filled in by Task 9. */
+/* Low-alpha hints — surface the two known foot-guns inline so the
+ * user doesn't have to discover them by experiment:
+ *
+ *   - Outline below 0.05 on a frameless transparent macOS window
+ *     can reveal the native NSWindow shadow ring (see the long
+ *     hasShadow:false comment in src/main.js's createWindow). With
+ *     a settings-driven outline we can't always suppress this; the
+ *     hint just tells the user it's expected.
+ *
+ *   - Text below 0.4 is hard to read on most prospect call
+ *     backgrounds (especially light desktops). 0.4 maps to the
+ *     existing --text-dim token; below that, body copy starts
+ *     disappearing into the surface.
+ *
+ * Hints are hidden until the slider crosses each threshold, then
+ * fade in as a small italic note under the slider track. Toggled
+ * by hidden attribute so screen-readers respect the show/hide.
+ *
+ * Called from:
+ *   - Slider input handler (every drag tick).
+ *   - Surface dropdown change (after slider re-hydrate).
+ *   - Reset Surface button.
+ *   - Preset Load handler.
+ *   - applySettingsToForm (first modal open + Reset / Import paths).
+ */
+const TRANSPARENCY_HINT_THRESHOLDS = {
+  outline: 0.05,
+  text: 0.4,
+};
+
+function updateTransparencyHints(surface) {
+  if (!TRANSPARENCY_SURFACES.includes(surface)) return;
+  const block = settingsCache?.appearance?.transparency?.[surface] || DEFAULT_TRANSPARENCY[surface] || {};
+  for (const channel of ['outline', 'text']) {
+    const threshold = TRANSPARENCY_HINT_THRESHOLDS[channel];
+    // Read the slider's current displayed value rather than the
+    // persisted setting — the user might still be dragging mid-
+    // debounce, and the hint should track what they SEE.
+    const slider = transparencySliderEls[channel];
+    let pct;
+    if (slider instanceof HTMLInputElement) {
+      pct = Number.parseInt(slider.value, 10);
+    }
+    if (!Number.isFinite(pct)) pct = Math.round((block[channel] ?? 0) * 100);
+    const value = pct / 100;
+    const hint = document.getElementById(
+      channel === 'outline' ? 'transparencyOutlineHint' : 'transparencyTextHint',
+    );
+    if (hint instanceof HTMLElement) hint.hidden = value >= threshold;
+  }
 }
 
 /* Surface dropdown — flush any pending debounce for the previous
