@@ -735,6 +735,21 @@
               aria-selected="false"
               aria-controls="settingsTabUsage"
             >Usage</button>
+            <!-- Error Log tab (Wave 3 feature/error-log). Slotted
+                 between Usage and General because both surface
+                 observability data — Usage = cost / tokens,
+                 Error Log = failures. The existing data-driven
+                 tab switcher in src/renderer.js picks it up via
+                 querySelectorAll('[data-tab]') without code
+                 changes. -->
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="logs"
+              role="tab"
+              aria-selected="false"
+              aria-controls="settingsTabLogs"
+            >Error Log</button>
             <button
               type="button"
               class="settings-modal__tab"
@@ -1964,6 +1979,66 @@
                   No sessions logged yet. Start a recording — the
                   first cost record will appear here when you stop it.
                 </p>
+              </div>
+            </section>
+            <!-- Error Log tab (Wave 3 feature/error-log). Renders the
+                 in-memory ring buffer from src/error-log.js with live
+                 tail subscription via window.gemini.onLogsEntry.
+                 Clear empties the in-memory ring; on-disk per-call
+                 .jsonl files at <userData>/error-logs/ are untouched
+                 and accessible via "Open saved logs folder". -->
+            <section
+              id="settingsTabLogs"
+              class="settings-tab"
+              data-tab-content="logs"
+              role="tabpanel"
+              aria-label="Error Log"
+              hidden
+            >
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Error log</h4>
+                <p class="settings-section__subtitle">
+                  Recent failures from the AI providers. Cleared when
+                  you quit the app. A copy of each call's failures is
+                  saved on Stop.
+                </p>
+                <!-- Header row mirrors the Usage tab's pattern: a
+                     counter on the left, action buttons on the right.
+                     The Reveal button opens <userData>/error-logs/
+                     even on a fresh install (the helper creates the
+                     folder on first call). -->
+                <div class="data-action">
+                  <div class="data-action__info">
+                    <span id="errorLogCount">0 entries this session</span>
+                  </div>
+                  <div class="data-action__controls">
+                    <button
+                      type="button"
+                      class="data-action__btn"
+                      id="errorLogRevealBtn"
+                    >Open saved logs folder</button>
+                    <button
+                      type="button"
+                      class="data-action__btn data-action__btn--danger"
+                      id="errorLogClearBtn"
+                    >Clear</button>
+                  </div>
+                </div>
+                <!-- aria-live="polite" so VoiceOver announces new
+                     entries during a live call without interrupting
+                     the user's other narration. -->
+                <ul
+                  id="errorLogList"
+                  class="error-log-list"
+                  aria-live="polite"
+                ></ul>
+                <!-- Empty state. Surfaces when the ring is empty
+                     (fresh session OR post-Clear). Hidden by the
+                     renderer when the list has entries. -->
+                <p
+                  id="errorLogEmpty"
+                  class="error-log-empty"
+                >No failures recorded.</p>
               </div>
             </section>
             <!-- General tab. Phase 1 ships the Data subsection

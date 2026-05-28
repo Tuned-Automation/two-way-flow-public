@@ -371,6 +371,19 @@ const usageEmptyEl = document.getElementById('usageEmpty');
 const usageExportButtonEl = document.getElementById('usageExportButton');
 const usageClearButtonEl = document.getElementById('usageClearButton');
 
+/* Error Log tab (Wave 3 feature/error-log). Sibling of the Usage tab
+ * conceptually — both surface observability data — but the data
+ * source is the live in-memory ring buffer at src/error-log.js
+ * (via window.gemini.logs.load()), with onLogsEntry subscriptions
+ * for the live tail. On-disk per-call .jsonl files at
+ * <userData>/error-logs/ are reachable via the Reveal button but
+ * NOT read directly by the renderer. */
+const errorLogListEl = document.getElementById('errorLogList');
+const errorLogEmptyEl = document.getElementById('errorLogEmpty');
+const errorLogCountEl = document.getElementById('errorLogCount');
+const errorLogClearBtnEl = document.getElementById('errorLogClearBtn');
+const errorLogRevealBtnEl = document.getElementById('errorLogRevealBtn');
+
 /* Reset confirmation dialog (#settingsResetConfirm) — siblings of
  * #settingsModal so showModal() puts them on the top layer above. */
 const settingsResetConfirmEl = document.getElementById('settingsResetConfirm');
@@ -5019,14 +5032,17 @@ function selectSettingsTab(tabId) {
       behavior: 'smooth',
     });
   }
-  // Per-tab lazy hydrators. Today only Usage needs one (the
-  // chronological list of SessionRecords is rebuilt on every open
-  // so a session that ended while the modal was closed shows up
-  // the next time the user lands on the tab). Other tabs hydrate
-  // from settingsCache, which is already loaded by
-  // ensureSettingsLoaded(); they don't need a per-tab callback.
+  // Per-tab lazy hydrators. Usage rebuilds from window.sessions.list();
+  // Error Log rebuilds from window.gemini.logs.load(). Both pull a
+  // fresh snapshot on every tab open so an entry / session that
+  // landed while the modal was closed shows up the next time the
+  // user lands on the tab. Other tabs hydrate from settingsCache,
+  // which is already loaded by ensureSettingsLoaded(); they don't
+  // need a per-tab callback.
   if (tabId === 'usage') {
     renderUsageTab();
+  } else if (tabId === 'logs') {
+    renderLogsTab();
   }
 }
 
@@ -5297,6 +5313,250 @@ function formatUsageDuration(ms) {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
   return `${s}s`;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * Settings → Error Log tab (Wave 3 feature/error-log)
+ *
+ * Renders the in-memory ring buffer maintained by src/error-log.js.
+ * Two data paths:
+ *
+ *   1. Tab activation → window.gemini.logs.load() → replaceChildren()
+ *      with a fresh snapshot (newest-first). selectSettingsTab calls
+ *      renderLogsTab() when the user lands on the tab.
+ *
+ *   2. Live tail → window.gemini.onLogsEntry((entry) => …) prepends
+ *      a new row to the existing list. Subscription is registered
+ *      at module scope so it stays active across Settings open/close
+ *      and the tab catches up on next open even if the subscription
+ *      missed something (the load() path rebuilds from main's ring,
+ *      which is the source of truth).
+ *
+ * The DOM is treated as a write-only view over main's ring. We don't
+ * try to diff old vs new — the entry count is bounded at 500 (plan
+ * invariant #4), so a full rebuild on every open is cheap.
+ *
+ * Architecture invariant #3: `level` and `source` values are fixed
+ * enums. The renderer uses them as data-attribute selectors only;
+ * adding a new value requires updating src/error-log.js (the source
+ * of truth for ALLOWED_SOURCES) and a matching CSS rule.
+ * ──────────────────────────────────────────────────────────────────── */
+
+/**
+ * Hydrate the Error Log tab from main's ring snapshot. Mirrors the
+ * pattern of renderUsageTab — defensive against the preload bridge
+ * not being exposed, async-fire-and-forget against load() failures.
+ *
+ * @returns {Promise<void>}
+ */
+async function renderLogsTab() {
+  if (!(errorLogListEl instanceof HTMLElement)) return;
+  if (!window.gemini?.logs || typeof window.gemini.logs.load !== 'function') {
+    // Preload bridge not exposed (test harness / out-of-sync preload).
+    // Surface as empty rather than crashing.
+    errorLogListEl.replaceChildren();
+    setErrorLogEmptyVisible(true);
+    setErrorLogCount(0);
+    return;
+  }
+
+  /** @type {Array<object>} */
+  let entries = [];
+  try {
+    entries = await window.gemini.logs.load();
+  } catch (err) {
+    console.warn('[error-log] load() failed:', err?.message || err);
+    entries = [];
+  }
+
+  if (!Array.isArray(entries) || entries.length === 0) {
+    errorLogListEl.replaceChildren();
+    setErrorLogEmptyVisible(true);
+    setErrorLogCount(0);
+    return;
+  }
+
+  setErrorLogEmptyVisible(false);
+  setErrorLogCount(entries.length);
+  // entries are newest-first per the getAll contract in error-log.js
+  errorLogListEl.replaceChildren(...entries.map(renderLogRow));
+}
+
+/**
+ * Build one `<li class="log-row">` from a LogEntry. Click toggles
+ * the details panel via the `.is-expanded` class — pure CSS for the
+ * actual show/hide (`.log-row.is-expanded .log-row__details {
+ * display: block; }`).
+ *
+ * Defensive about partial entries: every field has a fallback. The
+ * truncation cap on rawResponse is handled at append time in
+ * src/error-log.js (4 KB max) so the renderer can `.textContent`
+ * it without size-checking.
+ *
+ * @param {{ id: string, at: number, level: string, source: string,
+ *           provider: string, model: string|null, durationMs: number|null,
+ *           message: string, status: number|null, reason: string|null,
+ *           rawResponse: string|null }} entry
+ * @returns {HTMLLIElement}
+ */
+function renderLogRow(entry) {
+  const li = document.createElement('li');
+  li.className = 'log-row';
+  li.dataset.level = entry?.level === 'warn' ? 'warn' : 'error';
+  if (typeof entry?.id === 'string') li.dataset.entryId = entry.id;
+
+  const meta = document.createElement('div');
+  meta.className = 'log-row__meta';
+
+  const time = document.createElement('time');
+  time.className = 'log-row__time';
+  const dt = new Date(Number(entry?.at) || Date.now());
+  time.dateTime = dt.toISOString();
+  time.textContent = dt.toLocaleTimeString();
+  meta.appendChild(time);
+
+  const levelPill = document.createElement('span');
+  levelPill.className = 'log-row__level';
+  levelPill.textContent = (entry?.level === 'warn' ? 'warn' : 'error').toUpperCase();
+  meta.appendChild(levelPill);
+
+  const sourcePill = document.createElement('span');
+  sourcePill.className = 'log-row__source';
+  sourcePill.dataset.source = typeof entry?.source === 'string' ? entry.source : 'unknown';
+  sourcePill.textContent = (entry?.source || 'unknown').toUpperCase();
+  meta.appendChild(sourcePill);
+
+  const providerPill = document.createElement('span');
+  providerPill.className = 'log-row__provider';
+  const providerLabel = String(entry?.provider || 'unknown');
+  const modelLabel = entry?.model ? ` · ${entry.model}` : '';
+  providerPill.textContent = `${providerLabel}${modelLabel}`;
+  meta.appendChild(providerPill);
+
+  const message = document.createElement('span');
+  message.className = 'log-row__message';
+  const rawMessage = String(entry?.message || '(no message)');
+  // Top-line truncation. The full message is in the details panel so
+  // the row stays one-line. ~120 chars matches the plan's spec and
+  // keeps the truncated text from wrapping on the typical settings
+  // modal width.
+  message.textContent = rawMessage.length > 120
+    ? rawMessage.slice(0, 117) + '…'
+    : rawMessage;
+  message.title = rawMessage; // Hover for the full message without expanding
+  meta.appendChild(message);
+
+  li.appendChild(meta);
+
+  // Details panel — hidden by default, toggled by the row click
+  // handler below. Monospaced via the .log-row__details CSS so the
+  // rawResponse JSON / stack trace reads cleanly.
+  const details = document.createElement('div');
+  details.className = 'log-row__details';
+  details.hidden = true;
+  details.appendChild(buildLogDetailsContent(entry));
+  li.appendChild(details);
+
+  li.addEventListener('click', () => {
+    const expanding = !li.classList.contains('is-expanded');
+    li.classList.toggle('is-expanded', expanding);
+    details.hidden = !expanding;
+  });
+
+  return li;
+}
+
+/**
+ * Build the body of the expandable details panel: status, duration,
+ * reason, full message, raw response. Returned as a `<dl>` so the
+ * label/value pairs stay semantically tagged for screen readers.
+ *
+ * @param {object} entry
+ * @returns {DocumentFragment}
+ */
+function buildLogDetailsContent(entry) {
+  const frag = document.createDocumentFragment();
+
+  const dl = document.createElement('dl');
+  dl.className = 'log-row__details-list';
+
+  /** Append a <dt>/<dd> pair, skipping the row when value is null/empty. */
+  const appendRow = (label, value) => {
+    if (value == null || value === '') return;
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    dd.textContent = String(value);
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  };
+
+  appendRow('Status', entry?.status);
+  appendRow('Duration', entry?.durationMs == null ? null : `${entry.durationMs} ms`);
+  appendRow('Reason', entry?.reason);
+  appendRow('Message', entry?.message);
+
+  frag.appendChild(dl);
+
+  if (typeof entry?.rawResponse === 'string' && entry.rawResponse.length > 0) {
+    const heading = document.createElement('h5');
+    heading.className = 'log-row__details-heading';
+    heading.textContent = 'Raw response';
+    frag.appendChild(heading);
+
+    // <pre> + textContent preserves whitespace AND escapes any
+    // < / > / & in the body — important because rawResponse is
+    // untrusted server output that may include HTML-ish snippets.
+    const pre = document.createElement('pre');
+    pre.className = 'log-row__details-raw';
+    pre.textContent = entry.rawResponse;
+    frag.appendChild(pre);
+  }
+
+  return frag;
+}
+
+/**
+ * Update the entry-count strip. Plural-safe ("1 entry" / "2 entries").
+ * @param {number} n
+ */
+function setErrorLogCount(n) {
+  if (!(errorLogCountEl instanceof HTMLElement)) return;
+  const count = Number(n) || 0;
+  errorLogCountEl.textContent = `${count} ${count === 1 ? 'entry' : 'entries'} this session`;
+}
+
+/** Toggle the empty-state paragraph + the list visibility together. */
+function setErrorLogEmptyVisible(visible) {
+  if (errorLogEmptyEl instanceof HTMLElement) errorLogEmptyEl.hidden = !visible;
+  if (errorLogListEl instanceof HTMLElement) errorLogListEl.hidden = visible;
+}
+
+/**
+ * Append a single live entry to the existing list. Prepends to keep
+ * newest-first ordering. Bumps the count and clears the empty-state
+ * if it was visible. Called from the onLogsEntry subscription.
+ *
+ * The DOM update is unconditional (not gated on "is the tab open?")
+ * because the bounded-ring + cheap-DOM properties make it not worth
+ * tracking visibility separately — when the user opens the tab the
+ * list is already correct.
+ *
+ * @param {object} entry
+ */
+function prependLogRowLive(entry) {
+  if (!(errorLogListEl instanceof HTMLElement)) return;
+  const row = renderLogRow(entry);
+  errorLogListEl.insertBefore(row, errorLogListEl.firstChild);
+  // Trim the DOM if it grows past the ring cap. The main-side ring
+  // drops the oldest entry on overflow, so a fresh tab open would
+  // also show 500. Trimming live keeps the DOM in sync without a
+  // full reload.
+  while (errorLogListEl.children.length > 500) {
+    errorLogListEl.removeChild(errorLogListEl.lastChild);
+  }
+  setErrorLogCount(errorLogListEl.children.length);
+  setErrorLogEmptyVisible(false);
 }
 
 /** Export-button handler. v1 copies the JSON dump to the clipboard
@@ -6638,6 +6898,52 @@ if (usageExportButtonEl instanceof HTMLButtonElement) {
 }
 if (usageClearButtonEl instanceof HTMLButtonElement) {
   usageClearButtonEl.addEventListener('click', doUsageClear);
+}
+
+/* Error Log tab wiring (Wave 3 feature/error-log). Same module-scope
+ * pattern as the Usage buttons above. The live-tail subscription
+ * runs unconditionally so the DOM keeps pace with main's ring even
+ * when the modal is closed — when the user opens Settings → Error
+ * Log later, the list is already current. */
+window.gemini?.onLogsEntry?.((entry) => {
+  if (!entry || typeof entry !== 'object') return;
+  prependLogRowLive(entry);
+});
+
+if (errorLogClearBtnEl instanceof HTMLButtonElement) {
+  errorLogClearBtnEl.addEventListener('click', async () => {
+    if (!window.gemini?.logs || typeof window.gemini.logs.clear !== 'function') return;
+    try {
+      await window.gemini.logs.clear();
+    } catch (err) {
+      console.warn('[error-log] clear() failed:', err?.message || err);
+    }
+    // Clear the DOM optimistically — the in-memory ring is gone
+    // regardless of broadcast timing, and the next renderLogsTab()
+    // would re-fetch an empty array anyway. On-disk .jsonl files
+    // are untouched by Clear (plan invariant: file artefacts are
+    // session-permanent until the user manually deletes them via
+    // Finder/Explorer).
+    if (errorLogListEl instanceof HTMLElement) {
+      errorLogListEl.replaceChildren();
+    }
+    setErrorLogEmptyVisible(true);
+    setErrorLogCount(0);
+  });
+}
+
+if (errorLogRevealBtnEl instanceof HTMLButtonElement) {
+  errorLogRevealBtnEl.addEventListener('click', () => {
+    if (!window.gemini?.logs || typeof window.gemini.logs.revealFolder !== 'function') return;
+    // Fire-and-forget — shell.openPath in main.js doesn't surface a
+    // failure to the renderer today (Finder may refuse to open
+    // because of macOS sandbox prompts, but the user sees the
+    // prompt directly). Wrap in a Promise.resolve so a sync throw
+    // can't crash the click handler.
+    Promise.resolve(window.gemini.logs.revealFolder()).catch((err) => {
+      console.warn('[error-log] revealFolder() failed:', err?.message || err);
+    });
+  });
 }
 
 /* ── U21: Import settings from JSON ───────────────────────────────── */

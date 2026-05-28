@@ -89,6 +89,7 @@
 
 import { getProvider } from './providers/index.js';
 import { getQuickFix, getApiKey } from './settings.js';
+import * as errorLog from './error-log.js';
 
 /* Debounce window between the last factsSheet write and the Stage-2
  * roundtrip. 2.5 s is the sweet spot per the plan — short enough that
@@ -707,7 +708,7 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
 
     let provider;
     try {
-      provider = getProvider(providerName, { apiKey, model });
+      provider = getProvider(providerName, { apiKey, model, source: 'quick-fix' });
     } catch (err) {
       console.warn('[quick-fix] failed to construct provider:', err?.message || err);
       return;
@@ -740,19 +741,19 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
 
       const raw = typeof result?.text === 'string' ? result.text : '';
       if (!raw) {
-        recordFailure('empty_response', entries, '<empty>');
+        recordFailure('empty_response', entries, '<empty>', providerName, model);
         return;
       }
       let parsed;
       try {
         parsed = JSON.parse(raw);
       } catch (err) {
-        recordFailure(`parse_error: ${err?.message || 'invalid_json'}`, entries, raw);
+        recordFailure(`parse_error: ${err?.message || 'invalid_json'}`, entries, raw, providerName, model);
         return;
       }
       const validation = validateQuickFix(parsed);
       if (!validation.ok) {
-        recordFailure(validation.reason, entries, raw);
+        recordFailure(validation.reason, entries, raw, providerName, model);
         return;
       }
       const normalised = normaliseRollup(parsed, Date.now());
@@ -778,6 +779,8 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
             `headline_sum_mismatch: headline=${headline} sum=${breakdownSum.toFixed(0)} divergence=${(divergence * 100).toFixed(1)}%`,
             entries,
             raw,
+            providerName,
+            model,
           );
           return;
         }
@@ -798,7 +801,7 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
         anchorUsdAnnual,
       );
       if (!monotonic.ok) {
-        recordFailure(`monotonic_violation: ${monotonic.reason}`, entries, raw);
+        recordFailure(`monotonic_violation: ${monotonic.reason}`, entries, raw, providerName, model);
         return;
       }
       lastGoodRollup = normalised;
@@ -812,7 +815,7 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
       const message = err?.message || 'quick-fix roundtrip failed';
       console.warn('[quick-fix] roundtrip threw:', message);
       errorCb(message);
-      recordFailure(`exception: ${message}`, entries, '');
+      recordFailure(`exception: ${message}`, entries, '', providerName, model);
     } finally {
       inFlight = false;
     }
@@ -823,9 +826,31 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
    * good rollup with `stale: true` so the UI can flag "rollup paused".
    * After ERROR_THRESHOLD consecutive failures, escalates to
    * `error: true` so the rep knows the rollup is unavailable.
+   *
+   * `providerName` + `model` are threaded through from `runNow` so
+   * the errorLog entry below carries the right attribution. They're
+   * positional args (not closure state) so the failure recorded for
+   * a given run uses the same provider/model the model call actually
+   * targeted — even if the user swaps providers mid-call between
+   * the runNow read and the recordFailure call.
    */
-  function recordFailure(reason, entries, rawPayload) {
+  function recordFailure(reason, entries, rawPayload, providerName, model) {
     consecutiveFailures += 1;
+    // Two-channel surfacing — see facts-scanner.js JSON-parse warn-path
+    // for the rationale. The provider-wrapper at src/providers/index.js
+    // catches generateContent THROWS, but quick-fix's failures are
+    // mostly POST-success client-side rejections (parse / validation /
+    // sum-mismatch / monotonic-violation) that the wrapper can't see,
+    // so the warn-channel append here is load-bearing.
+    errorLog.append({
+      level: 'warn',
+      source: 'quick-fix',
+      provider: providerName,
+      model,
+      reason,
+      message: reason,
+      rawResponse: rawPayload,
+    });
     console.warn(
       '[quick-fix] validation/roundtrip failed:',
       reason,

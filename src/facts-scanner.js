@@ -56,6 +56,7 @@
 
 import { getProvider } from './providers/index.js';
 import { getQuickFix, getApiKey } from './settings.js';
+import * as errorLog from './error-log.js';
 
 /* Default cadence (ms). 12 s is the spec'd default — short enough
  * that a fact mentioned during the call appears in the headline
@@ -571,7 +572,7 @@ export function createFactsScanner({ getNewTranscriptLines, getEntries, appendEn
 
     let provider;
     try {
-      provider = getProvider(providerName, { apiKey, model });
+      provider = getProvider(providerName, { apiKey, model, source: 'facts-scanner' });
     } catch (err) {
       console.warn('[facts-scanner] failed to construct provider:', err?.message || err);
       return;
@@ -616,6 +617,23 @@ export function createFactsScanner({ getNewTranscriptLines, getEntries, appendEn
       try {
         parsed = JSON.parse(raw);
       } catch (err) {
+        // Two-channel surfacing: the existing console.warn keeps DevTools
+        // breadcrumb-trail compatibility, and the errorLog.append makes
+        // the failure visible in the Settings → Error Log tab + flushed
+        // to the per-call JSONL on Stop. The wrapper at
+        // src/providers/index.js doesn't catch this because the SDK
+        // call already returned successfully — the failure is on OUR
+        // side of the parse boundary, so this is the only place it
+        // can be observed.
+        errorLog.append({
+          level: 'warn',
+          source: 'facts-scanner',
+          provider: providerName,
+          model,
+          reason: 'parse_error',
+          message: err?.message || 'JSON parse failed',
+          rawResponse: raw,
+        });
         console.warn('[facts-scanner] JSON parse failed:', err?.message || err, '— raw:', raw.slice(0, 200));
         return;
       }
