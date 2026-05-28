@@ -307,17 +307,19 @@ const FACTS_SCHEMA = {
  * sales-call audio ("$30 a year" instead of "$30 grand a year"). The
  * Stage-1 model dutifully stores `30`, which compounds into a wrong
  * Stage-2 rollup. This post-processor reads the anchor_quote for
- * "grand"/"thousand"/"K"/"M"/"million" tokens and multiplies the
- * amount accordingly when it's too small to plausibly be the literal
- * value.
+ * "grand"/"thousand"/"K" (thousands) and "million"/"millions"/"mil"/
+ * "mill"/"M" (millions) tokens and multiplies the amount accordingly
+ * when it's too small to plausibly be the literal value.
  *
  * Only applied to monetary facts (unit === 'usd'). Hours, percent, and
  * people don't share the same magnitude ambiguity.
  *
  * Conservative on purpose: only scales UP when the amount is below the
- * relevant threshold (1000 for thousands, 100_000 for millions). A
- * model that already correctly returned 30000 with anchor "30 grand"
- * is not double-scaled.
+ * relevant threshold (10_000 for thousands — catches "two hundred
+ * grand" → 200 and "fifteen hundred grand" → 1500 even when the LLM
+ * forgot to multiply; 100_000 for millions). A model that already
+ * correctly returned 30000 with anchor "30 grand" is not double-
+ * scaled.
  *
  * @param {number} amount      The amount the model returned.
  * @param {string} anchorQuote The quote it claims to come from.
@@ -337,11 +339,14 @@ function normaliseMagnitude(amount, anchorQuote, unit) {
     || /\d\s*k\b/.test(quote);
   const hasMillions =
     /\bmillion\b/.test(quote)
+    || /\bmillions\b/.test(quote)
+    || /\bmil\b/.test(quote)
+    || /\bmill\b/.test(quote)
     || /\d\s*m\b/.test(quote);
   if (hasMillions && amount < 100_000) {
     return amount * 1_000_000;
   }
-  if (hasThousands && amount < 1_000) {
+  if (hasThousands && amount < 10_000) {
     return amount * 1_000;
   }
   return amount;
