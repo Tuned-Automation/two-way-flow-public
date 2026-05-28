@@ -310,6 +310,13 @@ const RENDERER_EVENTS = [
   // switcher pill + library bar, then re-renders the rail/captured
   // pane against the new active rubric.
   'rubrics:changed',
+  // Error-log feature: pushed every time errorLog.append(...) fires
+  // (provider-wrapper throws, facts-scanner parse failure, quick-fix
+  // recordFailure). Payload is a single LogEntry shape — see
+  // src/error-log.js's typedef. The renderer's Error Log tab
+  // subscribes via `window.gemini.onLogsEntry(cb)` and prepends a
+  // .log-row to #errorLogList in real time.
+  'logs:entry',
 ];
 
 function subscribe(channel) {
@@ -443,6 +450,35 @@ contextBridge.exposeInMainWorld('gemini', {
      * Main broadcasts `settings:changed` on success.
      */
     applyImport: (json) => ipcRenderer.invoke('settings:apply-import', json),
+  },
+
+  /**
+   * Error-log feature — `window.gemini.logs.*` bridge.
+   *
+   * The renderer's Settings → Error Log tab uses this sub-namespace to
+   * read the in-memory ring buffer snapshot, clear it, and open the
+   * on-disk per-call `.jsonl` folder. Live tail is handled by
+   * `onLogsEntry` (below, next to onSettingsChanged) which subscribes
+   * to the 'logs:entry' broadcast added to RENDERER_EVENTS.
+   *
+   * NESTED under `window.gemini.*` (not a peer top-level like
+   * `window.rubrics` / `window.sessions`) per the kickoff
+   * coordination decision — keeps the gemini bridge surface
+   * consolidated for new observability features that don't need
+   * their own bridge.
+   *
+   * Channels (renderer → main, all invoke):
+   *   logs:load          → opts? { limit?: number, offset?: number }
+   *                        → LogEntry[] (newest-first)
+   *   logs:clear         → () → undefined
+   *   logs:reveal-folder → () → undefined. Opens <userData>/error-logs/
+   *                        in Finder / Explorer. Creates the folder
+   *                        if it doesn't exist (fresh-install case).
+   */
+  logs: {
+    load: (opts) => ipcRenderer.invoke('logs:load', opts || {}),
+    clear: () => ipcRenderer.invoke('logs:clear'),
+    revealFolder: () => ipcRenderer.invoke('logs:reveal-folder'),
   },
 
   /**
@@ -599,6 +635,16 @@ contextBridge.exposeInMainWorld('gemini', {
   // fields) and re-render anything that depends on them (e.g. the
   // green-outline drawer styling).
   onSettingsChanged: subscribe('settings:changed'),
+
+  /**
+   * Error-log live tail. Fires every time main appends a LogEntry to
+   * the ring buffer (provider wrapper throws, facts-scanner parse
+   * fail, quick-fix recordFailure). The Error Log tab prepends a
+   * new .log-row to #errorLogList; the subscription stays active
+   * across Settings open/close so the renderer never misses an
+   * entry. `unsubscribe = onLogsEntry(callback)` to detach.
+   */
+  onLogsEntry: subscribe('logs:entry'),
 
   /**
    * Connection-health broadcast. Fires on every lifecycle transition
