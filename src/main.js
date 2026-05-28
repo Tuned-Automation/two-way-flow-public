@@ -1756,6 +1756,23 @@ function markSuggestionAskedManual({ suggestionId, source }) {
 }
 
 /**
+ * Extract the pillar id from a namespaced rubric item id. Real rubric
+ * items are stored as `<pillarId>.<localId>` (e.g. `finance.annual_cost`).
+ * Returns the input unchanged if no dot is found (defensive — shouldn't
+ * happen for real rubric items, but freeform sentinels like
+ * `freeform.deeper` are pre-filtered upstream by the auto-pivot path
+ * so this only sees real rubric ids in practice).
+ *
+ * Used by the `pivot_within_pillar` branch of `armReformulateTimer`'s
+ * setTimeout callback to build the TARGETED_PILLAR line for the Coach.
+ */
+function pillarIdForItem(itemId) {
+  if (typeof itemId !== 'string') return '';
+  const dot = itemId.indexOf('.');
+  return dot > 0 ? itemId.slice(0, dot) : itemId;
+}
+
+/**
  * Arm the 10s auto-reformulate timer for the currently-pinned
  * suggestion. Called from `onSuggestion` after a new pin lands.
  * Reads the live Advanced settings each time so flipping the toggle
@@ -1765,6 +1782,19 @@ function markSuggestionAskedManual({ suggestionId, source }) {
  * Both toggles must be true — `autoReformulate` alone is useless
  * without `trackQuestionState` because the timer's "still pinned and
  * not yet asked?" check needs the asked-detection signal.
+ *
+ * Cap + pivot behaviour (added by feature/reform-cap-pivot): the
+ * setTimeout callback consults `coachContext.currentItemReformulateCount`
+ * at fire time. While the count is 0 we behave as before — fire a
+ * `kind: 'reformulate'` for the same item. Once the count has been
+ * incremented (i.e. one reformulate already fired on this item without
+ * the rep asking) the callback flips to firing a `kind:
+ * 'pivot_within_pillar'` request with the original item's pillarId so
+ * the model picks a DIFFERENT not-yet-covered item from the same
+ * pillar. Freeform sentinels (`freeform.deeper`, `freeform.recap`)
+ * are short-circuited at the top of the callback because
+ * pivot_within_pillar with pillarId='freeform' would be malformed —
+ * see the guard inside the setTimeout for the contract.
  */
 function armReformulateTimer(suggestionId) {
   if (reformulateTimer) {
@@ -1814,8 +1844,34 @@ function armReformulateTimer(suggestionId) {
       }
       return;
     }
-    console.log('[coach] auto-reformulating pinned suggestion:', entry.itemId);
-    coachSession.requestSuggestion({ kind: 'reformulate', itemId: entry.itemId });
+    // Freeform sentinels (`freeform.deeper`, `freeform.recap`) never
+    // map to a real pillar — `pillarIdForItem` would return 'freeform'
+    // and the model would receive a malformed `TARGETED_PILLAR: freeform`
+    // line. Skip the auto path entirely for these pins: the rep can
+    // still ask or skip manually, and the next genuine rubric pin
+    // re-arms the timer normally. This also has the side-effect of
+    // dropping the existing freeform auto-reformulate behaviour, which
+    // was rarely useful (Deeper / Recap pins typically get asked
+    // quickly or skipped) — see the plan doc for the trade-off.
+    if (typeof entry.itemId === 'string' && entry.itemId.startsWith('freeform.')) return;
+    // Cap + pivot branch (feature/reform-cap-pivot). Count is incremented
+    // inside `onSuggestion` only on a same-item reformulate landing, so
+    // count === 0 here means "no reformulate has fired yet for this
+    // item" and count >= 1 means "one already fired and the rep still
+    // hasn't asked".
+    if (coachContext.currentItemReformulateCount === 0) {
+      console.log('[coach] auto-reformulating pinned suggestion:', entry.itemId);
+      coachSession.requestSuggestion({ kind: 'reformulate', itemId: entry.itemId });
+    } else {
+      const pillarId = pillarIdForItem(entry.itemId);
+      console.log(
+        '[coach] auto-pivoting within pillar after reformulate cap:',
+        entry.itemId,
+        '→ pillar',
+        pillarId,
+      );
+      coachSession.requestSuggestion({ kind: 'pivot_within_pillar', pillarId });
+    }
   }, REFORMULATE_DELAY_MS);
 }
 
