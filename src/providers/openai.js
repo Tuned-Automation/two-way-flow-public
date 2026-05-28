@@ -78,6 +78,7 @@ export class OpenAIProvider {
     return {
       toolCalls: extractToolCalls(result),
       text: extractText(result),
+      usage: extractUsage(result, this.model),
     };
   }
 
@@ -186,6 +187,25 @@ function extractToolCalls(result) {
 function extractText(result) {
   const content = result?.choices?.[0]?.message?.content;
   return typeof content === 'string' ? content : '';
+}
+
+/**
+ * Pull a universal `{ provider, model, inputTokens, outputTokens }`
+ * payload out of a Chat-Completions response. OpenAI exposes the
+ * figures under `result.usage.{prompt_tokens, completion_tokens}`.
+ *
+ * Returns `null` if usage metadata is missing (rare in practice for
+ * Chat Completions, but the consumer side tolerates it — invariant
+ * #2 of the cost-tracking plan).
+ */
+function extractUsage(result, model) {
+  if (!result || !result.usage || typeof result.usage !== 'object') return null;
+  return {
+    provider: 'openai',
+    model,
+    inputTokens: Number(result.usage.prompt_tokens) || 0,
+    outputTokens: Number(result.usage.completion_tokens) || 0,
+  };
 }
 
 function isMaxTokensParamError(err) {

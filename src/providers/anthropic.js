@@ -73,6 +73,7 @@ export class AnthropicProvider {
     return {
       toolCalls: extractToolCalls(result),
       text: extractText(result),
+      usage: extractUsage(result, this.model),
     };
   }
 
@@ -156,6 +157,33 @@ function extractText(result) {
     if (block?.type === 'text' && typeof block.text === 'string') buf.push(block.text);
   }
   return buf.join('');
+}
+
+/**
+ * Pull a universal `{ provider, model, inputTokens, outputTokens }`
+ * payload out of an Anthropic Messages-API response. Anthropic
+ * exposes the figures under `result.usage.{input_tokens, output_tokens}`.
+ *
+ * Returns `null` when the SDK didn't include usage metadata (e.g.
+ * a streaming response that's been short-circuited, or a future SDK
+ * version that changes the field name). The consumer side (see the
+ * usage accumulator) treats null as "no usage to record" so this
+ * never blows up a Coach tick — invariant #2 of the cost-tracking
+ * plan.
+ *
+ * `model` is captured from the provider instance (this.model) rather
+ * than the response. The two should always match in practice but the
+ * instance is the authoritative value the user/settings actually
+ * chose, so we prefer it.
+ */
+function extractUsage(result, model) {
+  if (!result || !result.usage || typeof result.usage !== 'object') return null;
+  return {
+    provider: 'anthropic',
+    model,
+    inputTokens: Number(result.usage.input_tokens) || 0,
+    outputTokens: Number(result.usage.output_tokens) || 0,
+  };
 }
 
 function friendlyError(err) {
