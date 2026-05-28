@@ -2,16 +2,134 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <!-- Same CSP discipline as index.html — no remote scripts; the
+         preview is a fully local styling sandbox that never reaches
+         out. -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
     <title>Two Way Flow — Transparency Preview</title>
+    <style>
+      /* Preview-specific layout overrides. The bulk of styling comes
+       * from src/index.css (imported by src/preview-renderer.js) so
+       * the surfaces look pixel-identical to the live overlay — these
+       * tweaks just trim the body grid to two columns (no pillar
+       * rail, no resize splitters) and add a small draggable header
+       * the user can grab to move the preview around. */
+      .coach__body {
+        grid-template-columns: minmax(220px, 1fr) var(--captured-w, 200px);
+        grid-template-areas: 'transcript captured';
+      }
+      .preview-header {
+        -webkit-app-region: drag;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 6px 12px 5px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        color: var(--text-dim);
+        border-bottom: 1px solid var(--border-soft);
+        -webkit-user-select: none;
+        user-select: none;
+        background: transparent;
+      }
+      .preview-header__label {
+        opacity: 0.85;
+      }
+      .preview-header__hint {
+        -webkit-app-region: no-drag;
+        opacity: 0.55;
+        font-weight: 500;
+        text-transform: none;
+        letter-spacing: 0;
+        font-size: 10px;
+      }
+    </style>
   </head>
   <body>
-    <!-- Skeletal stub. Task 5 of the per-surface-transparency-settings
-         plan replaces this with a fleshed-out mock of the four target
-         surfaces (.coach / .transcript-pane / .captured / .suggestion)
-         so the user can preview their slider changes in a real
-         BrowserWindow context. -->
-    <main class="coach" id="coach" data-status="idle"></main>
+    <!--
+      Preview-window mock.
+
+      Renders the four target surfaces (.coach, .transcript-pane,
+      .captured, .suggestion) with deliberately static placeholder
+      content so the user can see exactly how their slider edits
+      affect the real shipping styles. The renderer (preview-renderer.js)
+      subscribes to settings:changed and applies the 12
+      --surface-*-alpha CSS variables on every payload, so slider
+      nudges in the main window re-skin this window in lock-step.
+
+      NEVER call into live-session APIs from here — no Deepgram, no
+      Gemini, no microphone access. The preview is one-way and
+      read-only by invariant 4 / 5 in the plan.
+    -->
+    <main class="coach" id="coach" data-status="idle">
+      <header class="preview-header">
+        <span class="preview-header__label">Transparency preview</span>
+        <span class="preview-header__hint">Drag anywhere on this bar to move</span>
+      </header>
+
+      <div class="coach__body">
+        <section
+          class="transcript-pane"
+          aria-label="Live transcript preview"
+        >
+          <div class="transcript-pane__list" aria-live="off">
+            <p class="transcript-pane__line" data-speaker="you">Hey, thanks for jumping on — I'd love to start with how your team handles outreach today.</p>
+            <p class="transcript-pane__line" data-speaker="other">Sure, we've got a patchwork of spreadsheets and Slack threads. It works, but it's brittle.</p>
+            <p class="transcript-pane__line" data-speaker="you">Got it — and when something falls through the cracks, where does it usually surface?</p>
+            <p class="transcript-pane__line--pending">Prospect (typing)…</p>
+          </div>
+          <div class="transcript-pane__footer">
+            <div class="ask-controls">
+              <span
+                class="thinking-dot"
+                role="status"
+                aria-label="Coach is thinking"
+                data-active="false"
+                hidden
+              ></span>
+              <div class="ask-controls__buttons" role="group" aria-label="Ask coach">
+                <button type="button" class="ask-btn" data-kind="next" disabled>
+                  <span class="ask-btn__glyph" aria-hidden="true">+</span>
+                  <span class="ask-btn__label">Suggest</span>
+                </button>
+                <button type="button" class="ask-btn" data-kind="deeper" disabled>
+                  <span class="ask-btn__glyph" aria-hidden="true">↓</span>
+                  <span class="ask-btn__label">Deeper</span>
+                </button>
+              </div>
+            </div>
+            <div
+              class="suggestion"
+              role="region"
+              aria-label="Suggested next question preview"
+            >
+              <p>What would it take to move that workflow off spreadsheets entirely?</p>
+            </div>
+          </div>
+        </section>
+
+        <aside class="captured" aria-label="Captured information preview">
+          <div class="captured__heading">Captured</div>
+          <div class="captured__group">
+            <div class="captured__pair">
+              <div class="captured__label">Pain</div>
+              <div class="captured__value">Spreadsheet sprawl</div>
+            </div>
+            <div class="captured__pair">
+              <div class="captured__label">Stack</div>
+              <div class="captured__value">Slack + Google Sheets</div>
+            </div>
+            <div class="captured__pair">
+              <div class="captured__label">Team size</div>
+              <div class="captured__value captured__value--empty">Not captured yet</div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </main>
+
     <script type="module" src="/src/preview-renderer.js"></script>
   </body>
 </html>
