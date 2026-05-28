@@ -761,12 +761,33 @@ let stalePendingTimer = null;
  *                               on both channels for PAUSE_THRESHOLD_MS
  *                               and there's no currently-pinned
  *                               suggestion. See `maybeFirePauseNudge()`.
- *                             • Auto-reformulate — `kind: 'reformulate'`
- *                               request every REFORMULATE_DELAY_MS while
- *                               a pin stays unasked. Additionally gated
- *                               on coach.trackQuestionState and
+ *                             • Auto-reformulate (capped at 1 per item)
+ *                               — `kind: 'reformulate'` request fired
+ *                               REFORMULATE_DELAY_MS after a pin lands,
+ *                               while it stays unasked. CAPPED at one
+ *                               reformulate per item (counter lives on
+ *                               coachContext.currentItemReformulateCount);
+ *                               once the count has been incremented the
+ *                               timer flips to Auto-pivot-within-pillar
+ *                               below. Additionally gated on
+ *                               coach.trackQuestionState and
  *                               coach.autoReformulate Advanced toggles.
  *                               See `armReformulateTimer()`.
+ *                             • Auto-pivot within pillar — `kind:
+ *                               'pivot_within_pillar'` request fired by
+ *                               the same `armReformulateTimer()` once
+ *                               the per-item reformulate cap is hit.
+ *                               Carries the original item's pillarId
+ *                               (extracted by `pillarIdForItem()`) so
+ *                               the model picks a DIFFERENT
+ *                               not-yet-covered item from the SAME
+ *                               pillar. The directive includes a
+ *                               model-side fallback to a regular pivot
+ *                               if the pillar is exhausted. Freeform
+ *                               sentinels (`freeform.deeper`,
+ *                               `freeform.recap`) short-circuit at the
+ *                               top of the setTimeout callback — they
+ *                               have no pillar.
  *                             • Auto-advance on green — `kind: 'next'`
  *                               request the moment a pinned question
  *                               flips to asked (either via the AI's
