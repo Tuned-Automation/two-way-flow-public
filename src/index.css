@@ -3840,6 +3840,196 @@ a,
   border-color: rgba(255, 255, 255, 0.25);
 }
 
+/* ── Per-surface transparency editor (Appearance tab) ──────────────
+ *
+ * Lives in the Settings modal's Appearance tab below the speaker-
+ * label tag-colour grid. Three sliders drive --surface-*-alpha
+ * variables synchronously for instant live preview and queue a
+ * debounced settings.save for persistence. Three preset slot cards
+ * snapshot / restore the full transparency subtree.
+ *
+ * Visual register: matches the existing settings-section weight so
+ * the editor reads as a sibling of the speaker-label section rather
+ * than a separate destination. Uses --text-strong / --text-med /
+ * --text-dim tokens and the existing .modal__btn family for buttons
+ * — no new colour tokens.
+ */
+.transparency-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.transparency-controls__group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.transparency-controls__group > label {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.transparency-surface-select {
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 120px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.transparency-surface-select:hover {
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.transparency-surface-select:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 1px;
+}
+
+.transparency-sliders {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.transparency-slider {
+  display: grid;
+  /* label | track | percentage badge. The label column floors at
+   * 72px so the three labels (Outline / Body / Text) align under
+   * each other; the value column is fixed-width so the slider
+   * track stays the same width as the percentage rolls up and
+   * down between 0% and 100%. */
+  grid-template-columns: 72px 1fr 44px;
+  align-items: center;
+  gap: 10px;
+}
+
+.transparency-slider > label {
+  font-size: 11.5px;
+  color: var(--text-med);
+}
+
+.transparency-slider__input {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.transparency-slider__input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 80ms ease;
+}
+
+.transparency-slider__input::-webkit-slider-thumb:hover {
+  transform: scale(1.08);
+}
+
+.transparency-slider__input:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid rgba(255, 255, 255, 0.45);
+  outline-offset: 2px;
+}
+
+.transparency-slider__value {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.transparency-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.transparency-presets {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.transparency-preset {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  background: rgba(20, 20, 30, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+}
+
+.transparency-preset__name {
+  appearance: none;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-strong);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 5px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  -webkit-app-region: no-drag;
+}
+
+.transparency-preset__name:hover,
+.transparency-preset__name:focus {
+  border-color: rgba(255, 255, 255, 0.22);
+  outline: none;
+}
+
+.transparency-preset__actions {
+  display: flex;
+  gap: 4px;
+}
+
+.transparency-preset__actions > .modal__btn {
+  flex: 1 1 0;
+  padding: 4px 6px;
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+/* Inline hint below a slider — used by Task 9 to surface low-alpha
+ * foot-guns (macOS native-shadow ring at very low outline alpha,
+ * illegibility at low text alpha). Renderer toggles [hidden] based
+ * on the current slider value. */
+.transparency-hint {
+  grid-column: 2 / 4;
+  margin: -4px 0 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  font-style: italic;
+}
+
 /* Bottom-of-tab footer note. Reads as a subtle hint with a warning
  * glyph; italic to lower its visual weight further. */
 .settings-footer-note {
