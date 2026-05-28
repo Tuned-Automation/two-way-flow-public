@@ -108,18 +108,28 @@ const PERIOD_VALUES = ['one_time', 'weekly', 'monthly', 'quarterly', 'annual'];
 /* Monetary kinds where a bare amount under $5K is almost certainly a
  * transcription artefact, not a real $30 line item. The Stage-1 scanner
  * drops these rather than letting them through to Stage-2 where they
- * compound into a wrong rollup. `time_cost`, `other`, `context_only`,
- * and `hypothetical_fix_cost` are deliberately EXCLUDED — they have
- * legitimate small-amount usages (e.g. "$150 hourly rate", "$500
- * one-time setup fee"). `stated_total` IS included because a bottom-
- * line opportunity stated as "$30" is virtually always meant to be
- * "$30 grand". */
+ * compound into a wrong rollup.
+ *
+ * `time_cost` and `other` are included as of 2026-05-27 — a test call
+ * showed phrases like "twenty grand in wasted time" producing $20
+ * `time_cost` line items when Deepgram lost "grand" from the audio
+ * AND the LLM didn't multiply. Losing the fact entirely is the right
+ * outcome.
+ *
+ * `context_only` and `hypothetical_fix_cost` remain EXCLUDED — they
+ * have legitimate small-amount usages ("$150 hourly rate", "$500
+ * one-time setup fee") AND they're filtered out of the Stage-2
+ * rollup anyway (see EXCLUDED_FROM_HEADLINE_KINDS in quick-fix.js),
+ * so a wrong-magnitude entry in these kinds can't corrupt the
+ * headline. */
 const IMPLAUSIBILITY_USD_KINDS = new Set([
   'current_spend',
   'pain_cost',
   'savings_opportunity',
   'revenue_uplift',
+  'time_cost',
   'headcount_cost',
+  'other',
   'stated_total',
 ]);
 
