@@ -4611,6 +4611,13 @@ async function openSettingsModal() {
   // visit lights up the notice even if no setStatus() transition has
   // fired between the last hide and the open.
   refreshAudioApplyHint();
+  // Rubrics tab: re-fetch the library on every open so the list
+  // reflects out-of-band changes (another window edited a rubric,
+  // another renderer set-active, etc.). The IPC roundtrip is cheap
+  // and avoids a stale dropdown.
+  if (window.rubrics?.list) {
+    hydrateRubricsTab();
+  }
   selectSettingsTab('providers');
   try {
     settingsModalEl.showModal();
@@ -6299,6 +6306,676 @@ window.addEventListener('beforeunload', () => {
     stopCapture();
   }
 });
+
+/* ── Editable rubrics: Settings → Rubrics tab ──────────────────────── *
+ *
+ * Read-only library bar + sectioned editor (Task 8). The library bar
+ * picks which rubric is loaded into the editor and (optionally) makes
+ * it the active rubric. The editor below renders the loaded rubric
+ * across 6 sections — Overview / Coach prompts / Pillars / Items /
+ * Captured fields / Flags — in READ-ONLY form. Task 9 swaps the
+ * read-only renderers for writeable inputs + adds the New / Duplicate
+ * / Delete / Export / Import buttons + save/discard/validation. Task 10
+ * adds the header switcher pill that opens this tab on click.
+ *
+ * Data flow:
+ *   - openSettingsModal() → hydrateRubricsTab() — cheap re-fetch on
+ *     every open so the list reflects out-of-band changes (other
+ *     window edited a rubric, another renderer set-active, etc.).
+ *   - rubrics:changed broadcast → hydrateRubricsTab() — same path,
+ *     fires whenever main applies a rubric swap or persists a save to
+ *     the currently-active idle rubric.
+ *   - select change → loadRubricIntoEditor(id) — pulls the full
+ *     rubric and re-renders the visible section.
+ *   - section nav click → selectRubricsSection(id) — flips the
+ *     tabpanel visibility and re-renders.
+ *
+ * IPC contract is fully owned by main; the renderer never touches fs.
+ * Active-rubric switch is gated server-side (returns
+ * { ok: false, reason: 'call_in_progress' } during a live session)
+ * and we surface that as the library-bar hint message.
+ */
+
+const rubricsTabRootEl = document.getElementById('settingsTabRubrics');
+const rubricsLibrarySelectEl = document.getElementById('rubricsLibrarySelect');
+const rubricsActiveBadgeEl = document.getElementById('rubricsActiveBadge');
+const rubricsBtnSetActiveEl = document.getElementById('rubricsBtnSetActive');
+const rubricsBtnNewEl = document.getElementById('rubricsBtnNew');
+const rubricsBtnDuplicateEl = document.getElementById('rubricsBtnDuplicate');
+const rubricsBtnExportEl = document.getElementById('rubricsBtnExport');
+const rubricsBtnImportEl = document.getElementById('rubricsBtnImport');
+const rubricsBtnDeleteEl = document.getElementById('rubricsBtnDelete');
+const rubricsLibraryHintEl = document.getElementById('rubricsLibraryHint');
+const rubricsEditorEl = document.getElementById('rubricsEditor');
+const rubricsEmptyStateEl = document.getElementById('rubricsEmptyState');
+const rubricsSaveBarEl = document.getElementById('rubricsSaveBar');
+const rubricsSectionBtnEls = rubricsTabRootEl
+  ? Array.from(rubricsTabRootEl.querySelectorAll('.rubrics-tab__section-btn'))
+  : [];
+const rubricsSectionPanelEls = rubricsTabRootEl
+  ? Array.from(rubricsTabRootEl.querySelectorAll('.rubrics-tab__section'))
+  : [];
+const rubricsSectionElById = {
+  meta: document.getElementById('rubricsSectionMeta'),
+  prompts: document.getElementById('rubricsSectionPrompts'),
+  pillars: document.getElementById('rubricsSectionPillars'),
+  items: document.getElementById('rubricsSectionItems'),
+  fields: document.getElementById('rubricsSectionFields'),
+  flags: document.getElementById('rubricsSectionFlags'),
+};
+
+const rubricsTabState = {
+  hydrated: false,
+  loading: false,
+  list: [], // [{ id, name, description, isActive, updatedAt }]
+  activeId: null,
+  selectedId: null, // rubric currently loaded into the editor
+  currentRubric: null,
+  currentSection: 'meta',
+  hintTimer: null, // delayed clear for transient success messages
+};
+
+async function hydrateRubricsTab() {
+  if (!window.rubrics?.list) return;
+  if (rubricsTabState.loading) return;
+  rubricsTabState.loading = true;
+  try {
+    const result = await window.rubrics.list();
+    if (!result?.ok) {
+      setRubricsLibraryHint(
+        'Failed to load rubrics: ' + (result?.reason || 'unknown'),
+        'error',
+      );
+      return;
+    }
+    rubricsTabState.list = Array.isArray(result.rubrics) ? result.rubrics : [];
+    rubricsTabState.activeId = result.active?.id || null;
+    rubricsTabState.hydrated = true;
+    populateRubricsSelect();
+    // Decide which rubric to show in the editor:
+    //   - if the user was already editing one and it still exists,
+    //     keep it (re-load so on-disk changes propagate);
+    //   - otherwise fall back to the active rubric;
+    //   - otherwise fall back to the first listed rubric;
+    //   - if the list is empty (shouldn't happen post-seed), show empty state.
+    const stillExists = rubricsTabState.selectedId
+      && rubricsTabState.list.some((r) => r.id === rubricsTabState.selectedId);
+    const fallbackId = stillExists
+      ? rubricsTabState.selectedId
+      : (rubricsTabState.activeId || rubricsTabState.list[0]?.id || null);
+    if (fallbackId) {
+      await loadRubricIntoEditor(fallbackId);
+    } else {
+      rubricsTabState.selectedId = null;
+      rubricsTabState.currentRubric = null;
+      showRubricsEmptyState();
+    }
+  } catch (err) {
+    setRubricsLibraryHint('Failed to load rubrics: ' + (err?.message || err), 'error');
+  } finally {
+    rubricsTabState.loading = false;
+  }
+}
+
+function populateRubricsSelect() {
+  if (!rubricsLibrarySelectEl) return;
+  rubricsLibrarySelectEl.innerHTML = '';
+  for (const r of rubricsTabState.list) {
+    const opt = document.createElement('option');
+    opt.value = r.id;
+    const isActive = r.id === rubricsTabState.activeId;
+    opt.textContent = isActive ? `${r.name} (active)` : r.name;
+    if (r.id === rubricsTabState.selectedId) opt.selected = true;
+    rubricsLibrarySelectEl.appendChild(opt);
+  }
+  // If no current selection but list isn't empty, default to the first
+  // option so the select doesn't render blank.
+  if (
+    !rubricsTabState.selectedId
+    && rubricsLibrarySelectEl.options.length > 0
+  ) {
+    rubricsLibrarySelectEl.selectedIndex = 0;
+  }
+}
+
+async function loadRubricIntoEditor(id) {
+  if (!id) {
+    rubricsTabState.selectedId = null;
+    rubricsTabState.currentRubric = null;
+    showRubricsEmptyState();
+    return;
+  }
+  try {
+    const result = await window.rubrics.load(id);
+    if (!result?.ok) {
+      setRubricsLibraryHint(
+        `Failed to load rubric: ${result?.reason || 'unknown'}`,
+        'error',
+      );
+      return;
+    }
+    rubricsTabState.selectedId = id;
+    rubricsTabState.currentRubric = result.rubric || null;
+    if (rubricsLibrarySelectEl && rubricsLibrarySelectEl.value !== id) {
+      rubricsLibrarySelectEl.value = id;
+    }
+    showRubricsEditor();
+    renderRubricsLibraryBar();
+    renderCurrentRubricSection();
+  } catch (err) {
+    setRubricsLibraryHint(
+      'Failed to load rubric: ' + (err?.message || err),
+      'error',
+    );
+  }
+}
+
+function showRubricsEmptyState() {
+  if (rubricsEditorEl) rubricsEditorEl.hidden = true;
+  if (rubricsSaveBarEl) rubricsSaveBarEl.hidden = true;
+  if (rubricsEmptyStateEl) rubricsEmptyStateEl.hidden = false;
+  if (rubricsActiveBadgeEl) rubricsActiveBadgeEl.hidden = true;
+  if (rubricsBtnSetActiveEl) rubricsBtnSetActiveEl.disabled = true;
+  if (rubricsBtnDeleteEl) rubricsBtnDeleteEl.disabled = true;
+  if (rubricsBtnDuplicateEl) rubricsBtnDuplicateEl.disabled = true;
+  if (rubricsBtnExportEl) rubricsBtnExportEl.disabled = true;
+}
+
+function showRubricsEditor() {
+  if (rubricsEditorEl) rubricsEditorEl.hidden = false;
+  if (rubricsEmptyStateEl) rubricsEmptyStateEl.hidden = true;
+  // Save bar stays hidden in Task 8 (no editing yet). Task 9 reveals
+  // it on first dirty edit and re-hides on save/discard.
+  if (rubricsSaveBarEl) rubricsSaveBarEl.hidden = true;
+}
+
+function renderRubricsLibraryBar() {
+  const selectedId = rubricsTabState.selectedId;
+  const activeId = rubricsTabState.activeId;
+  const isActive = !!selectedId && selectedId === activeId;
+  if (rubricsActiveBadgeEl) rubricsActiveBadgeEl.hidden = !isActive;
+  // Re-populate the select to refresh the "(active)" suffix in case
+  // the active id changed without the list itself changing.
+  populateRubricsSelect();
+  // Button enabled states.
+  // - Set as active: enabled iff something is selected AND it isn't
+  //   already active.
+  // - Delete: enabled iff something is selected AND it isn't active.
+  // - Duplicate / Export: enabled iff something is selected.
+  // - New / Import: always enabled (Task 9 wires the actual handlers).
+  if (rubricsBtnSetActiveEl) {
+    rubricsBtnSetActiveEl.disabled = !selectedId || isActive;
+  }
+  if (rubricsBtnDeleteEl) {
+    rubricsBtnDeleteEl.disabled = !selectedId || isActive;
+  }
+  if (rubricsBtnDuplicateEl) {
+    rubricsBtnDuplicateEl.disabled = !selectedId;
+  }
+  if (rubricsBtnExportEl) {
+    rubricsBtnExportEl.disabled = !selectedId;
+  }
+}
+
+function renderCurrentRubricSection() {
+  const section = rubricsTabState.currentSection;
+  switch (section) {
+    case 'meta':    renderRubricsSectionMeta(); break;
+    case 'prompts': renderRubricsSectionPrompts(); break;
+    case 'pillars': renderRubricsSectionPillars(); break;
+    case 'items':   renderRubricsSectionItems(); break;
+    case 'fields':  renderRubricsSectionFields(); break;
+    case 'flags':   renderRubricsSectionFlags(); break;
+    default:        renderRubricsSectionMeta(); break;
+  }
+}
+
+function renderRubricsSectionMeta() {
+  const el = rubricsSectionElById.meta;
+  const r = rubricsTabState.currentRubric;
+  if (!el) return;
+  el.innerHTML = '';
+  if (!r) return;
+  el.appendChild(buildRubricsField('Name', r.name || '—'));
+  el.appendChild(buildRubricsField('Description', r.description || '—'));
+  el.appendChild(buildRubricsField('Id', r.id || '—'));
+  el.appendChild(buildRubricsField(
+    'Schema version',
+    r.schemaVersion != null ? String(r.schemaVersion) : '—',
+  ));
+  el.appendChild(buildRubricsField('Created', formatRubricTimestamp(r.createdAt)));
+  el.appendChild(buildRubricsField('Last updated', formatRubricTimestamp(r.updatedAt)));
+}
+
+function renderRubricsSectionPrompts() {
+  const el = rubricsSectionElById.prompts;
+  const r = rubricsTabState.currentRubric;
+  if (!el) return;
+  el.innerHTML = '';
+  if (!r) return;
+  const p = r.prompts || {};
+  el.appendChild(buildRubricsTextBlock(
+    'Voice & tone',
+    'Optional prose appended to the Coach system instruction. Use this to nudge phrasing without rewriting the catalogue.',
+    p.voiceAndTone,
+  ));
+  el.appendChild(buildRubricsTextBlock(
+    'Coach system instruction (template)',
+    'Prose-only template — the catalogue blocks (pillars, items, fields, flags) are composed in at runtime.',
+    p.coachSystemInstruction,
+  ));
+  el.appendChild(buildRubricsTextBlock(
+    'Live system instruction (template)',
+    'Prose-only template for the live (flag-detection) Gemini session.',
+    p.liveSystemInstruction,
+  ));
+}
+
+function renderRubricsSectionPillars() {
+  // Pillar shape (rubric-defaults.js): { id, name, short, glyph, tint }
+  // — no description field; the visual identity (glyph + tint) is the
+  // documentation. Render those alongside the name so the editor view
+  // matches what shows up in the rail.
+  const el = rubricsSectionElById.pillars;
+  const r = rubricsTabState.currentRubric;
+  if (!el) return;
+  el.innerHTML = '';
+  if (!r) return;
+  const pillars = Array.isArray(r.pillars) ? r.pillars : [];
+  if (pillars.length === 0) {
+    el.appendChild(buildRubricsPlaceholder('No pillars defined.'));
+    return;
+  }
+  const list = document.createElement('div');
+  list.className = 'rubrics-tab__list';
+  for (const p of pillars) {
+    const card = document.createElement('div');
+    card.className = 'rubrics-tab__card';
+    // Glyph swatch — gives the user a visual hook back to the rail.
+    if (p.glyph || p.tint) {
+      const swatch = document.createElement('span');
+      swatch.className = 'rubrics-tab__pillar-swatch';
+      swatch.textContent = p.glyph || '•';
+      swatch.setAttribute('aria-hidden', 'true');
+      if (p.tint) swatch.style.color = p.tint;
+      card.appendChild(swatch);
+    }
+    const title = document.createElement('h5');
+    title.className = 'rubrics-tab__card-title';
+    title.textContent = p.name || p.id || '(untitled)';
+    card.appendChild(title);
+    if (p.short && p.short !== p.name) {
+      const sub = document.createElement('p');
+      sub.className = 'rubrics-tab__card-desc';
+      sub.textContent = `Short label: ${p.short}`;
+      card.appendChild(sub);
+    }
+    const meta = document.createElement('p');
+    meta.className = 'rubrics-tab__card-meta';
+    const parts = [`id: ${p.id || '—'}`];
+    if (p.tint) parts.push(`tint: ${p.tint}`);
+    meta.textContent = parts.join(' · ');
+    card.appendChild(meta);
+    list.appendChild(card);
+  }
+  el.appendChild(list);
+}
+
+function renderRubricsSectionItems() {
+  // Item shape (rubric-defaults.js): { id, pillarId, label, hint,
+  // suggestable }. `pillarId` is camelCase (NOT `pillar_id`); items
+  // group naturally by pillarId because that's how the rail computes
+  // per-pillar coverage.
+  const el = rubricsSectionElById.items;
+  const r = rubricsTabState.currentRubric;
+  if (!el) return;
+  el.innerHTML = '';
+  if (!r) return;
+  const items = Array.isArray(r.items) ? r.items : [];
+  if (items.length === 0) {
+    el.appendChild(buildRubricsPlaceholder('No items defined.'));
+    return;
+  }
+  const byPillar = new Map();
+  for (const it of items) {
+    const pid = it.pillarId || '_unassigned';
+    if (!byPillar.has(pid)) byPillar.set(pid, []);
+    byPillar.get(pid).push(it);
+  }
+  const pillars = Array.isArray(r.pillars) ? r.pillars : [];
+  for (const p of pillars) {
+    const group = byPillar.get(p.id);
+    if (!group || group.length === 0) continue;
+    el.appendChild(buildRubricsItemGroup(`${p.name || p.id} (${group.length})`, group));
+  }
+  const unassigned = byPillar.get('_unassigned');
+  if (unassigned && unassigned.length > 0) {
+    el.appendChild(buildRubricsItemGroup(`Unassigned (${unassigned.length})`, unassigned));
+  }
+}
+
+function buildRubricsItemGroup(headingText, items) {
+  const group = document.createElement('div');
+  group.className = 'rubrics-tab__group';
+  const heading = document.createElement('h5');
+  heading.className = 'rubrics-tab__group-title';
+  heading.textContent = headingText;
+  group.appendChild(heading);
+  for (const it of items) {
+    const card = document.createElement('div');
+    card.className = 'rubrics-tab__card';
+    const title = document.createElement('h6');
+    title.className = 'rubrics-tab__card-title';
+    title.textContent = it.label || it.id || '(untitled)';
+    card.appendChild(title);
+    if (it.hint) {
+      const hint = document.createElement('p');
+      hint.className = 'rubrics-tab__card-desc';
+      hint.textContent = it.hint;
+      card.appendChild(hint);
+    }
+    const meta = document.createElement('p');
+    meta.className = 'rubrics-tab__card-meta';
+    const parts = [`id: ${it.id || '—'}`];
+    // `suggestable: true` is the meaningful signal — it tells the
+    // coach this item is one of the next-question candidates. Render
+    // it explicitly so the user can see at a glance which items the
+    // coach will actively try to cover.
+    parts.push(it.suggestable ? 'suggestable: yes' : 'suggestable: no');
+    meta.textContent = parts.join(' · ');
+    card.appendChild(meta);
+    group.appendChild(card);
+  }
+  return group;
+}
+
+function renderRubricsSectionFields() {
+  // CapturedField shape (rubric-defaults.js): { id, group, label, hint }.
+  // Items are organised by `group` (Revenue / Team / Stack / Pain /
+  // Buyer / Timeline / …); render with the same heading-per-group
+  // pattern as items-by-pillar above.
+  const el = rubricsSectionElById.fields;
+  const r = rubricsTabState.currentRubric;
+  if (!el) return;
+  el.innerHTML = '';
+  if (!r) return;
+  const fields = Array.isArray(r.capturedFields) ? r.capturedFields : [];
+  if (fields.length === 0) {
+    el.appendChild(buildRubricsPlaceholder('No captured fields defined.'));
+    return;
+  }
+  // Group by `group` while preserving the on-disk order (insertion
+  // order on the Map mirrors source order, which is the order the
+  // captured-fields pane uses).
+  const byGroup = new Map();
+  for (const f of fields) {
+    const g = f.group || '_ungrouped';
+    if (!byGroup.has(g)) byGroup.set(g, []);
+    byGroup.get(g).push(f);
+  }
+  for (const [groupName, groupFields] of byGroup) {
+    const group = document.createElement('div');
+    group.className = 'rubrics-tab__group';
+    const heading = document.createElement('h5');
+    heading.className = 'rubrics-tab__group-title';
+    heading.textContent = `${groupName === '_ungrouped' ? 'Ungrouped' : groupName} (${groupFields.length})`;
+    group.appendChild(heading);
+    for (const f of groupFields) {
+      const card = document.createElement('div');
+      card.className = 'rubrics-tab__card';
+      const title = document.createElement('h6');
+      title.className = 'rubrics-tab__card-title';
+      title.textContent = f.label || f.id || '(untitled)';
+      card.appendChild(title);
+      if (f.hint) {
+        const hint = document.createElement('p');
+        hint.className = 'rubrics-tab__card-desc';
+        hint.textContent = f.hint;
+        card.appendChild(hint);
+      }
+      const meta = document.createElement('p');
+      meta.className = 'rubrics-tab__card-meta';
+      meta.textContent = `id: ${f.id || '—'}`;
+      card.appendChild(meta);
+      group.appendChild(card);
+    }
+    el.appendChild(group);
+  }
+}
+
+function renderRubricsSectionFlags() {
+  // Flag shape (rubric-defaults.js): { id, severity, category, short,
+  // when, desc }. `short` is the headline; `desc` is the multi-line
+  // detection rule. Render severity + when as a chip-style meta line
+  // because those are the two filterable dimensions a user looks at
+  // when scanning the catalogue.
+  const el = rubricsSectionElById.flags;
+  const r = rubricsTabState.currentRubric;
+  if (!el) return;
+  el.innerHTML = '';
+  if (!r) return;
+  const flags = Array.isArray(r.flags) ? r.flags : [];
+  if (flags.length === 0) {
+    el.appendChild(buildRubricsPlaceholder('No flags defined.'));
+    return;
+  }
+  // Group by severity (red / green / …) — preserves the on-disk
+  // ordering inside each severity bucket.
+  const bySeverity = new Map();
+  for (const fl of flags) {
+    const sev = fl.severity || '_unknown';
+    if (!bySeverity.has(sev)) bySeverity.set(sev, []);
+    bySeverity.get(sev).push(fl);
+  }
+  for (const [severity, sevFlags] of bySeverity) {
+    const group = document.createElement('div');
+    group.className = 'rubrics-tab__group';
+    const heading = document.createElement('h5');
+    heading.className = 'rubrics-tab__group-title';
+    heading.textContent = `${severity === '_unknown' ? 'Unknown' : capitaliseFirst(severity)} (${sevFlags.length})`;
+    group.appendChild(heading);
+    for (const fl of sevFlags) {
+      const card = document.createElement('div');
+      card.className = `rubrics-tab__card rubrics-tab__card--severity-${severity}`;
+      const title = document.createElement('h6');
+      title.className = 'rubrics-tab__card-title';
+      title.textContent = fl.short || fl.id || '(untitled)';
+      card.appendChild(title);
+      if (fl.desc) {
+        const desc = document.createElement('p');
+        desc.className = 'rubrics-tab__card-desc';
+        desc.textContent = fl.desc;
+        card.appendChild(desc);
+      }
+      const meta = document.createElement('p');
+      meta.className = 'rubrics-tab__card-meta';
+      const parts = [`id: ${fl.id || '—'}`];
+      if (fl.category) parts.push(`category: ${fl.category}`);
+      if (fl.when) parts.push(`fires: ${fl.when}-call`);
+      meta.textContent = parts.join(' · ');
+      card.appendChild(meta);
+      group.appendChild(card);
+    }
+    el.appendChild(group);
+  }
+}
+
+function capitaliseFirst(s) {
+  if (!s || typeof s !== 'string') return s;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function buildRubricsField(labelText, valueText) {
+  const wrap = document.createElement('div');
+  wrap.className = 'rubrics-tab__field';
+  const label = document.createElement('div');
+  label.className = 'rubrics-tab__field-label';
+  label.textContent = labelText;
+  const value = document.createElement('div');
+  value.className = 'rubrics-tab__field-value';
+  value.textContent = valueText;
+  wrap.appendChild(label);
+  wrap.appendChild(value);
+  return wrap;
+}
+
+function buildRubricsTextBlock(labelText, helpText, value) {
+  const wrap = document.createElement('div');
+  wrap.className = 'rubrics-tab__field rubrics-tab__field--block';
+  const label = document.createElement('div');
+  label.className = 'rubrics-tab__field-label';
+  label.textContent = labelText;
+  wrap.appendChild(label);
+  if (helpText) {
+    const help = document.createElement('p');
+    help.className = 'rubrics-tab__field-help';
+    help.textContent = helpText;
+    wrap.appendChild(help);
+  }
+  const pre = document.createElement('pre');
+  pre.className = 'rubrics-tab__field-pre';
+  pre.textContent = value && String(value).length > 0 ? String(value) : '—';
+  wrap.appendChild(pre);
+  return wrap;
+}
+
+function buildRubricsPlaceholder(text) {
+  const p = document.createElement('p');
+  p.className = 'rubrics-tab__placeholder';
+  p.textContent = text;
+  return p;
+}
+
+function formatRubricTimestamp(value) {
+  if (!value) return '—';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleString();
+}
+
+function selectRubricsSection(sectionId) {
+  if (!sectionId) return;
+  if (!rubricsSectionElById[sectionId]) return;
+  rubricsTabState.currentSection = sectionId;
+  for (const btn of rubricsSectionBtnEls) {
+    const isActive = btn.dataset.section === sectionId;
+    btn.setAttribute('aria-selected', String(isActive));
+  }
+  for (const sec of rubricsSectionPanelEls) {
+    const isActive = sec.dataset.sectionContent === sectionId;
+    sec.hidden = !isActive;
+  }
+  renderCurrentRubricSection();
+}
+
+async function handleSetActiveRubric() {
+  const id = rubricsTabState.selectedId;
+  if (!id) return;
+  if (!window.rubrics?.setActive) return;
+  setRubricsLibraryHint('', null);
+  rubricsBtnSetActiveEl?.setAttribute('disabled', 'disabled');
+  try {
+    const result = await window.rubrics.setActive(id);
+    if (!result?.ok) {
+      const reason = result?.reason || 'unknown';
+      if (reason === 'call_in_progress') {
+        setRubricsLibraryHint(
+          'End the current call before switching rubrics.',
+          'warn',
+        );
+      } else if (reason === 'not_found') {
+        setRubricsLibraryHint('Rubric no longer exists.', 'error');
+      } else {
+        setRubricsLibraryHint('Failed to set active: ' + reason, 'error');
+      }
+      return;
+    }
+    // Optimistically update; the rubrics:changed broadcast will also
+    // fire and re-hydrate, so this is just a snappier UI tick.
+    rubricsTabState.activeId = id;
+    renderRubricsLibraryBar();
+    setRubricsLibraryHint('Rubric activated.', 'info', { autoClearMs: 4000 });
+  } catch (err) {
+    setRubricsLibraryHint(
+      'Failed to set active: ' + (err?.message || err),
+      'error',
+    );
+  } finally {
+    // renderRubricsLibraryBar() recomputes disabled state, but if we
+    // failed before reaching it, restore the button so a retry is
+    // possible.
+    if (rubricsBtnSetActiveEl) {
+      const stillSelected = !!rubricsTabState.selectedId;
+      const isActive = rubricsTabState.selectedId === rubricsTabState.activeId;
+      rubricsBtnSetActiveEl.disabled = !stillSelected || isActive;
+    }
+  }
+}
+
+function setRubricsLibraryHint(message, kind = 'info', { autoClearMs = 0 } = {}) {
+  if (!rubricsLibraryHintEl) return;
+  if (rubricsTabState.hintTimer) {
+    clearTimeout(rubricsTabState.hintTimer);
+    rubricsTabState.hintTimer = null;
+  }
+  rubricsLibraryHintEl.classList.remove(
+    'rubrics-tab__hint--warn',
+    'rubrics-tab__hint--error',
+    'rubrics-tab__hint--info',
+  );
+  if (!message) {
+    rubricsLibraryHintEl.hidden = true;
+    rubricsLibraryHintEl.textContent = '';
+    return;
+  }
+  rubricsLibraryHintEl.textContent = message;
+  rubricsLibraryHintEl.hidden = false;
+  if (kind) {
+    rubricsLibraryHintEl.classList.add(`rubrics-tab__hint--${kind}`);
+  }
+  if (autoClearMs > 0) {
+    rubricsTabState.hintTimer = setTimeout(() => {
+      setRubricsLibraryHint('', null);
+    }, autoClearMs);
+  }
+}
+
+function onRubricsChanged(_payload) {
+  // Re-hydrate so the (active) suffix in the select and the badge
+  // both reflect the new active id. If the user was editing a
+  // different rubric, the editor keeps that rubric loaded but its
+  // active-state markers refresh.
+  if (rubricsTabState.hydrated) hydrateRubricsTab();
+}
+
+if (rubricsLibrarySelectEl) {
+  rubricsLibrarySelectEl.addEventListener('change', (e) => {
+    const id = /** @type {HTMLSelectElement} */ (e.target).value;
+    if (id && id !== rubricsTabState.selectedId) {
+      // Task 9 will add a dirty-prompt confirm here. For Task 8 every
+      // load is safe — there are no editable forms yet.
+      loadRubricIntoEditor(id);
+    }
+  });
+}
+
+if (rubricsBtnSetActiveEl) {
+  rubricsBtnSetActiveEl.addEventListener('click', handleSetActiveRubric);
+}
+
+for (const btn of rubricsSectionBtnEls) {
+  btn.addEventListener('click', () => {
+    const sid = btn.dataset.section;
+    if (sid) selectRubricsSection(sid);
+  });
+}
+
+// Subscribe to main's rubrics:changed broadcast so any out-of-band
+// active-rubric swap (or save-to-active-while-idle) refreshes our
+// library bar without the user having to re-open the modal.
+if (window.rubrics?.onChanged) {
+  window.rubrics.onChanged(onRubricsChanged);
+}
 
 /* ── Initial render ─────────────────────────────────────────────────── */
 
