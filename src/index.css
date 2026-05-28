@@ -3036,6 +3036,55 @@ a,
   color: var(--accent-red);
 }
 
+/* Collapse / expand — data-details='collapsed' (default in HTML) hides
+ * the per-row italic notes and the bottom assumptions list, leaving
+ * just heading + label/amount rows. data-details='expanded' shows
+ * everything (the default-on state of the original card). The
+ * renderer flips the attribute via the .quick-fix__details-toggle
+ * button (see renderQuickFix in renderer.js). */
+.quick-fix[data-details='collapsed'] .quick-fix__row-notes,
+.quick-fix[data-details='collapsed'] .quick-fix__assumptions {
+  display: none;
+}
+
+/* Details toggle — quiet ghost button matching the existing
+ * .quick-fix__export aesthetic. Sits in .quick-fix__controls between
+ * the title and the confidence pill / export button. */
+.quick-fix__details-toggle {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+
+.quick-fix__details-toggle:hover {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.quick-fix__details-toggle:focus-visible {
+  outline: 2px solid rgba(74, 222, 128, 0.6);
+  outline-offset: 2px;
+}
+
+.quick-fix__details-toggle-chevron {
+  display: inline-block;
+  font-size: 9px;
+  line-height: 1;
+  opacity: 0.85;
+}
+
 /* Transcript-pane line highlight (used by the quick-fix drill-through).
  * When the rep clicks a breakdown row, the renderer scrolls the
  * transcript pane to the line whose text contains the source fact's
