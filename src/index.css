@@ -4273,6 +4273,1214 @@ a,
   opacity: 0.7;
 }
 
+/* ── #rubricSwitcher pill (Task 10) ──────────────────────────────────
+ *
+ * Header status pill that surfaces the active rubric's name and
+ * doubles as a shortcut into Settings → Rubrics. Lives in the same
+ * row as `.aec-badge`, `.conn-pill`, and `.version-badge` so the
+ * pill cluster reads as a single strip of small status tags.
+ *
+ * Hidden until the first hydrateRubricSwitcher() resolves (see
+ * src/renderer.js) so a "Rubric: —" placeholder never flashes
+ * pre-IPC.
+ *
+ * Visual register intentionally matches `.version-badge`'s clean
+ * state — neutral dim grey, full radius pill — but the cursor +
+ * hover treatment signals it's clickable (the version badge is
+ * metadata; the switcher is an action surface).
+ */
+.rubric-switcher {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px 2px 8px;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-med);
+  white-space: nowrap;
+  cursor: pointer;
+  max-width: 220px;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+}
+
+.rubric-switcher[hidden] {
+  display: none;
+}
+
+.rubric-switcher:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
+  color: var(--text-strong);
+}
+
+.rubric-switcher:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 2px;
+}
+
+.rubric-switcher__caption {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.rubric-switcher__label {
+  color: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+
+/* ── Settings → Rubrics tab (Tasks 7–9) ──────────────────────────────
+ *
+ * Layout architecture
+ * ───────────────────
+ * The Rubrics tab is a 3-row flex column inside the standard
+ * `.settings-tab` scroll container:
+ *
+ *   ┌─────────────────────────────────┐
+ *   │ library bar (sticky-top)        │  ← select + action buttons
+ *   ├─────────────────────────────────┤
+ *   │ editor (scroll)                 │  ← 8 <details> accordion
+ *   │   - Identity (open by default)  │    sections, populated by
+ *   │   - Voice & tone                │    the renderer's section
+ *   │   - Pillars                     │    render functions
+ *   │   - Items                       │
+ *   │   - Captured fields             │
+ *   │   - Live flags                  │
+ *   │   - Scoring                     │
+ *   │   - Advanced — System prompts   │
+ *   ├─────────────────────────────────┤
+ *   │ save bar (sticky-bottom)        │  ← Discard + Save + dirty
+ *   └─────────────────────────────────┘    hint + validation banner
+ *
+ * The library bar stays visible while the editor scrolls; the save
+ * bar appears only when the editor is dirty (renderer toggles
+ * `hidden`). Both bars are flush with the panel edges so the
+ * editor's scroll area lines up cleanly with the `.settings-modal`
+ * panel borders.
+ *
+ * BEM scope: every selector here starts with `.rubrics-tab__` (or
+ * `details.rubrics-tab__section` for the accordion-specific rules).
+ * The only exception is the header pill above (`.rubric-switcher`)
+ * which lives outside the modal entirely.
+ *
+ * Design tokens
+ * ─────────────
+ * Reuses the global `--bg-*`, `--text-*`, `--border-soft`, and
+ * `--radius-*` tokens. The only ad-hoc rgba values are the success/
+ * warn/error semantics on the validation banner and active badge —
+ * those mirror the existing `.conn-pill` colour family so the two
+ * read as siblings.
+ */
+
+.rubrics-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  /* Cancel the .settings-tab default padding so the library + save
+   * bars can run edge-to-edge inside the modal panel. */
+  margin: -14px -18px -18px;
+}
+
+/* ── Library bar ──────────────────────────────────────────────────── */
+
+.rubrics-tab__library {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.rubrics-tab__library-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.rubrics-tab__library-select-label {
+  flex: 1 1 220px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rubrics-tab__library-select-caption {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.rubrics-tab__library-select {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 26px 7px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.05)
+    url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23ffffff88' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'/%3e%3c/svg%3e")
+    right 8px center / 12px no-repeat;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.rubrics-tab__library-select:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.rubrics-tab__library-select:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 1px;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+/* Active rubric badge — same colour family as .conn-pill[connected]
+ * so the green is consistent across the app. Hidden until the
+ * selected rubric matches the active id. */
+.rubrics-tab__active-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px 3px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  border-radius: var(--radius-pill);
+  background: rgba(34, 197, 94, 0.14);
+  border: 1px solid rgba(34, 197, 94, 0.45);
+  color: #4ade80;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  align-self: flex-end;
+}
+
+.rubrics-tab__active-badge[hidden] {
+  display: none;
+}
+
+.rubrics-tab__active-badge-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+/* ── Library action buttons ───────────────────────────────────────── */
+
+.rubrics-tab__library-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.rubrics-tab__btn {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
+}
+
+.rubrics-tab__btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.11);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.rubrics-tab__btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.rubrics-tab__btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 1px;
+}
+
+.rubrics-tab__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.rubrics-tab__btn--primary {
+  background: rgba(96, 165, 250, 0.18);
+  border-color: rgba(96, 165, 250, 0.45);
+  color: #93c5fd;
+}
+
+.rubrics-tab__btn--primary:hover:not(:disabled) {
+  background: rgba(96, 165, 250, 0.28);
+  border-color: rgba(96, 165, 250, 0.7);
+  color: #bfdbfe;
+}
+
+.rubrics-tab__btn--danger {
+  color: var(--accent-red);
+  border-color: rgba(248, 113, 113, 0.25);
+}
+
+.rubrics-tab__btn--danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.15);
+  border-color: rgba(248, 113, 113, 0.5);
+}
+
+.rubrics-tab__btn--ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-med);
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+.rubrics-tab__btn--ghost:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--border-soft);
+  color: var(--text-strong);
+}
+
+/* Inline "+ Add …" buttons (pillars, items, fields, flags). Slimmer
+ * than the library actions; sit at the end of the relevant list. */
+.rubrics-tab__add-btn {
+  align-self: flex-start;
+  font-size: 11px;
+  padding: 4px 10px;
+  margin-top: 6px;
+  color: var(--text-med);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.rubrics-tab__add-btn:hover:not(:disabled) {
+  color: var(--text-strong);
+}
+
+/* ── Library hint (toast-style ephemeral message) ────────────────── */
+
+.rubrics-tab__hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  min-height: 14px;
+  margin: 0;
+  transition: color 160ms ease;
+}
+
+.rubrics-tab__hint[hidden] {
+  display: none;
+}
+
+.rubrics-tab__hint--info {
+  color: #93c5fd;
+}
+
+.rubrics-tab__hint--warn {
+  color: #fbbf24;
+}
+
+.rubrics-tab__hint--error {
+  color: var(--accent-red);
+}
+
+/* ── Editor body (scrollable) ─────────────────────────────────────── */
+
+.rubrics-tab__editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.rubrics-tab__editor[hidden] {
+  display: none;
+}
+
+.rubrics-tab__editor::-webkit-scrollbar {
+  width: 5px;
+}
+
+.rubrics-tab__editor::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 2px;
+}
+
+/* ── <details> accordion sections ─────────────────────────────────── */
+
+.rubrics-tab__section {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  overflow: hidden;
+  transition: border-color 160ms ease;
+}
+
+.rubrics-tab__section:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.rubrics-tab__section[open] {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.rubrics-tab__section-summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 9px 12px 9px 28px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  position: relative;
+  user-select: none;
+  outline: none;
+}
+
+/* Replace the native disclosure triangle with a chevron we control
+ * so we can rotate it smoothly on open/close. */
+.rubrics-tab__section-summary::-webkit-details-marker {
+  display: none;
+}
+
+.rubrics-tab__section-summary::before {
+  content: '';
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid var(--text-med);
+  border-bottom: 1.5px solid var(--text-med);
+  transform: translateY(-65%) rotate(-45deg);
+  transition: transform 160ms ease, border-color 160ms ease;
+}
+
+.rubrics-tab__section[open] > .rubrics-tab__section-summary::before {
+  transform: translateY(-20%) rotate(45deg);
+  border-color: var(--text-strong);
+}
+
+.rubrics-tab__section-summary:hover {
+  color: var(--text-strong);
+}
+
+.rubrics-tab__section-summary:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: -2px;
+}
+
+.rubrics-tab__section-body {
+  padding: 4px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Advanced — System prompts is the "here be dragons" section. Tint
+ * the section subtly (amber) and slot the warning banner above the
+ * body content so the user reads the warning BEFORE they reach the
+ * textareas. */
+.rubrics-tab__section--advanced {
+  border-color: rgba(251, 191, 36, 0.25);
+}
+
+.rubrics-tab__section--advanced[open] {
+  border-color: rgba(251, 191, 36, 0.45);
+  background: rgba(40, 32, 18, 0.25);
+}
+
+.rubrics-tab__warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-radius: 8px;
+  background: rgba(40, 32, 18, 0.55);
+  color: var(--text-med);
+  font-size: 11.5px;
+  line-height: 1.45;
+  margin: 8px 14px 0;
+}
+
+.rubrics-tab__warning--advanced::before {
+  content: '⚠';
+  flex: 0 0 auto;
+  color: rgba(248, 196, 113, 0.95);
+  font-size: 13px;
+  line-height: 1;
+}
+
+/* ── Field primitives (label + input/textarea wrapper) ──────────── */
+
+.rubrics-tab__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rubrics-tab__field--block {
+  gap: 6px;
+}
+
+.rubrics-tab__field-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.rubrics-tab__field-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-med);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin: 0;
+}
+
+.rubrics-tab__field-value {
+  font-size: 12.5px;
+  color: var(--text-strong);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rubrics-tab__field-help {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.45;
+  margin: 0;
+}
+
+.rubrics-tab__field-action {
+  flex: 0 0 auto;
+}
+
+.rubrics-tab__placeholder {
+  font-size: 11.5px;
+  font-style: italic;
+  color: var(--text-faint);
+  margin: 4px 0;
+}
+
+/* Inputs + textareas — neutral dark register, same focus treatment
+ * as the providers tab so the two read as a family. */
+.rubrics-tab__input,
+.rubrics-tab__textarea {
+  appearance: none;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  transition: background 120ms ease, border-color 120ms ease;
+  -webkit-app-region: no-drag;
+}
+
+.rubrics-tab__textarea {
+  resize: vertical;
+  min-height: 64px;
+  line-height: 1.45;
+  font-family: inherit;
+}
+
+.rubrics-tab__textarea--inline {
+  min-height: 40px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.rubrics-tab__input:hover,
+.rubrics-tab__textarea:hover {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.rubrics-tab__input:focus,
+.rubrics-tab__input:focus-visible,
+.rubrics-tab__textarea:focus,
+.rubrics-tab__textarea:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 1px;
+  border-color: rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.rubrics-tab__input::placeholder,
+.rubrics-tab__textarea::placeholder {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* Inline inputs — borderless until focus. Used inside card rows for
+ * pillar/item/field/flag names so the row reads as a single chip
+ * rather than a stack of bordered fields. */
+.rubrics-tab__inline-input {
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-strong);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  transition: background 120ms ease, border-color 120ms ease;
+  -webkit-app-region: no-drag;
+}
+
+.rubrics-tab__inline-input--name {
+  font-weight: 600;
+  font-size: 12.5px;
+}
+
+.rubrics-tab__inline-input--short,
+.rubrics-tab__inline-input--category {
+  font-size: 11.5px;
+  color: var(--text-med);
+  flex: 0 0 110px;
+}
+
+.rubrics-tab__inline-input--label {
+  font-weight: 500;
+}
+
+.rubrics-tab__inline-input:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--border-soft);
+}
+
+.rubrics-tab__inline-input:focus,
+.rubrics-tab__inline-input:focus-visible {
+  outline: none;
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: var(--text-strong);
+}
+
+.rubrics-tab__inline-input::placeholder {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* ── List groups (items/fields are grouped) ─────────────────────── */
+
+.rubrics-tab__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rubrics-tab__group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0 4px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.rubrics-tab__group:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.rubrics-tab__group-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-med);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rubrics-tab__group-title-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-med);
+  -webkit-app-region: no-drag;
+}
+
+.rubrics-tab__group-title-input:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--border-soft);
+}
+
+.rubrics-tab__group-title-input:focus,
+.rubrics-tab__group-title-input:focus-visible {
+  outline: none;
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: var(--text-strong);
+}
+
+.rubrics-tab__group-count {
+  font-weight: 500;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  letter-spacing: 0;
+  text-transform: none;
+  flex: 0 0 auto;
+}
+
+/* ── Editor cards (one per pillar / item / field / flag) ────────── */
+
+.rubrics-tab__card {
+  background: rgba(20, 20, 30, 0.5);
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+
+.rubrics-tab__card--editor:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.rubrics-tab__card--editor:focus-within {
+  border-color: rgba(255, 255, 255, 0.25);
+  background: rgba(20, 20, 30, 0.7);
+}
+
+/* Flag severity tint — coloured left border to surface the
+ * red/green semantics at a glance. The renderer toggles the
+ * severity modifier on radio change. */
+.rubrics-tab__card--severity-red {
+  border-left: 3px solid rgba(248, 113, 113, 0.7);
+}
+
+.rubrics-tab__card--severity-green {
+  border-left: 3px solid rgba(74, 222, 128, 0.7);
+}
+
+.rubrics-tab__card--severity-unknown {
+  border-left: 3px solid var(--border-soft);
+}
+
+.rubrics-tab__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.rubrics-tab__row--secondary {
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.rubrics-tab__card-meta,
+.rubrics-tab__id-chip {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  letter-spacing: 0;
+  padding: 2px 6px;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 4px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* ── Pillar swatch (glyph + tinted background) ──────────────────── */
+
+.rubrics-tab__pillar-swatch {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* ── Delete button (red ghost — sits at the end of card rows) ───── */
+
+.rubrics-tab__row-delete {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.rubrics-tab__row-delete:hover {
+  color: var(--accent-red);
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.35);
+}
+
+.rubrics-tab__row-delete:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 1px;
+}
+
+/* ── Reorder controls (up / down arrows) ────────────────────────── */
+
+.rubrics-tab__reorder {
+  display: inline-flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  gap: 1px;
+}
+
+.rubrics-tab__reorder-btn {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  width: 18px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font: inherit;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.rubrics-tab__reorder-btn:hover:not(:disabled) {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.rubrics-tab__reorder-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.rubrics-tab__reorder-btn:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 0;
+}
+
+/* ── Glyph picker (grid of emoji buttons for pillar identity) ───── */
+
+.rubrics-tab__glyph-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.rubrics-tab__glyph-picker-caption {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.rubrics-tab__glyph-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 26px);
+  gap: 4px;
+}
+
+.rubrics-tab__glyph-pick {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+
+.rubrics-tab__glyph-pick:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.rubrics-tab__glyph-pick--selected {
+  background: rgba(96, 165, 250, 0.18);
+  border-color: rgba(96, 165, 250, 0.55);
+}
+
+.rubrics-tab__glyph-pick:active {
+  transform: scale(0.94);
+}
+
+.rubrics-tab__glyph-pick:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 1px;
+}
+
+/* ── Tint picker (native color input wrapped to match the family) ─ */
+
+.rubrics-tab__tint-picker {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.rubrics-tab__tint-picker-caption {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.rubrics-tab__tint-picker-input {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  -webkit-appearance: none;
+  width: 30px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.rubrics-tab__tint-picker-input::-webkit-color-swatch-wrapper { padding: 0; }
+.rubrics-tab__tint-picker-input::-webkit-color-swatch { border: 0; border-radius: 4px; }
+.rubrics-tab__tint-picker-input::-moz-color-swatch { border: 0; border-radius: 4px; }
+
+.rubrics-tab__tint-picker-input:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 1px;
+}
+
+/* ── Radio group (severity, when-to-fire) ───────────────────────── */
+
+.rubrics-tab__radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rubrics-tab__radio-legend {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 0;
+  margin: 0;
+}
+
+.rubrics-tab__radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--text-med);
+  margin-right: 8px;
+  cursor: pointer;
+}
+
+.rubrics-tab__radio input[type='radio'] {
+  -webkit-app-region: no-drag;
+  margin: 0;
+  accent-color: rgba(96, 165, 250, 0.95);
+}
+
+.rubrics-tab__radio:has(input[type='radio']:checked) {
+  color: var(--text-strong);
+}
+
+/* ── Checkbox (item "suggestable" toggle) ───────────────────────── */
+
+.rubrics-tab__checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-med);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.rubrics-tab__checkbox input[type='checkbox'] {
+  -webkit-app-region: no-drag;
+  margin: 0;
+  accent-color: rgba(96, 165, 250, 0.95);
+}
+
+/* ── Scoring section (read-only preview list) ───────────────────── */
+
+.rubrics-tab__scoring-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rubrics-tab__scoring-list-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  font-size: 11.5px;
+  color: var(--text-med);
+}
+
+/* ── Save bar (sticky bottom) ───────────────────────────────────── */
+
+.rubrics-tab__save-bar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 18px 12px;
+  border-top: 1px solid var(--border-soft);
+  background: rgba(20, 20, 30, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.rubrics-tab__save-bar[hidden] {
+  display: none;
+}
+
+.rubrics-tab__save-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.rubrics-tab__dirty-hint {
+  flex: 1 1 auto;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-dim);
+}
+
+/* ── Validation banner (inside save bar) ────────────────────────── */
+
+.rubrics-tab__validation {
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.rubrics-tab__validation[hidden] {
+  display: none;
+}
+
+.rubrics-tab__validation--error {
+  border-color: rgba(248, 113, 113, 0.45);
+  background: rgba(48, 18, 18, 0.5);
+  color: #fecaca;
+}
+
+.rubrics-tab__validation--warn {
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(40, 32, 18, 0.5);
+  color: #fde68a;
+}
+
+.rubrics-tab__validation--info {
+  border-color: rgba(96, 165, 250, 0.4);
+  background: rgba(20, 28, 45, 0.5);
+  color: #bfdbfe;
+}
+
+.rubrics-tab__validation-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.rubrics-tab__validation-item {
+  font-size: 11px;
+  line-height: 1.4;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.rubrics-tab__validation-item::before {
+  content: '•';
+  flex: 0 0 auto;
+  opacity: 0.6;
+}
+
+/* Per-item kind modifiers. Mostly the banner's parent colour does the
+ * work, but when errors + warnings appear in the same banner (banner
+ * goes red on first error) the marker colour stays semantic so a
+ * scan-read still distinguishes the two. The --info variant carries
+ * its own colour because it appears as a standalone "Saved." ping
+ * appended after a successful save inside an otherwise-empty banner. */
+.rubrics-tab__validation-item--error::before {
+  color: #fecaca;
+  opacity: 0.85;
+}
+
+.rubrics-tab__validation-item--warn::before {
+  color: #fde68a;
+  opacity: 0.85;
+}
+
+.rubrics-tab__validation-item--info {
+  color: #bfdbfe;
+}
+
+.rubrics-tab__validation-item--info::before {
+  color: #93c5fd;
+  opacity: 0.85;
+}
+
+.rubrics-tab__validation-jump {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin-left: auto;
+  color: inherit;
+  text-decoration: underline;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 120ms ease;
+  flex: 0 0 auto;
+}
+
+.rubrics-tab__validation-jump:hover {
+  opacity: 1;
+}
+
+.rubrics-tab__validation-jump:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 1px;
+}
+
+/* ── Empty state (no rubrics loaded yet) ────────────────────────── */
+
+.rubrics-tab__empty {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 24px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.rubrics-tab__empty[hidden] {
+  display: none;
+}
+
 /* Reduced motion: drop the recording-dot pulse and the coach thinking pulse.
  * Also disable the rail-overlay slide transition. */
 @media (prefers-reduced-motion: reduce) {
@@ -4294,5 +5502,12 @@ a,
   }
   .settings-save:active {
     transform: none;
+  }
+  .rubrics-tab__btn:active,
+  .rubrics-tab__glyph-pick:active {
+    transform: none;
+  }
+  .rubrics-tab__section[open] > .rubrics-tab__section-summary::before {
+    transition: none;
   }
 }
