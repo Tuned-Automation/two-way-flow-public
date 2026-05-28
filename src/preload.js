@@ -739,6 +739,14 @@ contextBridge.exposeInMainWorld('gemini', {
  *       Used by the editor's "Reset to default" buttons under the
  *       Coach Prompt section.
  *
+ *   activeSync()                    → rubrics:active-sync  (SYNCHRONOUS)
+ *       Blocking round-trip that returns the full active rubric shape
+ *       (or null). The ONLY synchronous channel in this bridge. Used
+ *       exactly once, at the top of the renderer module body, to hydrate
+ *       rubric.js's live bindings before any rubric-derived state is
+ *       built — so the first frame paints the active rubric instead of
+ *       flashing DEFAULT_RUBRIC. Not for general use.
+ *
  *   onChanged(callback)             ← rubrics:changed
  *       Subscribe to active-rubric / saved-active-rubric broadcasts.
  *       Callback receives { activeId, reason: 'set-active' | 'save' }.
@@ -764,6 +772,15 @@ contextBridge.exposeInMainWorld('rubrics', {
   import: (json) => ipcRenderer.invoke('rubrics:import', { json }),
   validate: (rubric) => ipcRenderer.invoke('rubrics:validate', { rubric }),
   getDefaultPrompts: () => ipcRenderer.invoke('rubrics:get-default-prompts'),
+  // SYNCHRONOUS — returns the full active rubric shape (or null) in a
+  // single blocking round-trip. Exists solely so the renderer can
+  // hydrate its rubric.js live bindings at the very top of its module
+  // body, before any rubric-derived state is computed, and paint the
+  // active rubric on the first frame instead of flashing DEFAULT_RUBRIC.
+  // Do NOT use this for anything else — every other read/mutation must
+  // stay on the async invoke channels above. Backed by `rubrics:active-sync`
+  // (ipcMain.on) in src/main.js.
+  activeSync: () => ipcRenderer.sendSync('rubrics:active-sync'),
   onChanged: subscribe('rubrics:changed'),
 });
 

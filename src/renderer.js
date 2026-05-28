@@ -10,13 +10,43 @@ import {
   FIELD_GROUPS,
   FLAGS_BY_ID,
   SUGGESTION_SENTINEL_ITEM_IDS,
+  applyRubric,
 } from './rubric.js';
 
+/* ── Renderer-realm rubric hydration (boot) ─────────────────────────── *
+ * rubric.js initialises its live bindings (PILLARS / ITEMS / …) from
+ * DEFAULT_RUBRIC so the module stays renderer-safe — it must not touch
+ * disk (see its header doc-block). The user's ACTIVE rubric lives on
+ * disk in the main process. Pull it synchronously, right here, BEFORE
+ * any rubric-derived module state is computed (ITEM_DECLARATION_INDEX
+ * just below, state.pillarStatus in the state literal, etc.) so the very
+ * first painted frame reflects the active rubric instead of flashing the
+ * default and swapping a beat later.
+ *
+ * window.rubrics.activeSync() is a sendSync bridge to `rubrics:active-sync`
+ * in main (see src/preload.js / src/main.js). It returns the full active
+ * rubric shape or null. On null / malformed / an older preload without
+ * the method, we keep the DEFAULT_RUBRIC bindings — the overlay still
+ * works, it just shows the default catalogue until the next swap. */
+try {
+  const bootRubric = window.rubrics?.activeSync?.();
+  if (bootRubric && Array.isArray(bootRubric.pillars) && bootRubric.pillars.length > 0) {
+    applyRubric(bootRubric);
+  }
+} catch (err) {
+  console.warn('[rubric] boot hydration failed; using defaults:', err?.message || err);
+}
+
 /** Rubric declaration index — lets us sort runtime collections (e.g.
- *  the Logged pillar's item list) into stable rubric order. */
-const ITEM_DECLARATION_INDEX = Object.fromEntries(
+ *  the Logged pillar's item list) into stable rubric order. Mutable so
+ *  the live rubric-swap path (rehydrateActiveRubricIntoUI) can rebuild
+ *  it after applyRubric re-points the ITEMS binding to a new rubric. */
+let ITEM_DECLARATION_INDEX = Object.fromEntries(
   ITEMS.map((it, i) => [it.id, i]),
 );
+function rebuildItemDeclarationIndex() {
+  ITEM_DECLARATION_INDEX = Object.fromEntries(ITEMS.map((it, i) => [it.id, i]));
+}
 
 /* ── Coach history behaviour ───────────────────────────────────────── */
 const COACH_HISTORY_MAX = 50;
@@ -9601,7 +9631,56 @@ function setRubricsLibraryHint(message, kind = 'info', { autoClearMs = 0 } = {})
   }
 }
 
+/* Re-point the renderer realm's rubric bindings at the active on-disk
+ * rubric and repaint every rubric-driven surface (rail, overlay,
+ * captured pane). This is the live counterpart to the boot bootstrap at
+ * the top of this module.
+ *
+ * Idle-gated by design. Structural rubric changes only ever broadcast
+ * while no session is running — main.js refuses `rubrics:set-active`
+ * mid-call, and only broadcasts a save when the saved rubric is active
+ * AND the session is idle (see src/preload.js rubrics doc-block). During
+ * a call we deliberately leave the live bindings untouched: the running
+ * Coach owns its own per-instance tool schemas for the duration of the
+ * call, and the rail keeps rendering the rubric the call started with.
+ * The next idle broadcast (or an app restart) reconciles.
+ *
+ * Because we only run while idle, state.itemStates / capturedFields are
+ * already empty (they're wiped at the end of every call by
+ * clearScoringState), so there's nothing rubric-keyed to migrate — we
+ * just rebuild the idle pillar-status map from the new PILLARS. */
+function rehydrateActiveRubricIntoUI() {
+  if (state.status === 'listening' || state.status === 'starting') return;
+  let nextRubric = null;
+  try {
+    nextRubric = window.rubrics?.activeSync?.();
+  } catch (err) {
+    console.warn('[rubric] live re-hydrate fetch failed:', err?.message || err);
+    return;
+  }
+  if (!nextRubric || !Array.isArray(nextRubric.pillars) || nextRubric.pillars.length === 0) {
+    return;
+  }
+  applyRubric(nextRubric);
+  rebuildItemDeclarationIndex();
+  state.pillarStatus = Object.fromEntries(PILLARS.map((p) => [p.id, 'idle']));
+  // Drop an open slide-over if it pointed at a pillar the new rubric no
+  // longer defines, so renderRailOverlay doesn't try to render a ghost.
+  if (state.activePillarId && !PILLARS_BY_ID[state.activePillarId]) {
+    state.activePillarId = null;
+  }
+  renderRail();
+  renderRailOverlay();
+  renderCaptured();
+}
+
 function onRubricsChanged(_payload) {
+  // Re-point the live rubric bindings + repaint the rail / captured pane
+  // first (idle only — no-op mid-call), so the structural surfaces track
+  // a set-active / save-to-active swap without an app restart. Must run
+  // before the tab + switcher refresh below so those read the freshly
+  // applied rubric.
+  rehydrateActiveRubricIntoUI();
   // Re-hydrate so the (active) suffix in the select and the badge
   // both reflect the new active id. If the user was editing a
   // different rubric, the editor keeps that rubric loaded but its

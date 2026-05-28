@@ -4409,6 +4409,35 @@ function registerIpcHandlers() {
     }
   });
 
+  /* Synchronous boot bridge for the renderer realm.
+   * ────────────────────────────────────────────────
+   * rubric.js in the RENDERER initialises its live bindings (PILLARS /
+   * ITEMS / …) from DEFAULT_RUBRIC because it must stay renderer-safe
+   * (no disk access — see its header doc-block). Without this channel
+   * the overlay's rail / checklist / captured pane / flags would paint
+   * the DEFAULT rubric even when the user has a different active rubric
+   * on disk, and they'd only ever see the default until they edited the
+   * active one in-session.
+   *
+   * The renderer calls this exactly ONCE, synchronously, at the very top
+   * of its module body — before it computes any rubric-derived state —
+   * so the first painted frame already reflects the active rubric.
+   * Synchronous IPC is the right tool here precisely because the answer
+   * must be in hand before the renderer builds that derived state; an
+   * async invoke would force a default-then-swap flash on every launch.
+   *
+   * Returns the full active rubric shape (the same value passed to
+   * applyRubric in THIS process at boot) or null on any failure — the
+   * renderer falls back to its DEFAULT_RUBRIC bindings on null. */
+  ipcMain.on('rubrics:active-sync', (event) => {
+    try {
+      event.returnValue = rubricStore.loadActiveRubric();
+    } catch (err) {
+      console.warn('[rubrics:active-sync]', err?.message || err);
+      event.returnValue = null;
+    }
+  });
+
   ipcMain.handle('rubrics:load', (_event, payload = {}) => {
     const id = typeof payload.id === 'string' ? payload.id : '';
     if (!id) return { ok: false, reason: 'id_required' };
