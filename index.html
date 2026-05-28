@@ -354,10 +354,26 @@
                See renderQuickFix in src/renderer.js for population
                + drill-through behaviour (clicking a breakdown row
                scrolls the transcript pane to the anchor quote). -->
-          <section id="quickFix" class="quick-fix" hidden>
+          <section id="quickFix" class="quick-fix" data-details="collapsed" hidden>
             <header class="quick-fix__header">
               <span class="quick-fix__title">Total annual opportunity</span>
               <div class="quick-fix__controls">
+                <!-- Toggles whether per-row notes and the bottom Assumptions
+                     list are visible. Default 'collapsed' — the rep sees only
+                     heading + label/amount rows. Expanded reveals the muted
+                     italic notes under each row and the assumptions list at
+                     the bottom. State is in-memory; resets to collapsed on
+                     Stop / Start (see clearScoringState in renderer.js). -->
+                <button
+                  type="button"
+                  class="quick-fix__details-toggle"
+                  title="Show / hide per-row notes and assumptions"
+                  aria-expanded="false"
+                  aria-controls="quickFix"
+                >
+                  <span class="quick-fix__details-toggle-label">Details</span>
+                  <span class="quick-fix__details-toggle-chevron" aria-hidden="true">▾</span>
+                </button>
                 <!-- Copies {exportedAt, rollup, entries} JSON to the
                      clipboard so the rep can paste the full
                      opportunity breakdown + underlying facts into
