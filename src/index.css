@@ -3470,7 +3470,13 @@ a,
   -webkit-app-region: no-drag;
   -webkit-user-select: text;
   user-select: text;
-  width: min(520px, calc(100% - 24px));
+  /* Widened 520 → 720 to give the dense Providers / Rubrics tabs
+   * room to breathe and to keep all 9 tab labels visible on a
+   * "normal sized" coach overlay window without horizontal scrolling.
+   * Narrower windows still clamp via calc(100% - 24px), and the
+   * .settings-modal__tabs scroll affordance below picks up the slack
+   * for the truly tiny case. */
+  width: min(720px, calc(100% - 24px));
   max-height: calc(100% - 24px);
   display: flex;
   flex-direction: column;
@@ -3537,12 +3543,52 @@ a,
 
 /* Tab bar — flat-bottom, with the active tab carrying a 2px
  * underline. Mirrors .summary-modal__tabs visually so the two
- * modals read as a family. */
+ * modals read as a family.
+ *
+ * Overflow discipline:
+ *   The bar is a horizontal scroller. Tab labels are nowrap and the
+ *   buttons are flex-shrink:0 so the inactive tabs never collapse
+ *   into "G…" — instead the row scrolls. The right edge carries a
+ *   subtle mask-image fade so the user gets a visual hint that more
+ *   tabs live off-screen, and selectSettingsTab() in src/renderer.js
+ *   calls scrollIntoView() on the clicked tab so it always parks in
+ *   view after a click. Scrollbar is suppressed visually — the fade
+ *   is the affordance. */
 .settings-modal__tabs {
   display: flex;
+  flex-wrap: nowrap;
   gap: 4px;
   padding: 8px 12px 0;
   border-bottom: 1px solid var(--border-soft);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-behavior: smooth;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  /* Tight 14px right-edge fade — visible enough to hint at off-screen
+   * tabs when the bar is scrollable, subtle enough that it barely
+   * touches the rightmost tab label when the bar fits inside the
+   * panel or when the user has scrolled fully right. A larger mask
+   * range (e.g. 28px) was tried first but it ate into "Help" once
+   * the user scrolled to the end. */
+  -webkit-mask-image: linear-gradient(
+    to right,
+    #000 0,
+    #000 calc(100% - 14px),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    #000 0,
+    #000 calc(100% - 14px),
+    transparent 100%
+  );
+}
+
+.settings-modal__tabs::-webkit-scrollbar {
+  height: 0;
+  width: 0;
+  display: none;
 }
 
 .settings-modal__tab {
@@ -3556,6 +3602,8 @@ a,
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
+  flex: 0 0 auto;
+  white-space: nowrap;
   transition: color 120ms ease, border-color 120ms ease;
 }
 
@@ -4959,10 +5007,20 @@ a,
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 12px 18px;
+  /* Tightened: gap 10→8, vertical padding 12→10, and the subtitle's
+   * legacy 10px bottom margin is overridden to 0 below. Together
+   * this sheds ~12px of library-bar chrome which goes directly to
+   * the accordion editor below — the Rubrics tab is dense enough
+   * that every pixel of vertical room counts on a short coach
+   * overlay window. */
+  gap: 8px;
+  padding: 10px 18px;
   border-bottom: 1px solid var(--border-soft);
   background: rgba(255, 255, 255, 0.02);
+}
+
+.rubrics-tab__library > .settings-section__subtitle {
+  margin: 0;
 }
 
 .rubrics-tab__library-row {

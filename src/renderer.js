@@ -4989,15 +4989,35 @@ async function ensureSettingsLoaded() {
  *  more tabs without editing this code. */
 function selectSettingsTab(tabId) {
   let matched = false;
+  /** @type {HTMLElement | null} */
+  let activeBtn = null;
   for (const btn of settingsTabEls) {
     const isActive = btn.dataset.tab === tabId;
     btn.setAttribute('aria-selected', String(isActive));
-    if (isActive) matched = true;
+    if (isActive) {
+      matched = true;
+      activeBtn = btn instanceof HTMLElement ? btn : null;
+    }
   }
   if (!matched) return;
   for (const section of settingsTabContentEls) {
     const isActive = section.dataset.tabContent === tabId;
     section.hidden = !isActive;
+  }
+  // Park the newly-active tab in the visible portion of the scrolling
+  // tab bar. The .settings-modal__tabs container is overflow-x:auto
+  // (with the right-edge fade as its affordance — see src/index.css)
+  // so tabs at the right side of the bar (General, Help, …) live
+  // off-screen on a narrow window. scrollIntoView({inline:'nearest'})
+  // is a no-op when the tab is already fully visible and slides the
+  // tab the minimum distance otherwise. `block:'nearest'` keeps the
+  // tab bar from vertical-scrolling the modal panel.
+  if (activeBtn && typeof activeBtn.scrollIntoView === 'function') {
+    activeBtn.scrollIntoView({
+      inline: 'nearest',
+      block: 'nearest',
+      behavior: 'smooth',
+    });
   }
   // Per-tab lazy hydrators. Today only Usage needs one (the
   // chronological list of SessionRecords is rebuilt on every open
