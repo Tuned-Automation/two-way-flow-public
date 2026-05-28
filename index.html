@@ -1399,133 +1399,131 @@
                 ></p>
               </div>
 
-              <!-- Editor. Sectioned because a single long form would
-                   force the user to scroll past prompts to reach
-                   pillars (or vice versa). The 6 sections match the
-                   rubric schema: meta (name + description), prompts
-                   (voice / coach / live), pillars (catalogue of
-                   non-synthetic pillars), items (per-pillar rubric
-                   items), fields (captured key/value extractions),
-                   flags (live-coaching flag definitions).
-                   Section panels are intentionally empty here — the
-                   renderer (Tasks 8/9) builds their contents from the
+              <!-- Editor. Each section is a native <details> accordion
+                   so the user can keep several sections expanded at
+                   once for cross-referencing (e.g. Pillars + Items
+                   side-by-side while building a new pillar). Identity
+                   opens by default; everything else collapsed by
+                   default. Advanced — System prompts is sticky-closed
+                   on every load because it's a power-user surface that
+                   should never be opened by mistake.
+
+                   Section bodies are intentionally empty here — the
+                   renderer (Tasks 8 / 9) builds their contents from the
                    loaded rubric so a future schema change doesn't
-                   require an index.html edit. -->
+                   require an index.html edit. The CSS task (Task 11)
+                   styles `details.rubrics-tab__section` as a rounded
+                   card with a hairline divider between the summary
+                   and the body. -->
               <div
                 id="rubricsEditor"
                 class="rubrics-tab__editor"
                 hidden
               >
-                <nav
-                  class="rubrics-tab__section-nav"
-                  role="tablist"
-                  aria-label="Rubric sections"
+                <details
+                  id="rubricsSectionIdentity"
+                  class="rubrics-tab__section"
+                  data-section="identity"
+                  open
                 >
-                  <button
-                    type="button"
-                    id="rubricsSectionBtnMeta"
-                    class="rubrics-tab__section-btn"
-                    data-section="meta"
-                    role="tab"
-                    aria-selected="true"
-                    aria-controls="rubricsSectionMeta"
-                  >Overview</button>
-                  <button
-                    type="button"
-                    id="rubricsSectionBtnPrompts"
-                    class="rubrics-tab__section-btn"
-                    data-section="prompts"
-                    role="tab"
-                    aria-selected="false"
-                    aria-controls="rubricsSectionPrompts"
-                  >Coach prompts</button>
-                  <button
-                    type="button"
-                    id="rubricsSectionBtnPillars"
-                    class="rubrics-tab__section-btn"
-                    data-section="pillars"
-                    role="tab"
-                    aria-selected="false"
-                    aria-controls="rubricsSectionPillars"
-                  >Pillars</button>
-                  <button
-                    type="button"
-                    id="rubricsSectionBtnItems"
-                    class="rubrics-tab__section-btn"
-                    data-section="items"
-                    role="tab"
-                    aria-selected="false"
-                    aria-controls="rubricsSectionItems"
-                  >Items</button>
-                  <button
-                    type="button"
-                    id="rubricsSectionBtnFields"
-                    class="rubrics-tab__section-btn"
-                    data-section="fields"
-                    role="tab"
-                    aria-selected="false"
-                    aria-controls="rubricsSectionFields"
-                  >Captured fields</button>
-                  <button
-                    type="button"
-                    id="rubricsSectionBtnFlags"
-                    class="rubrics-tab__section-btn"
-                    data-section="flags"
-                    role="tab"
-                    aria-selected="false"
-                    aria-controls="rubricsSectionFlags"
-                  >Flags</button>
-                </nav>
+                  <summary class="rubrics-tab__section-summary">Identity</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="identity"
+                  ></div>
+                </details>
 
-                <div class="rubrics-tab__sections">
-                  <section
-                    id="rubricsSectionMeta"
-                    class="rubrics-tab__section"
-                    data-section-content="meta"
-                    role="tabpanel"
-                    aria-label="Overview"
-                  ></section>
-                  <section
-                    id="rubricsSectionPrompts"
-                    class="rubrics-tab__section"
-                    data-section-content="prompts"
-                    role="tabpanel"
-                    aria-label="Coach prompts"
-                    hidden
-                  ></section>
-                  <section
-                    id="rubricsSectionPillars"
-                    class="rubrics-tab__section"
+                <details
+                  id="rubricsSectionVoiceTone"
+                  class="rubrics-tab__section"
+                  data-section="voice-tone"
+                >
+                  <summary class="rubrics-tab__section-summary">Voice &amp; tone</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="voice-tone"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionPillars"
+                  class="rubrics-tab__section"
+                  data-section="pillars"
+                >
+                  <summary class="rubrics-tab__section-summary">Pillars</summary>
+                  <div
+                    class="rubrics-tab__section-body"
                     data-section-content="pillars"
-                    role="tabpanel"
-                    aria-label="Pillars"
-                    hidden
-                  ></section>
-                  <section
-                    id="rubricsSectionItems"
-                    class="rubrics-tab__section"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionItems"
+                  class="rubrics-tab__section"
+                  data-section="items"
+                >
+                  <summary class="rubrics-tab__section-summary">Items</summary>
+                  <div
+                    class="rubrics-tab__section-body"
                     data-section-content="items"
-                    role="tabpanel"
-                    aria-label="Items"
-                    hidden
-                  ></section>
-                  <section
-                    id="rubricsSectionFields"
-                    class="rubrics-tab__section"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionFields"
+                  class="rubrics-tab__section"
+                  data-section="fields"
+                >
+                  <summary class="rubrics-tab__section-summary">Captured fields</summary>
+                  <div
+                    class="rubrics-tab__section-body"
                     data-section-content="fields"
-                    role="tabpanel"
-                    aria-label="Captured fields"
-                    hidden
-                  ></section>
-                  <section
-                    id="rubricsSectionFlags"
-                    class="rubrics-tab__section"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionFlags"
+                  class="rubrics-tab__section"
+                  data-section="flags"
+                >
+                  <summary class="rubrics-tab__section-summary">Live flags</summary>
+                  <div
+                    class="rubrics-tab__section-body"
                     data-section-content="flags"
-                    role="tabpanel"
-                    aria-label="Flags"
-                    hidden
-                  ></section>
-                </div>
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionScoring"
+                  class="rubrics-tab__section"
+                  data-section="scoring"
+                >
+                  <summary class="rubrics-tab__section-summary">Scoring</summary>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="scoring"
+                  ></div>
+                </details>
+
+                <details
+                  id="rubricsSectionAdvancedPrompts"
+                  class="rubrics-tab__section rubrics-tab__section--advanced"
+                  data-section="advanced-prompts"
+                >
+                  <summary class="rubrics-tab__section-summary">Advanced — System prompts</summary>
+                  <div
+                    class="rubrics-tab__warning rubrics-tab__warning--advanced"
+                    role="note"
+                  >
+                    These prompts drive the AI's behaviour. Only edit if
+                    you understand the existing instructions. Use
+                    <strong>Reset to default</strong> to restore.
+                  </div>
+                  <div
+                    class="rubrics-tab__section-body"
+                    data-section-content="advanced-prompts"
+                  ></div>
+                </details>
               </div>
 
               <!-- Save bar. Sticks to the bottom of the scrolling tab

@@ -6309,14 +6309,19 @@ window.addEventListener('beforeunload', () => {
 
 /* ── Editable rubrics: Settings → Rubrics tab ──────────────────────── *
  *
- * Read-only library bar + sectioned editor (Task 8). The library bar
- * picks which rubric is loaded into the editor and (optionally) makes
- * it the active rubric. The editor below renders the loaded rubric
- * across 6 sections — Overview / Coach prompts / Pillars / Items /
- * Captured fields / Flags — in READ-ONLY form. Task 9 swaps the
- * read-only renderers for writeable inputs + adds the New / Duplicate
- * / Delete / Export / Import buttons + save/discard/validation. Task 10
- * adds the header switcher pill that opens this tab on click.
+ * Read-only library bar + sectioned editor (Tasks 8 + 9a). The library
+ * bar picks which rubric is loaded into the editor and (optionally)
+ * makes it the active rubric. The editor below renders the loaded
+ * rubric across 8 native <details> accordion sections:
+ *   Identity / Voice & tone / Pillars / Items / Captured fields /
+ *   Live flags / Scoring / Advanced — System prompts.
+ * Identity opens by default; everything else is collapsed. Multiple
+ * sections can be open simultaneously, so every section body is
+ * repainted eagerly when a rubric loads — there is no single "current
+ * section" to track. Task 9b swaps the read-only renderers for
+ * writeable inputs + adds the New / Duplicate / Delete / Export /
+ * Import buttons + save/discard/validation. Task 10 adds the header
+ * switcher pill that opens this tab on click.
  *
  * Data flow:
  *   - openSettingsModal() → hydrateRubricsTab() — cheap re-fetch on
@@ -6326,9 +6331,7 @@ window.addEventListener('beforeunload', () => {
  *     fires whenever main applies a rubric swap or persists a save to
  *     the currently-active idle rubric.
  *   - select change → loadRubricIntoEditor(id) — pulls the full
- *     rubric and re-renders the visible section.
- *   - section nav click → selectRubricsSection(id) — flips the
- *     tabpanel visibility and re-renders.
+ *     rubric and repaints every section body.
  *
  * IPC contract is fully owned by main; the renderer never touches fs.
  * Active-rubric switch is gated server-side (returns
@@ -6349,19 +6352,20 @@ const rubricsLibraryHintEl = document.getElementById('rubricsLibraryHint');
 const rubricsEditorEl = document.getElementById('rubricsEditor');
 const rubricsEmptyStateEl = document.getElementById('rubricsEmptyState');
 const rubricsSaveBarEl = document.getElementById('rubricsSaveBar');
-const rubricsSectionBtnEls = rubricsTabRootEl
-  ? Array.from(rubricsTabRootEl.querySelectorAll('.rubrics-tab__section-btn'))
-  : [];
-const rubricsSectionPanelEls = rubricsTabRootEl
-  ? Array.from(rubricsTabRootEl.querySelectorAll('.rubrics-tab__section'))
-  : [];
-const rubricsSectionElById = {
-  meta: document.getElementById('rubricsSectionMeta'),
-  prompts: document.getElementById('rubricsSectionPrompts'),
-  pillars: document.getElementById('rubricsSectionPillars'),
-  items: document.getElementById('rubricsSectionItems'),
-  fields: document.getElementById('rubricsSectionFields'),
-  flags: document.getElementById('rubricsSectionFlags'),
+// Section bodies — keyed by their data-section value. Each is a
+// <div data-section-content="…"> inside a <details
+// class="rubrics-tab__section"> accordion. The renderer paints
+// every section eagerly on load (since multiple <details> may be
+// open simultaneously); the browser handles open/close itself.
+const rubricsSectionBodyEls = {
+  identity: rubricsTabRootEl?.querySelector('[data-section-content="identity"]') || null,
+  'voice-tone': rubricsTabRootEl?.querySelector('[data-section-content="voice-tone"]') || null,
+  pillars: rubricsTabRootEl?.querySelector('[data-section-content="pillars"]') || null,
+  items: rubricsTabRootEl?.querySelector('[data-section-content="items"]') || null,
+  fields: rubricsTabRootEl?.querySelector('[data-section-content="fields"]') || null,
+  flags: rubricsTabRootEl?.querySelector('[data-section-content="flags"]') || null,
+  scoring: rubricsTabRootEl?.querySelector('[data-section-content="scoring"]') || null,
+  'advanced-prompts': rubricsTabRootEl?.querySelector('[data-section-content="advanced-prompts"]') || null,
 };
 
 const rubricsTabState = {
@@ -6371,7 +6375,6 @@ const rubricsTabState = {
   activeId: null,
   selectedId: null, // rubric currently loaded into the editor
   currentRubric: null,
-  currentSection: 'meta',
   hintTimer: null, // delayed clear for transient success messages
 };
 
@@ -6461,7 +6464,7 @@ async function loadRubricIntoEditor(id) {
     }
     showRubricsEditor();
     renderRubricsLibraryBar();
-    renderCurrentRubricSection();
+    renderAllRubricSections();
   } catch (err) {
     setRubricsLibraryHint(
       'Failed to load rubric: ' + (err?.message || err),
@@ -6517,21 +6520,25 @@ function renderRubricsLibraryBar() {
   }
 }
 
-function renderCurrentRubricSection() {
-  const section = rubricsTabState.currentSection;
-  switch (section) {
-    case 'meta':    renderRubricsSectionMeta(); break;
-    case 'prompts': renderRubricsSectionPrompts(); break;
-    case 'pillars': renderRubricsSectionPillars(); break;
-    case 'items':   renderRubricsSectionItems(); break;
-    case 'fields':  renderRubricsSectionFields(); break;
-    case 'flags':   renderRubricsSectionFlags(); break;
-    default:        renderRubricsSectionMeta(); break;
-  }
+function renderAllRubricSections() {
+  // Paint every section eagerly. Multiple <details> can be open
+  // simultaneously (Identity is open by default; the rest collapse),
+  // so we don't have a single "current section" — every body needs
+  // its contents up to date the moment the rubric loads.
+  renderRubricsSectionIdentity();
+  renderRubricsSectionVoiceTone();
+  renderRubricsSectionPillars();
+  renderRubricsSectionItems();
+  renderRubricsSectionFields();
+  renderRubricsSectionFlags();
+  renderRubricsSectionScoring();
+  renderRubricsSectionAdvancedPrompts();
 }
 
-function renderRubricsSectionMeta() {
-  const el = rubricsSectionElById.meta;
+function renderRubricsSectionIdentity() {
+  // Plan name "Identity" replaces the working draft's "Overview" —
+  // semantically the same surface (name + description + ids + timestamps).
+  const el = rubricsSectionBodyEls.identity;
   const r = rubricsTabState.currentRubric;
   if (!el) return;
   el.innerHTML = '';
@@ -6547,8 +6554,12 @@ function renderRubricsSectionMeta() {
   el.appendChild(buildRubricsField('Last updated', formatRubricTimestamp(r.updatedAt)));
 }
 
-function renderRubricsSectionPrompts() {
-  const el = rubricsSectionElById.prompts;
+function renderRubricsSectionVoiceTone() {
+  // Plan §Task 9: just the voiceAndTone prompt block — top-level,
+  // user-facing. The coach + live system-instruction templates live
+  // in the separate Advanced — System prompts section so power-user
+  // surfaces stay collapsed-by-default.
+  const el = rubricsSectionBodyEls['voice-tone'];
   const r = rubricsTabState.currentRubric;
   if (!el) return;
   el.innerHTML = '';
@@ -6556,19 +6567,83 @@ function renderRubricsSectionPrompts() {
   const p = r.prompts || {};
   el.appendChild(buildRubricsTextBlock(
     'Voice & tone',
-    'Optional prose appended to the Coach system instruction. Use this to nudge phrasing without rewriting the catalogue.',
+    'Optional. Appended to the AI coach\u2019s prompt under a \u201cVOICE & TONE OVERRIDE\u201d heading. Use it to set tone, style, or domain context (e.g. \u201cPlain English. No jargon. Be concise.\u201d).',
     p.voiceAndTone,
   ));
+}
+
+function renderRubricsSectionAdvancedPrompts() {
+  // Plan §Task 9: collapsed-by-default surface for coach + live
+  // system-instruction templates. Reset-to-default buttons land in
+  // the writeable pass (Task 9b) — read-only render here is just the
+  // current text. The warning banner above this section is hard-coded
+  // in index.html (it's static copy, not data-driven).
+  const el = rubricsSectionBodyEls['advanced-prompts'];
+  const r = rubricsTabState.currentRubric;
+  if (!el) return;
+  el.innerHTML = '';
+  if (!r) return;
+  const p = r.prompts || {};
   el.appendChild(buildRubricsTextBlock(
     'Coach system instruction (template)',
-    'Prose-only template — the catalogue blocks (pillars, items, fields, flags) are composed in at runtime.',
+    'Prose-only template. The runtime catalogue blocks (pillars, items, fields, flags) are composed in at concat time \u2014 storing only the prose means editing here can never desync the catalogue render.',
     p.coachSystemInstruction,
   ));
   el.appendChild(buildRubricsTextBlock(
     'Live system instruction (template)',
-    'Prose-only template for the live (flag-detection) Gemini session.',
+    'Prose-only template for the live (flag-detection) Gemini session. Same composer rules as the coach template above.',
     p.liveSystemInstruction,
   ));
+}
+
+function renderRubricsSectionScoring() {
+  // Plan §Task 9: read-only in v1. Static summary of how the rubric
+  // is scored, plus a preview of which pillars will appear in the
+  // post-call scorecard. We list `r.pillars` so the user can confirm
+  // their edits to Pillars are reflected here without saving first.
+  const el = rubricsSectionBodyEls.scoring;
+  const r = rubricsTabState.currentRubric;
+  if (!el) return;
+  el.innerHTML = '';
+  if (!r) return;
+  const intro = document.createElement('p');
+  intro.className = 'rubrics-tab__field-help';
+  intro.textContent =
+    'Each pillar is scored as % covered = (covered items) / (total items) × 100. '
+    + 'The post-call scorecard surfaces every non-synthetic pillar listed below. '
+    + 'Synthetic pillars (live signals, logged questions) are re-injected at runtime '
+    + 'and aren\u2019t editable here.';
+  el.appendChild(intro);
+
+  const heading = document.createElement('h6');
+  heading.className = 'rubrics-tab__field-label';
+  heading.textContent = 'Pillars in this rubric\u2019s scorecard';
+  el.appendChild(heading);
+
+  const list = document.createElement('ul');
+  list.className = 'rubrics-tab__scoring-list';
+  const pillars = Array.isArray(r.pillars) ? r.pillars : [];
+  if (pillars.length === 0) {
+    el.appendChild(buildRubricsPlaceholder('No pillars defined yet \u2014 add some in the Pillars section above.'));
+    return;
+  }
+  for (const p of pillars) {
+    const li = document.createElement('li');
+    li.className = 'rubrics-tab__scoring-list-item';
+    if (p.glyph || p.tint) {
+      const glyph = document.createElement('span');
+      glyph.className = 'rubrics-tab__pillar-swatch';
+      glyph.textContent = p.glyph || '\u2022';
+      glyph.setAttribute('aria-hidden', 'true');
+      if (p.tint) glyph.style.color = p.tint;
+      li.appendChild(glyph);
+    }
+    const label = document.createElement('span');
+    label.textContent = p.name || p.id || '(untitled)';
+    li.appendChild(label);
+    list.appendChild(li);
+  }
+  el.appendChild(list);
 }
 
 function renderRubricsSectionPillars() {
@@ -6576,7 +6651,7 @@ function renderRubricsSectionPillars() {
   // — no description field; the visual identity (glyph + tint) is the
   // documentation. Render those alongside the name so the editor view
   // matches what shows up in the rail.
-  const el = rubricsSectionElById.pillars;
+  const el = rubricsSectionBodyEls.pillars;
   const r = rubricsTabState.currentRubric;
   if (!el) return;
   el.innerHTML = '';
@@ -6626,7 +6701,7 @@ function renderRubricsSectionItems() {
   // suggestable }. `pillarId` is camelCase (NOT `pillar_id`); items
   // group naturally by pillarId because that's how the rail computes
   // per-pillar coverage.
-  const el = rubricsSectionElById.items;
+  const el = rubricsSectionBodyEls.items;
   const r = rubricsTabState.currentRubric;
   if (!el) return;
   el.innerHTML = '';
@@ -6694,7 +6769,7 @@ function renderRubricsSectionFields() {
   // Items are organised by `group` (Revenue / Team / Stack / Pain /
   // Buyer / Timeline / …); render with the same heading-per-group
   // pattern as items-by-pillar above.
-  const el = rubricsSectionElById.fields;
+  const el = rubricsSectionBodyEls.fields;
   const r = rubricsTabState.currentRubric;
   if (!el) return;
   el.innerHTML = '';
@@ -6749,7 +6824,7 @@ function renderRubricsSectionFlags() {
   // detection rule. Render severity + when as a chip-style meta line
   // because those are the two filterable dimensions a user looks at
   // when scanning the catalogue.
-  const el = rubricsSectionElById.flags;
+  const el = rubricsSectionBodyEls.flags;
   const r = rubricsTabState.currentRubric;
   if (!el) return;
   el.innerHTML = '';
@@ -6853,21 +6928,6 @@ function formatRubricTimestamp(value) {
   return d.toLocaleString();
 }
 
-function selectRubricsSection(sectionId) {
-  if (!sectionId) return;
-  if (!rubricsSectionElById[sectionId]) return;
-  rubricsTabState.currentSection = sectionId;
-  for (const btn of rubricsSectionBtnEls) {
-    const isActive = btn.dataset.section === sectionId;
-    btn.setAttribute('aria-selected', String(isActive));
-  }
-  for (const sec of rubricsSectionPanelEls) {
-    const isActive = sec.dataset.sectionContent === sectionId;
-    sec.hidden = !isActive;
-  }
-  renderCurrentRubricSection();
-}
-
 async function handleSetActiveRubric() {
   const id = rubricsTabState.selectedId;
   if (!id) return;
@@ -6961,13 +7021,6 @@ if (rubricsLibrarySelectEl) {
 
 if (rubricsBtnSetActiveEl) {
   rubricsBtnSetActiveEl.addEventListener('click', handleSetActiveRubric);
-}
-
-for (const btn of rubricsSectionBtnEls) {
-  btn.addEventListener('click', () => {
-    const sid = btn.dataset.section;
-    if (sid) selectRubricsSection(sid);
-  });
 }
 
 // Subscribe to main's rubrics:changed broadcast so any out-of-band
