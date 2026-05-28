@@ -262,6 +262,8 @@ import { getProvider } from './providers/index.js';
 import * as rubricStore from './rubric-store.js';
 import { applyRubric } from './rubric.js';
 import { DEFAULT_RUBRIC } from './rubric-defaults.js';
+import * as errorLog from './error-log.js';
+import * as errorLogFlush from './error-log-flush.js';
 import {
   appendSession,
   listSessions,
@@ -2084,6 +2086,13 @@ const createWindow = () => {
   });
 
   mainWindowRef = mainWindow;
+  // Wire the error-log module to broadcast through the same send()
+  // helper as every other main → renderer push. registerSender is
+  // safe to call any time after the function is declared (it captures
+  // `send` by reference, not value), but hooking it inside
+  // createWindow() keeps the lifecycle obvious — the broadcast goes
+  // to whatever mainWindow lives now.
+  errorLog.registerSender(send);
   return mainWindow;
 };
 
@@ -3031,14 +3040,46 @@ function registerIpcHandlers() {
       if (!apiKey) {
         return { ok: false, message: 'No API key configured.' };
       }
+      // source: 'provider-test' tags the entry the wrapper at
+      // src/providers/index.js will append when testConnection
+      // returns { ok: false }. provider-test entries appear in
+      // the live Error Log tab but are excluded from per-call
+      // .jsonl flushes (the markCallStart/Stop window doesn't
+      // cover the test button — see invariant #5 in error-log.js).
       const inst = getProvider(provider, {
         apiKey,
         model: getDefaultModelForProvider(provider),
+        source: 'provider-test',
       });
       const result = await inst.testConnection();
       return result;
     } catch (err) {
       return { ok: false, message: err?.message || String(err) };
+    }
+  });
+
+  /* ── Settings → Error Log tab (Wave 3 feature/error-log) ─────────
+   *
+   * Three invoke channels for the renderer-side Error Log UI:
+   *   logs:load          → snapshot of the in-memory ring (newest-first)
+   *   logs:clear         → empty the ring (on-disk .jsonl files
+   *                        untouched — they outlive the session)
+   *   logs:reveal-folder → ensure <userData>/error-logs/ exists,
+   *                        then shell.openPath() it. Works even on
+   *                        a fresh install where no error has fired.
+   *
+   * Live push of new entries goes through the existing send()
+   * helper via errorLog.registerSender(send) (wired in
+   * createWindow above) and emerges as the 'logs:entry' channel
+   * declared in src/preload.js's RENDERER_EVENTS list.
+   * ──────────────────────────────────────────────────────────────── */
+  ipcMain.handle('logs:load', (_event, opts) => errorLog.getAll(opts || {}));
+  ipcMain.handle('logs:clear', () => errorLog.clear());
+  ipcMain.handle('logs:reveal-folder', async () => {
+    try {
+      await errorLogFlush.revealFolder();
+    } catch (err) {
+      console.warn('[logs] reveal-folder failed:', err?.message || err);
     }
   });
 
@@ -3212,6 +3253,13 @@ function registerIpcHandlers() {
     await teardownSession();
     resetCoachContext();
     sessionStartedAt = Date.now();
+    // Open the error-log call window. Entries appended between this
+    // marker and the markCallStop() in gemini:stop's summary chain
+    // are eligible for the per-call .jsonl flush. Out-of-call entries
+    // (provider-test, errors during teardown, etc.) still appear in
+    // the live Error Log tab but are excluded by the window filter
+    // in src/error-log-flush.js.
+    errorLog.markCallStart();
 
     // ── Deepgram first ──────────────────────────────────────────────
     // Open the dual-channel STT session BEFORE Gemini Live so that by
@@ -3302,6 +3350,7 @@ function registerIpcHandlers() {
     const coachProvider = getProvider(coachProviderName, {
       apiKey: coachApiKey,
       model: getDefaultModelForProvider(coachProviderName),
+      source: 'coach',
     });
     coachSession = new Coach({
       provider: coachProvider,
@@ -3691,8 +3740,17 @@ function registerIpcHandlers() {
       ? getProvider('gemini', {
           apiKey: summaryApiKey,
           model: getModelFor('summary'),
+          source: 'summary',
         })
       : null;
+
+    // Capture the error-log call window NOW so a mid-summary re-Start
+    // can't reassign callStartedAt before the flush reads it. The
+    // window snapshot is { startedAt, stoppedAt } where stoppedAt is
+    // the moment of markCallStop; entries appended after this point
+    // (e.g. from a new call) are excluded by the window filter in
+    // src/error-log-flush.js regardless of how the ring evolves.
+    const errorLogWindow = errorLog.markCallStop();
 
     generateSummary({
       provider: summaryProvider,
@@ -3736,6 +3794,26 @@ function registerIpcHandlers() {
           startedAt: sessionStartedAtSnapshot,
           durationMs,
         });
+      })
+      .finally(() => {
+        // Flush the error-log ring entries that fell inside the call's
+        // [startedAt, stoppedAt] window to <userData>/error-logs/
+        // error-log-<ISO>.jsonl. .finally() ensures we capture summary
+        // errors (which fire in the .catch above) BEFORE writing the
+        // file — the plan's wording "after summary scheduling" is
+        // implemented as "after summary completion" so summary
+        // failures actually land in the artefact.
+        //
+        // flushCallToFile returns null when zero entries fall in the
+        // window (the happy path), so no empty file clutters the
+        // folder on a clean call. The captured `errorLogWindow`
+        // (rather than errorLog.getCallWindow()) is intentional —
+        // see the snapshot comment above.
+        try {
+          errorLogFlush.flushCallToFile(errorLogWindow, errorLog.getEntries());
+        } catch (err) {
+          console.warn('[error-log] flush failed:', err?.message || err);
+        }
       });
 
     return { ok: true };
