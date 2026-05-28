@@ -3472,13 +3472,16 @@ a,
   user-select: text;
   /* Widened 520 → 720 → 1120 to host the redesigned Rubrics editor's
    * two-column (section-nav rail + panel) layout and to give the dense
-   * Providers / Rubrics tabs real room to breathe. Narrower overlay
-   * windows still clamp via calc(100% - 24px) so the modal never
-   * overflows the frame; the .settings-modal__tabs scroll affordance
-   * below picks up the slack for the tiny case, and the Rubrics editor
-   * collapses its nav rail to a horizontal strip under ~760px. */
-  width: min(1120px, calc(100% - 24px));
-  max-height: calc(100% - 24px);
+   * Providers / Rubrics tabs real room to breathe. The 48px inset (was
+   * 24px) keeps a clear gap between the modal and the overlay window's
+   * edges on all four sides so the chrome doesn't feel jammed into the
+   * corners. Narrower overlay windows still clamp via calc(100% - 48px)
+   * so the modal never overflows the frame; the .settings-modal__tabs
+   * scroll affordance below picks up the slack for the tiny case, and
+   * the Rubrics editor collapses its nav rail to a horizontal strip
+   * under ~760px. */
+  width: min(1120px, calc(100% - 48px));
+  max-height: calc(100% - 48px);
   display: flex;
   flex-direction: column;
   background: var(--bg-card);
@@ -5014,8 +5017,8 @@ a,
    * the accordion editor below — the Rubrics tab is dense enough
    * that every pixel of vertical room counts on a short coach
    * overlay window. */
-  gap: 8px;
-  padding: 10px 18px;
+  gap: 10px;
+  padding: 16px 22px;
   border-bottom: 1px solid var(--border-soft);
   background: rgba(255, 255, 255, 0.02);
 }
@@ -5267,8 +5270,8 @@ a,
 .rubrics-tab__nav {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 14px 10px;
+  gap: 3px;
+  padding: 18px 14px;
   min-height: 0;
   overflow-y: auto;
   border-right: 1px solid var(--border-soft);
