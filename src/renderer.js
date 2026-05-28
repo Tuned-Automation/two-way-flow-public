@@ -51,6 +51,59 @@ function persistCoachMode(mode) {
   try { localStorage.setItem(COACH_MODE_LS_KEY, mode); } catch { /* private mode */ }
 }
 
+/* ─── Header collapse state (separate from 'twf.layout.v1') ──────────
+ * Persists whether the user wants the top toolbar hidden between
+ * launches. Kept out of 'twf.layout.v1' so it can be reasoned about
+ * (and migrated / rolled back) independently of the pane-sizing schema.
+ *
+ * Shape:
+ *   {
+ *     "collapsed":     boolean,   // user wants chrome hidden
+ *     "pinned":        boolean,   // when true and collapsed=false, the
+ *                                 //   header stays open and ignores
+ *                                 //   the hover-leave auto-collapse
+ *                                 //   timer. Default true (no auto-
+ *                                 //   collapse for first-launch users).
+ *     "schemaVersion": 1
+ *   }
+ *
+ * Reads tolerate missing/corrupt values and fall back to
+ * { collapsed: false, pinned: true }. Writes are fire-and-forget;
+ * a private-mode localStorage failure falls back silently.
+ * ─────────────────────────────────────────────────────────────────── */
+const HEADER_STATE_LS_KEY = 'twf.header.v1';
+const HEADER_STATE_DEFAULT = Object.freeze({
+  collapsed: false,
+  pinned: true,
+  schemaVersion: 1,
+});
+
+function loadHeaderState() {
+  try {
+    const raw = localStorage.getItem(HEADER_STATE_LS_KEY);
+    if (!raw) return { ...HEADER_STATE_DEFAULT };
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && parsed.schemaVersion === 1) {
+      return {
+        collapsed: parsed.collapsed === true,
+        pinned: parsed.pinned !== false,
+        schemaVersion: 1,
+      };
+    }
+  } catch { /* corrupt JSON or private mode */ }
+  return { ...HEADER_STATE_DEFAULT };
+}
+
+function persistHeaderState(next) {
+  try {
+    localStorage.setItem(HEADER_STATE_LS_KEY, JSON.stringify({
+      collapsed: next.collapsed === true,
+      pinned: next.pinned !== false,
+      schemaVersion: 1,
+    }));
+  } catch { /* private mode */ }
+}
+
 /** Set of sentinel item ids the coach can emit for non-rubric
  *  suggestions. Currently only 'freeform.deeper' (Deeper-kind asks
  *  whose natural follow-up doesn't map to any rubric item). The
@@ -112,6 +165,14 @@ const versionBadgeEl = document.getElementById('versionBadge');
 const recToggleEl = document.getElementById('recToggle');
 const minButtonEl = document.getElementById('minButton');
 const closeButtonEl = document.getElementById('closeButton');
+/* Header-collapse feature (see plan: 2026-05-27-collapsible-top-toolbar.md).
+ * These refs are null until Task 2 lands the matching DOM nodes; every
+ * use guards with `if (el)`. */
+const coachRevealStripEl = document.getElementById('coachRevealStrip');
+const coachGhostPillEl = document.getElementById('coachGhostPill');
+const coachMiniMinButtonEl = document.getElementById('coachMiniMinButton');
+const coachMiniCloseButtonEl = document.getElementById('coachMiniCloseButton');
+const headerCollapseBtnEl = document.getElementById('headerCollapseBtn');
 const railEl = document.getElementById('pillarRail');
 const transcriptPaneEl = document.getElementById('transcriptPane');
 const transcriptListEl = document.getElementById('transcriptList');
@@ -942,6 +1003,17 @@ const state = {
    *  (default 'signalled'); updated by the header toggle. Forwarded to
    *  main on session start AND on every flip. */
   coachMode: readSavedCoachMode(),
+
+  /* Header collapse state (see 'twf.header.v1' schema doc-block above).
+   *   headerCollapsed  — current visible state, mirrors persisted value
+   *   headerPinned     — disables auto-collapse-on-mouseleave when true
+   *   headerRevealing  — transient: hover-revealed while collapsed
+   *   headerRevealTimer — setTimeout handle for the leave-grace period
+   */
+  headerCollapsed: false,
+  headerPinned: true,
+  headerRevealing: false,
+  headerRevealTimer: null,
 
   /**
    * "Cover remaining" queue. Active when the seller clicks the
