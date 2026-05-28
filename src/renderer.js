@@ -323,6 +323,55 @@ const appearanceResetBtnEl = document.getElementById('appearanceResetBtn');
 const DEFAULT_TAG_YOU = '#f0f0f0';
 const DEFAULT_TAG_OTHER = '#c7d2fe';
 
+/* ── Per-surface transparency editor (Appearance tab) ──────────────
+ *
+ * Four controllable overlay surfaces, each with three numeric
+ * alpha channels (outline / body / text) backed by a CSS variable
+ * (--surface-<surface>-<channel>-alpha) consumed by src/index.css's
+ * color-mix(...) rules. Sliders drive CSS vars synchronously for
+ * live preview and queue a 200 ms debounced settings.save into
+ * appearance.transparency.* for persistence.
+ *
+ * DEFAULT_TRANSPARENCY MUST stay in sync with
+ * DEFAULT_SETTINGS.appearance.transparency in src/settings.js. The
+ * renderer reads these for the Reset Surface button so the user
+ * doesn't pay an IPC roundtrip for "snap this surface back to
+ * default" — values are identical to what main would write anyway.
+ */
+const TRANSPARENCY_SURFACES = ['coach', 'transcript', 'captured', 'suggestion'];
+const TRANSPARENCY_CHANNELS = ['outline', 'body', 'text'];
+const DEFAULT_TRANSPARENCY = {
+  coach:      { outline: 0,    body: 0.9,  text: 0.94 },
+  transcript: { outline: 0.08, body: 0.03, text: 0.94 },
+  captured:   { outline: 0.08, body: 0.03, text: 0.66 },
+  suggestion: { outline: 0.08, body: 0.10, text: 0.94 },
+};
+const DEFAULT_TRANSPARENCY_PRESETS = {
+  slot1: { name: 'Day' },
+  slot2: { name: 'Night' },
+  slot3: { name: 'Demo' },
+};
+
+const transparencySurfaceEl = document.getElementById('transparencySurface');
+const transparencyPreviewBtnEl = document.getElementById('transparencyPreviewBtn');
+const transparencyResetSurfaceEl = document.getElementById('transparencyResetSurface');
+const transparencySliderEls = {
+  outline: document.getElementById('transparencyOutline'),
+  body: document.getElementById('transparencyBody'),
+  text: document.getElementById('transparencyText'),
+};
+const transparencyValueEls = {
+  outline: document.getElementById('transparencyOutlineValue'),
+  body: document.getElementById('transparencyBodyValue'),
+  text: document.getElementById('transparencyTextValue'),
+};
+const transparencyPresetEls = Array.from(
+  document.querySelectorAll('.transparency-preset[data-preset-slot]'),
+);
+/** Track whether the preview window is currently open. Toggled
+ *  optimistically on Open / Close clicks; reset on IPC failure. */
+let transparencyPreviewOpen = false;
+
 /* ── Layout persistence (v3 — resizable panes) ────────────────────
  *
  * Per-device display preference, NOT exportable settings — a wide-
@@ -3796,6 +3845,15 @@ window.gemini.onSettingsChanged?.((payload) => {
   // path we didn't fire ourselves (e.g. a different window-instance
   // edit in a future multi-window build, or a wholesale import).
   applyAecBadgeVisibility(payload?.audio);
+  // Per-surface transparency. Apply CSS vars on every broadcast so a
+  // preset Load (from any window, or a future import) re-skins the
+  // main overlay live. We DON'T re-hydrate the slider thumbs here —
+  // the user may be mid-drag on a slider, and snapping the thumb
+  // back to the broadcast value would feel like a fight against the
+  // input. The sliders re-hydrate explicitly via the surface
+  // dropdown's change handler and on Reset / Import via
+  // applySettingsToForm().
+  applyTransparencyBlock(payload?.appearance?.transparency);
   // Coach toggle flip mid-call also affects the pinned card's
   // asked-flip styling (gated on trackQuestionState). Repaint so a
   // toggle change immediately neutralises or re-greens the card.
@@ -4331,6 +4389,15 @@ function applySettingsToForm(settings) {
   if (appearanceColorOtherEl instanceof HTMLInputElement) appearanceColorOtherEl.value = otherVal;
   applyTagColors({ you: youVal, other: otherVal });
 
+  // Appearance tab — per-surface transparency. Apply all twelve CSS
+  // vars (so the main overlay re-skins on Reset / Import) and
+  // hydrate the editor's sliders + preset cards. Sliders show
+  // values for whichever surface the dropdown currently points at;
+  // a fresh boot points at 'coach' by default.
+  applyTransparencyBlock(settings.appearance?.transparency || DEFAULT_TRANSPARENCY);
+  hydrateTransparencySliders(settings.appearance?.transparency || DEFAULT_TRANSPARENCY);
+  hydrateTransparencyPresetCards(settings.appearance?.transparencyPresets);
+
   applyCoachToForm(settings.coach);
   applyAudioToForm(settings.audio);
 }
@@ -4502,6 +4569,89 @@ function applyTagColors({ you, other }) {
   if (other) root.style.setProperty('--speaker-color-other', other);
 }
 
+/**
+ * Apply a single per-surface alpha channel onto :root as an inline
+ * CSS variable. Called from every slider `input` event (synchronous,
+ * for instant live preview) and from preset-load / reset flows.
+ *
+ * Value is clamped to [0, 1] defensively — color-mix() handles
+ * out-of-range percentages gracefully but we want the persisted
+ * settings / slider UI / live CSS to all agree on the same number.
+ */
+function applySurfaceTransparency(surface, channel, value) {
+  if (!TRANSPARENCY_SURFACES.includes(surface)) return;
+  if (!TRANSPARENCY_CHANNELS.includes(channel)) return;
+  if (typeof value !== 'number' || Number.isNaN(value)) return;
+  const clamped = Math.max(0, Math.min(1, value));
+  document.documentElement.style.setProperty(
+    `--surface-${surface}-${channel}-alpha`,
+    String(clamped),
+  );
+}
+
+/**
+ * Bulk-apply an `appearance.transparency` block onto :root. Used by
+ * the initial-render path, the onSettingsChanged subscriber, and
+ * the preset Load handler. Missing surfaces / channels are skipped
+ * — the :root defaults in src/index.css then carry their own
+ * fallback values.
+ */
+function applyTransparencyBlock(transparencyBlock) {
+  if (!transparencyBlock || typeof transparencyBlock !== 'object') return;
+  for (const surface of TRANSPARENCY_SURFACES) {
+    const surfaceBlock = transparencyBlock[surface];
+    if (!surfaceBlock || typeof surfaceBlock !== 'object') continue;
+    for (const channel of TRANSPARENCY_CHANNELS) {
+      applySurfaceTransparency(surface, channel, surfaceBlock[channel]);
+    }
+  }
+}
+
+/**
+ * Hydrate the three slider inputs + percentage badges for the
+ * currently-selected surface from the supplied transparency block.
+ * Falls back to DEFAULT_TRANSPARENCY for missing values so the
+ * sliders always show a valid 0–100 integer (instead of an empty
+ * NaN-driven thumb position).
+ */
+function hydrateTransparencySliders(transparencyBlock) {
+  if (!(transparencySurfaceEl instanceof HTMLSelectElement)) return;
+  const surface = transparencySurfaceEl.value;
+  if (!TRANSPARENCY_SURFACES.includes(surface)) return;
+  const surfaceBlock = (transparencyBlock && transparencyBlock[surface]) || {};
+  const defaults = DEFAULT_TRANSPARENCY[surface] || { outline: 0, body: 0, text: 0 };
+  for (const channel of TRANSPARENCY_CHANNELS) {
+    const raw = typeof surfaceBlock[channel] === 'number'
+      ? surfaceBlock[channel]
+      : defaults[channel];
+    const pct = Math.round(Math.max(0, Math.min(1, raw)) * 100);
+    const slider = transparencySliderEls[channel];
+    if (slider instanceof HTMLInputElement) slider.value = String(pct);
+    const badge = transparencyValueEls[channel];
+    if (badge instanceof HTMLElement) badge.textContent = `${pct}%`;
+  }
+}
+
+/**
+ * Hydrate the three preset slot cards' name inputs from a
+ * transparencyPresets block. Falls back to the DEFAULT_TRANSPARENCY_PRESETS
+ * labels ('Day' / 'Night' / 'Demo') so an empty / missing block
+ * still shows readable placeholders rather than empty fields.
+ */
+function hydrateTransparencyPresetCards(presetsBlock) {
+  for (const card of transparencyPresetEls) {
+    const slot = card.dataset.presetSlot;
+    if (!slot) continue;
+    const nameInput = card.querySelector('.transparency-preset__name');
+    if (!(nameInput instanceof HTMLInputElement)) continue;
+    const persistedName = presetsBlock?.[slot]?.name;
+    const fallbackName = DEFAULT_TRANSPARENCY_PRESETS[slot]?.name || `Preset ${slot.slice(-1)}`;
+    nameInput.value = typeof persistedName === 'string' && persistedName.length > 0
+      ? persistedName
+      : fallbackName;
+  }
+}
+
 /** Update the .provider-card__status badge + Test button label for a
  *  single card based on the current settings + env-var snapshot. */
 function refreshProviderStatusBadge(card, settings, envAvail) {
@@ -4625,9 +4775,12 @@ function closeSettingsModal() {
   // Force-flush any pending debounced key edits so closing the dialog
   // mid-typing doesn't drop the user's input. Same protection for the
   // appearance debounce — colour pickers can fire `input` right before
-  // the user hits Esc.
+  // the user hits Esc. The transparency editor has two debounce paths
+  // (sliders + preset-name typing) so both get flushed here too.
   for (const provider of PROVIDER_IDS) flushPendingKeySave(provider);
   flushAppearanceSave();
+  flushTransparencySave();
+  flushTransparencyPresetNameSaves();
   try { settingsModalEl.close(); } catch { /* not open */ }
 }
 
@@ -5385,6 +5538,265 @@ if (appearanceResetBtnEl) {
       appearance: { tagColors: { you: DEFAULT_TAG_YOU, other: DEFAULT_TAG_OTHER } },
     });
   });
+}
+
+/* ── Transparency editor wiring ────────────────────────────────────
+ *
+ * Mirror of the speaker-label wiring above for the per-surface alpha
+ * sliders + preset cards. Two debounce paths:
+ *
+ *   - queueTransparencySave (200 ms, like queueAppearanceSave) for
+ *     slider edits. Merges multiple channel changes for the same
+ *     surface so a rapid outline-then-body nudge results in a single
+ *     IPC roundtrip.
+ *
+ *   - queueTransparencyPresetNameSave (400 ms, longer than the
+ *     slider debounce — the user TYPES into the preset name input,
+ *     so we want to wait for them to stop) for preset label edits.
+ *
+ * The Reset Surface, preset Load, and preset Save Current paths all
+ * skip the debounce and fire pushSettingsPartial directly — these
+ * are click events with clear "do it now" intent.
+ */
+const TRANSPARENCY_IDLE_SAVE_MS = 200;
+const TRANSPARENCY_PRESET_NAME_IDLE_SAVE_MS = 400;
+let transparencySaveTimer = null;
+/** Pending partial keyed by surface — `{ coach: { body: 0.7 }, ... }`.
+ *  Lets a fast slider-then-surface-switch land all queued edits in a
+ *  single save instead of dropping the earlier surface. */
+let transparencyPendingPartial = null;
+
+function queueTransparencySave(surface, partial) {
+  if (!TRANSPARENCY_SURFACES.includes(surface)) return;
+  transparencyPendingPartial = transparencyPendingPartial || {};
+  transparencyPendingPartial[surface] = {
+    ...(transparencyPendingPartial[surface] || {}),
+    ...partial,
+  };
+  clearTimeout(transparencySaveTimer);
+  transparencySaveTimer = setTimeout(() => {
+    const next = transparencyPendingPartial;
+    transparencyPendingPartial = null;
+    transparencySaveTimer = null;
+    pushSettingsPartial({ appearance: { transparency: next } });
+  }, TRANSPARENCY_IDLE_SAVE_MS);
+}
+
+function flushTransparencySave() {
+  if (transparencySaveTimer) {
+    clearTimeout(transparencySaveTimer);
+    transparencySaveTimer = null;
+  }
+  const next = transparencyPendingPartial;
+  transparencyPendingPartial = null;
+  if (!next) return Promise.resolve();
+  return pushSettingsPartial({ appearance: { transparency: next } });
+}
+
+/** Per-slot debounce timers for preset name edits. Map of slot -> timer. */
+const transparencyPresetNameTimers = new Map();
+function queueTransparencyPresetNameSave(slot, name) {
+  if (!slot) return;
+  const existing = transparencyPresetNameTimers.get(slot);
+  if (existing) clearTimeout(existing);
+  transparencyPresetNameTimers.set(
+    slot,
+    setTimeout(() => {
+      transparencyPresetNameTimers.delete(slot);
+      pushSettingsPartial({
+        appearance: { transparencyPresets: { [slot]: { name } } },
+      });
+    }, TRANSPARENCY_PRESET_NAME_IDLE_SAVE_MS),
+  );
+}
+
+function flushTransparencyPresetNameSaves() {
+  // Called from closeSettingsModal — if the user typed into a name
+  // input and immediately Esc'd, we want the pending typing to
+  // persist instead of getting lost on the next modal open.
+  for (const [slot, timer] of transparencyPresetNameTimers.entries()) {
+    clearTimeout(timer);
+    const card = transparencyPresetEls.find((c) => c.dataset.presetSlot === slot);
+    if (!card) continue;
+    const nameInput = card.querySelector('.transparency-preset__name');
+    if (!(nameInput instanceof HTMLInputElement)) continue;
+    pushSettingsPartial({
+      appearance: { transparencyPresets: { [slot]: { name: nameInput.value } } },
+    });
+  }
+  transparencyPresetNameTimers.clear();
+}
+
+/* Slider input handlers. Each slider stores its channel via
+ * data-channel, so a single handler covers all three. value is the
+ * integer 0–100 from the range input — we convert to 0.0–1.0 for the
+ * CSS var + the persisted settings, and keep the integer for the
+ * read-only percentage badge. */
+function wireTransparencySlider(slider) {
+  if (!(slider instanceof HTMLInputElement)) return;
+  const channel = slider.dataset.channel;
+  if (!TRANSPARENCY_CHANNELS.includes(channel)) return;
+  slider.addEventListener('input', () => {
+    if (!(transparencySurfaceEl instanceof HTMLSelectElement)) return;
+    const surface = transparencySurfaceEl.value;
+    if (!TRANSPARENCY_SURFACES.includes(surface)) return;
+    const pct = Math.max(0, Math.min(100, Number.parseInt(slider.value, 10) || 0));
+    const value = pct / 100;
+    applySurfaceTransparency(surface, channel, value);
+    const badge = transparencyValueEls[channel];
+    if (badge instanceof HTMLElement) badge.textContent = `${pct}%`;
+    queueTransparencySave(surface, { [channel]: value });
+    updateTransparencyHints(surface);
+  });
+}
+wireTransparencySlider(transparencySliderEls.outline);
+wireTransparencySlider(transparencySliderEls.body);
+wireTransparencySlider(transparencySliderEls.text);
+
+/* Low-alpha hint placeholder. Task 9 fills this with the real
+ * data-channel hint toggles; for now it's a no-op so the slider
+ * handler above can call it unconditionally without breaking.
+ * Defined here so the slider handler doesn't ReferenceError on
+ * first load — Task 9 replaces the body, not the signature. */
+function updateTransparencyHints(/* surface */) {
+  /* Filled in by Task 9. */
+}
+
+/* Surface dropdown — flush any pending debounce for the previous
+ * surface so the user's last edit lands BEFORE we switch, then
+ * re-hydrate the three sliders + badges from the new surface's
+ * current values in the cached settings. */
+if (transparencySurfaceEl instanceof HTMLSelectElement) {
+  transparencySurfaceEl.addEventListener('change', () => {
+    flushTransparencySave();
+    const block = settingsCache?.appearance?.transparency || DEFAULT_TRANSPARENCY;
+    hydrateTransparencySliders(block);
+    updateTransparencyHints(transparencySurfaceEl.value);
+  });
+}
+
+/* Open / Close preview button. Toggles aria-pressed + the visible
+ * label optimistically; on IPC failure we revert. The preview
+ * window's `closed` event in main.js also nulls previewWindowRef,
+ * but the renderer doesn't subscribe to that signal — if the user
+ * closes the preview from its own window chrome (Cmd+W) the button
+ * label will stay at "Close preview" until the next open click,
+ * which is fine: clicking it just re-opens the window. */
+function setTransparencyPreviewBtnState(open) {
+  transparencyPreviewOpen = open;
+  if (!(transparencyPreviewBtnEl instanceof HTMLButtonElement)) return;
+  transparencyPreviewBtnEl.textContent = open ? 'Close preview' : 'Open preview';
+  transparencyPreviewBtnEl.setAttribute('aria-pressed', String(open));
+}
+
+if (transparencyPreviewBtnEl instanceof HTMLButtonElement) {
+  transparencyPreviewBtnEl.addEventListener('click', async () => {
+    const targetOpen = !transparencyPreviewOpen;
+    transparencyPreviewBtnEl.disabled = true;
+    try {
+      if (targetOpen) {
+        await window.gemini.appearance?.openPreview?.();
+      } else {
+        await window.gemini.appearance?.closePreview?.();
+      }
+      setTransparencyPreviewBtnState(targetOpen);
+    } catch (err) {
+      console.warn('[transparency] preview toggle failed:', err?.message || err);
+    } finally {
+      transparencyPreviewBtnEl.disabled = false;
+    }
+  });
+}
+
+/* Reset Surface — restore DEFAULT_TRANSPARENCY for whichever
+ * surface the dropdown points at. Eager save (no debounce) so the
+ * user's intent is honoured immediately. */
+if (transparencyResetSurfaceEl instanceof HTMLButtonElement) {
+  transparencyResetSurfaceEl.addEventListener('click', () => {
+    if (!(transparencySurfaceEl instanceof HTMLSelectElement)) return;
+    const surface = transparencySurfaceEl.value;
+    if (!TRANSPARENCY_SURFACES.includes(surface)) return;
+    const defaults = DEFAULT_TRANSPARENCY[surface];
+    for (const channel of TRANSPARENCY_CHANNELS) {
+      applySurfaceTransparency(surface, channel, defaults[channel]);
+    }
+    // Cancel any pending debounce for this surface so the eager save
+    // below doesn't get clobbered by the deferred slider partial.
+    if (transparencyPendingPartial?.[surface]) {
+      delete transparencyPendingPartial[surface];
+      if (Object.keys(transparencyPendingPartial).length === 0) {
+        transparencyPendingPartial = null;
+        clearTimeout(transparencySaveTimer);
+        transparencySaveTimer = null;
+      }
+    }
+    hydrateTransparencySliders({ [surface]: defaults });
+    updateTransparencyHints(surface);
+    pushSettingsPartial({
+      appearance: { transparency: { [surface]: defaults } },
+    });
+  });
+}
+
+/* Preset Load — deep-merge slot.values into appearance.transparency
+ * via pushSettingsPartial, write the 12 CSS vars synchronously for
+ * instant feedback, re-hydrate the sliders for the current surface.
+ *
+ * Preset Save Current — snapshot the current appearance.transparency
+ * from the cache into slot.values. Single IPC.
+ *
+ * Preset name input — debounced 400 ms (longer than slider — user is
+ * typing). */
+for (const card of transparencyPresetEls) {
+  const slot = card.dataset.presetSlot;
+  if (!slot) continue;
+
+  const loadBtn = card.querySelector('.transparency-preset__load');
+  const saveBtn = card.querySelector('.transparency-preset__save');
+  const nameInput = card.querySelector('.transparency-preset__name');
+
+  if (loadBtn instanceof HTMLButtonElement) {
+    loadBtn.addEventListener('click', () => {
+      const slotBlock = settingsCache?.appearance?.transparencyPresets?.[slot];
+      const values = slotBlock?.values;
+      if (!values || typeof values !== 'object') {
+        console.warn(`[transparency] preset ${slot} has no values yet`);
+        return;
+      }
+      // Cancel any pending slider debounce — the user just blew away
+      // their in-flight edit by loading a preset.
+      clearTimeout(transparencySaveTimer);
+      transparencySaveTimer = null;
+      transparencyPendingPartial = null;
+      applyTransparencyBlock(values);
+      hydrateTransparencySliders(values);
+      if (transparencySurfaceEl instanceof HTMLSelectElement) {
+        updateTransparencyHints(transparencySurfaceEl.value);
+      }
+      pushSettingsPartial({ appearance: { transparency: values } });
+    });
+  }
+
+  if (saveBtn instanceof HTMLButtonElement) {
+    saveBtn.addEventListener('click', () => {
+      // Flush any pending slider debounce so the snapshot reflects
+      // the user's most recent edit, not the last-saved disk state.
+      flushTransparencySave();
+      const live = settingsCache?.appearance?.transparency || DEFAULT_TRANSPARENCY;
+      // Deep clone so subsequent edits to settingsCache don't
+      // mutate the persisted snapshot.
+      const snapshot = JSON.parse(JSON.stringify(live));
+      pushSettingsPartial({
+        appearance: { transparencyPresets: { [slot]: { values: snapshot } } },
+      });
+    });
+  }
+
+  if (nameInput instanceof HTMLInputElement) {
+    nameInput.addEventListener('input', () => {
+      queueTransparencyPresetNameSave(slot, nameInput.value);
+    });
+  }
 }
 
 /* ── General → Data subsection wiring (Phase 1) ──────────────────────
