@@ -728,11 +728,29 @@ let stalePendingTimer = null;
  *   'signalled' (default) — the coach NEVER auto-suggests. Suggestions
  *                           only come from the rep's explicit asks
  *                           (Suggest / Deeper / Pivot) or a skip.
- *   'automated'           — same as signalled, PLUS the pause detector
- *                           fires a `kind: 'pause'` request whenever
- *                           the transcript has been silent on both
- *                           channels for PAUSE_THRESHOLD_MS and there's
- *                           no currently-pinned suggestion.
+ *   'automated'           — same as signalled, PLUS the following
+ *                           automated triggers:
+ *                             • Kickstart — one-shot opening suggestion
+ *                               ~10s after session start. See
+ *                               `armKickstart()`.
+ *                             • Pause nudge — `kind: 'pause'` request
+ *                               whenever the transcript has been silent
+ *                               on both channels for PAUSE_THRESHOLD_MS
+ *                               and there's no currently-pinned
+ *                               suggestion. See `maybeFirePauseNudge()`.
+ *                             • Auto-reformulate — `kind: 'reformulate'`
+ *                               request every REFORMULATE_DELAY_MS while
+ *                               a pin stays unasked. Additionally gated
+ *                               on coach.trackQuestionState and
+ *                               coach.autoReformulate Advanced toggles.
+ *                               See `armReformulateTimer()`.
+ *                             • Auto-advance on green — `kind: 'next'`
+ *                               request the moment a pinned question
+ *                               flips to asked (either via the AI's
+ *                               mark_question_asked tool or the rep's
+ *                               manual tick button). See the
+ *                               onQuestionAsked callback and the
+ *                               coach:mark-suggestion-asked IPC handler.
  *
  * The mode is held here in main rather than on the Coach instance
  * because main owns the canonical transcript stream timing — the
@@ -3046,7 +3064,27 @@ function registerIpcHandlers() {
       },
       onQuestionAsked: ({ suggestionId, evidence }) => {
         const changed = applyMarkAsked({ suggestionId, evidence });
-        if (changed) broadcastSuggestionHistory();
+        if (!changed) return;
+        broadcastSuggestionHistory();
+        // Auto-advance-on-green: in Automated mode, fire a fresh
+        // 'next' the moment the model spots the seller asking a
+        // pinned question. The pin greens via the broadcast above,
+        // and the new suggestion lands within ~1 tick (~1.5s) so
+        // the rep has a follow-up ready before the prospect
+        // finishes answering. Signalled mode stays calm — see the
+        // coachMode doc-block above for the contract.
+        //
+        // Why no explicit markItemAsAsked() here (unlike the manual
+        // path): requestSuggestion() itself stamps the previous
+        // pin's itemId into skippedItemIds (see src/coach.js
+        // lines 553-555), and the AI typically pairs this call with
+        // update_item_state(covered) which also removes the item
+        // from the candidate pool. Either way, the next tick won't
+        // re-pin the same item.
+        if (coachMode === 'automated' && coachSession) {
+          cancelReformulateTimer();
+          coachSession.requestSuggestion({ kind: 'next' });
+        }
       },
       getSuggestionContext: () => {
         // The Coach asks for this on every tick — return an empty
@@ -3667,7 +3705,22 @@ function registerIpcHandlers() {
     const result = markSuggestionAskedManual({ suggestionId, source: 'manual_mark_asked' });
     if (result.unknown) return { ok: false, error: 'unknown_suggestion' };
     if (result.alreadyAsked) return { ok: true, alreadyAsked: true };
-    if (result.changed) broadcastSuggestionHistory();
+    if (result.changed) {
+      broadcastSuggestionHistory();
+      // Auto-advance-on-green: in Automated mode, mirror the AI
+      // path's behaviour so a manual tick also triggers a fresh
+      // next-kind suggestion. The rep has already touched the
+      // pin, so the explicit cleanup inside markSuggestionAskedManual
+      // (markItemAsAsked + 'logged' transition + skip-set stamp)
+      // has run before we get here. requestSuggestion is therefore
+      // safe to call without further bookkeeping.
+      //
+      // Signalled mode stays calm — same contract as Task 1.
+      if (coachMode === 'automated' && coachSession) {
+        cancelReformulateTimer();
+        coachSession.requestSuggestion({ kind: 'next' });
+      }
+    }
     return { ok: true };
   });
 
