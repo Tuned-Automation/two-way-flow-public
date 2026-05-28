@@ -7847,11 +7847,28 @@ const rubricsLibraryHintEl = document.getElementById('rubricsLibraryHint');
 const rubricsEditorEl = document.getElementById('rubricsEditor');
 const rubricsEmptyStateEl = document.getElementById('rubricsEmptyState');
 const rubricsSaveBarEl = document.getElementById('rubricsSaveBar');
+// Section nav rail + panel area (the redesigned editor layout). The
+// nav buttons swap which .rubrics-tab__panel-section is visible; the
+// section bodies inside each panel are still filled by the per-section
+// render functions via rubricsSectionBodyEls above.
+const rubricsNavEl = document.getElementById('rubricsNav');
+const rubricsPanelEl = document.getElementById('rubricsPanel');
+const rubricsNavItemEls = rubricsNavEl
+  ? Array.from(rubricsNavEl.querySelectorAll('.rubrics-tab__nav-item'))
+  : [];
+const rubricsPanelSectionEls = rubricsPanelEl
+  ? Array.from(rubricsPanelEl.querySelectorAll('.rubrics-tab__panel-section'))
+  : [];
+// The section currently shown in the panel. Persists across rubric
+// loads while the modal stays open so re-selecting a rubric doesn't
+// bounce the user back to Identity. Defaults to the section flagged
+// --active in index.html.
+let rubricsActiveSection = 'identity';
 // Section bodies — keyed by their data-section value. Each is a
-// <div data-section-content="…"> inside a <details
-// class="rubrics-tab__section"> accordion. The renderer paints
-// every section eagerly on load (since multiple <details> may be
-// open simultaneously); the browser handles open/close itself.
+// <div data-section-content="…"> inside a .rubrics-tab__panel-section
+// wrapper. The renderer paints every section eagerly on load; the
+// section-nav rail (selectRubricsSection) controls which panel is
+// visible at any moment.
 const rubricsSectionBodyEls = {
   identity: rubricsTabRootEl?.querySelector('[data-section-content="identity"]') || null,
   'voice-tone': rubricsTabRootEl?.querySelector('[data-section-content="voice-tone"]') || null,
@@ -8034,6 +8051,10 @@ function showRubricsEmptyState() {
 function showRubricsEditor() {
   if (rubricsEditorEl) rubricsEditorEl.hidden = false;
   if (rubricsEmptyStateEl) rubricsEmptyStateEl.hidden = true;
+  // Re-assert the visible panel section. Keeps the user on whatever
+  // section they last had open (rubricsActiveSection persists) across
+  // a rubric reload / save, instead of snapping back to Identity.
+  selectRubricsSection(rubricsActiveSection);
   // Save bar reveal is dirty-driven; clearRubricsDirty() already hid
   // it. markRubricsDirty() will reveal it on the first edit.
 }
@@ -8067,6 +8088,9 @@ function markRubricsDirty() {
   if (rubricsDirtyHintEl) rubricsDirtyHintEl.hidden = false;
   updateRubricsSaveButtonState();
   scheduleRubricsValidate();
+  // Add/delete handlers push/splice the array then call this before
+  // re-rendering, so the nav count badges stay in sync on every edit.
+  updateRubricsNavCounts();
 }
 
 function clearRubricsDirty() {
@@ -8193,25 +8217,56 @@ function buildRubricsValidationItem(issue, kind) {
   return li;
 }
 
-function jumpToRubricsSection(sectionId) {
-  // Find the matching <details> by data-section attribute; expand it
-  // if collapsed, then scroll it into view.
-  if (!rubricsTabRootEl) return;
-  const details = rubricsTabRootEl.querySelector(
-    `details.rubrics-tab__section[data-section="${cssEscape(sectionId)}"]`,
-  );
-  if (!details) return;
-  if (!details.open) details.open = true;
-  details.scrollIntoView({ behavior: 'smooth', block: 'start' });
+/* Show one editor section in the panel and light up its nav button.
+ * Replaces the old <details> open/close model — exactly one panel
+ * section is visible at a time, mirroring the mockup's section-nav +
+ * single-panel layout. Safe to call with an unknown key (no-op). */
+function selectRubricsSection(key) {
+  if (!key) return;
+  let matched = false;
+  for (const sec of rubricsPanelSectionEls) {
+    const on = sec.dataset.panel === key;
+    sec.hidden = !on;
+    if (on) matched = true;
+  }
+  if (!matched) return;
+  rubricsActiveSection = key;
+  for (const item of rubricsNavItemEls) {
+    const on = item.dataset.section === key;
+    item.classList.toggle('rubrics-tab__nav-item--active', on);
+    item.setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+  // Reset the panel scroll to the top so each section starts at its
+  // header rather than wherever the previous section was scrolled to.
+  if (rubricsPanelEl) rubricsPanelEl.scrollTop = 0;
 }
 
-function cssEscape(s) {
-  // Conservative CSS.escape polyfill — the section ids in this file
-  // are all simple slugs so this just guards against future changes.
-  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
-    return CSS.escape(s);
+/* Refresh the count badges on the Pillars / Items / Captured fields /
+ * Live flags nav items from the in-memory rubric. Cheap; called from
+ * every section renderer that can change a count. */
+function updateRubricsNavCounts() {
+  if (!rubricsNavEl) return;
+  const r = rubricsTabState.currentRubric;
+  const counts = {
+    pillars: r && Array.isArray(r.pillars) ? r.pillars.length : 0,
+    items: r && Array.isArray(r.items) ? r.items.length : 0,
+    fields: r && Array.isArray(r.capturedFields) ? r.capturedFields.length : 0,
+    flags: r && Array.isArray(r.flags) ? r.flags.length : 0,
+  };
+  for (const [key, n] of Object.entries(counts)) {
+    const badge = rubricsNavEl.querySelector(
+      `.rubrics-tab__nav-count[data-count="${key}"]`,
+    );
+    if (badge) badge.textContent = String(n);
   }
-  return String(s).replace(/[^\w-]/g, '\\$&');
+}
+
+function jumpToRubricsSection(sectionId) {
+  // Switch the panel to the matching section and scroll the panel to
+  // the top. Used by the validation banner's "Jump to section" links
+  // (when an issue carries a sectionId hint that matches a nav slug).
+  if (!sectionId) return;
+  selectRubricsSection(sectionId);
 }
 
 async function handleRubricsSave() {
@@ -8349,6 +8404,7 @@ function renderAllRubricSections() {
   renderRubricsSectionFlags();
   renderRubricsSectionScoring();
   renderRubricsSectionAdvancedPrompts();
+  updateRubricsNavCounts();
 }
 
 function renderRubricsSectionIdentity() {
@@ -9747,6 +9803,13 @@ async function hydrateRubricSwitcher() {
 if (rubricSwitcherEl) {
   rubricSwitcherEl.addEventListener('click', () => {
     openSettingsModal('rubrics');
+  });
+}
+
+// Section-nav rail: each button swaps which panel section is visible.
+for (const item of rubricsNavItemEls) {
+  item.addEventListener('click', () => {
+    selectRubricsSection(item.dataset.section);
   });
 }
 

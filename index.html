@@ -1717,131 +1717,269 @@
                 ></p>
               </div>
 
-              <!-- Editor. Each section is a native <details> accordion
-                   so the user can keep several sections expanded at
-                   once for cross-referencing (e.g. Pillars + Items
-                   side-by-side while building a new pillar). Identity
-                   opens by default; everything else collapsed by
-                   default. Advanced — System prompts is sticky-closed
-                   on every load because it's a power-user surface that
-                   should never be opened by mistake.
+              <!-- Editor. A two-column layout: a left section-nav rail
+                   (#rubricsNav) and a panel area (#rubricsPanel) that
+                   shows ONE section at a time. The renderer's
+                   selectRubricsSection() toggles `hidden` on the
+                   .rubrics-tab__panel-section wrappers and the
+                   --active class on the matching nav button.
 
-                   Section bodies are intentionally empty here — the
-                   renderer (Tasks 8 / 9) builds their contents from the
-                   loaded rubric so a future schema change doesn't
-                   require an index.html edit. The CSS task (Task 11)
-                   styles `details.rubrics-tab__section` as a rounded
-                   card with a hairline divider between the summary
-                   and the body. -->
+                   Section bodies (the [data-section-content] divs) are
+                   intentionally empty here — the renderer builds their
+                   contents from the loaded rubric so a future schema
+                   change doesn't require an index.html edit. Each panel
+                   carries a static header (title + description); the
+                   nav rail collapses to a horizontal strip under ~760px
+                   (see the rubrics CSS media query). -->
               <div
                 id="rubricsEditor"
                 class="rubrics-tab__editor"
                 hidden
               >
-                <details
-                  id="rubricsSectionIdentity"
-                  class="rubrics-tab__section"
-                  data-section="identity"
-                  open
+                <nav
+                  id="rubricsNav"
+                  class="rubrics-tab__nav"
+                  aria-label="Rubric sections"
                 >
-                  <summary class="rubrics-tab__section-summary">Identity</summary>
-                  <div
-                    class="rubrics-tab__section-body"
-                    data-section-content="identity"
-                  ></div>
-                </details>
-
-                <details
-                  id="rubricsSectionVoiceTone"
-                  class="rubrics-tab__section"
-                  data-section="voice-tone"
-                >
-                  <summary class="rubrics-tab__section-summary">Voice &amp; tone</summary>
-                  <div
-                    class="rubrics-tab__section-body"
-                    data-section-content="voice-tone"
-                  ></div>
-                </details>
-
-                <details
-                  id="rubricsSectionPillars"
-                  class="rubrics-tab__section"
-                  data-section="pillars"
-                >
-                  <summary class="rubrics-tab__section-summary">Pillars</summary>
-                  <div
-                    class="rubrics-tab__section-body"
-                    data-section-content="pillars"
-                  ></div>
-                </details>
-
-                <details
-                  id="rubricsSectionItems"
-                  class="rubrics-tab__section"
-                  data-section="items"
-                >
-                  <summary class="rubrics-tab__section-summary">Items</summary>
-                  <div
-                    class="rubrics-tab__section-body"
-                    data-section-content="items"
-                  ></div>
-                </details>
-
-                <details
-                  id="rubricsSectionFields"
-                  class="rubrics-tab__section"
-                  data-section="fields"
-                >
-                  <summary class="rubrics-tab__section-summary">Captured fields</summary>
-                  <div
-                    class="rubrics-tab__section-body"
-                    data-section-content="fields"
-                  ></div>
-                </details>
-
-                <details
-                  id="rubricsSectionFlags"
-                  class="rubrics-tab__section"
-                  data-section="flags"
-                >
-                  <summary class="rubrics-tab__section-summary">Live flags</summary>
-                  <div
-                    class="rubrics-tab__section-body"
-                    data-section-content="flags"
-                  ></div>
-                </details>
-
-                <details
-                  id="rubricsSectionScoring"
-                  class="rubrics-tab__section"
-                  data-section="scoring"
-                >
-                  <summary class="rubrics-tab__section-summary">Scoring</summary>
-                  <div
-                    class="rubrics-tab__section-body"
-                    data-section-content="scoring"
-                  ></div>
-                </details>
-
-                <details
-                  id="rubricsSectionAdvancedPrompts"
-                  class="rubrics-tab__section rubrics-tab__section--advanced"
-                  data-section="advanced-prompts"
-                >
-                  <summary class="rubrics-tab__section-summary">Advanced — System prompts</summary>
-                  <div
-                    class="rubrics-tab__warning rubrics-tab__warning--advanced"
-                    role="note"
+                  <span class="rubrics-tab__nav-head">Sections</span>
+                  <button
+                    type="button"
+                    class="rubrics-tab__nav-item rubrics-tab__nav-item--active"
+                    data-section="identity"
+                    aria-selected="true"
                   >
-                    These prompts drive the AI's behaviour. Only edit if
-                    you understand the existing instructions. Use
-                    <strong>Reset to default</strong> to restore.
-                  </div>
-                  <div
-                    class="rubrics-tab__section-body"
-                    data-section-content="advanced-prompts"
-                  ></div>
-                </details>
+                    <span class="rubrics-tab__nav-dot" aria-hidden="true"></span>
+                    <span class="rubrics-tab__nav-label">Identity</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="rubrics-tab__nav-item"
+                    data-section="voice-tone"
+                    aria-selected="false"
+                  >
+                    <span class="rubrics-tab__nav-dot" aria-hidden="true"></span>
+                    <span class="rubrics-tab__nav-label">Voice &amp; tone</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="rubrics-tab__nav-item"
+                    data-section="pillars"
+                    aria-selected="false"
+                  >
+                    <span class="rubrics-tab__nav-dot" aria-hidden="true"></span>
+                    <span class="rubrics-tab__nav-label">Pillars</span>
+                    <span class="rubrics-tab__nav-count" data-count="pillars"></span>
+                  </button>
+                  <button
+                    type="button"
+                    class="rubrics-tab__nav-item"
+                    data-section="items"
+                    aria-selected="false"
+                  >
+                    <span class="rubrics-tab__nav-dot" aria-hidden="true"></span>
+                    <span class="rubrics-tab__nav-label">Items</span>
+                    <span class="rubrics-tab__nav-count" data-count="items"></span>
+                  </button>
+                  <button
+                    type="button"
+                    class="rubrics-tab__nav-item"
+                    data-section="fields"
+                    aria-selected="false"
+                  >
+                    <span class="rubrics-tab__nav-dot" aria-hidden="true"></span>
+                    <span class="rubrics-tab__nav-label">Captured fields</span>
+                    <span class="rubrics-tab__nav-count" data-count="fields"></span>
+                  </button>
+                  <button
+                    type="button"
+                    class="rubrics-tab__nav-item"
+                    data-section="flags"
+                    aria-selected="false"
+                  >
+                    <span class="rubrics-tab__nav-dot" aria-hidden="true"></span>
+                    <span class="rubrics-tab__nav-label">Live flags</span>
+                    <span class="rubrics-tab__nav-count" data-count="flags"></span>
+                  </button>
+                  <button
+                    type="button"
+                    class="rubrics-tab__nav-item"
+                    data-section="scoring"
+                    aria-selected="false"
+                  >
+                    <span class="rubrics-tab__nav-dot" aria-hidden="true"></span>
+                    <span class="rubrics-tab__nav-label">Scoring</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="rubrics-tab__nav-item rubrics-tab__nav-item--advanced"
+                    data-section="advanced-prompts"
+                    aria-selected="false"
+                  >
+                    <span class="rubrics-tab__nav-dot" aria-hidden="true"></span>
+                    <span class="rubrics-tab__nav-label">Advanced</span>
+                  </button>
+                </nav>
+
+                <div id="rubricsPanel" class="rubrics-tab__panel">
+                  <section
+                    class="rubrics-tab__panel-section"
+                    data-panel="identity"
+                  >
+                    <header class="rubrics-tab__panel-head">
+                      <h3 class="rubrics-tab__panel-title">Identity</h3>
+                      <p class="rubrics-tab__panel-desc">
+                        Name and describe this rubric so it's easy to find
+                        in the library and clear what kind of call it's
+                        built for.
+                      </p>
+                    </header>
+                    <div
+                      class="rubrics-tab__section-body"
+                      data-section-content="identity"
+                    ></div>
+                  </section>
+
+                  <section
+                    class="rubrics-tab__panel-section"
+                    data-panel="voice-tone"
+                    hidden
+                  >
+                    <header class="rubrics-tab__panel-head">
+                      <h3 class="rubrics-tab__panel-title">Voice &amp; tone</h3>
+                      <p class="rubrics-tab__panel-desc">
+                        An optional style note appended to the coach's
+                        prompt — set tone, plain-language rules, or domain
+                        context the AI should follow mid-call.
+                      </p>
+                    </header>
+                    <div
+                      class="rubrics-tab__section-body"
+                      data-section-content="voice-tone"
+                    ></div>
+                  </section>
+
+                  <section
+                    class="rubrics-tab__panel-section"
+                    data-panel="pillars"
+                    hidden
+                  >
+                    <header class="rubrics-tab__panel-head">
+                      <h3 class="rubrics-tab__panel-title">Pillars</h3>
+                      <p class="rubrics-tab__panel-desc">
+                        The scoring categories shown in the live call rail.
+                        Reorder, rename, and set each pillar's glyph and
+                        tint.
+                      </p>
+                    </header>
+                    <div
+                      class="rubrics-tab__section-body"
+                      data-section-content="pillars"
+                    ></div>
+                  </section>
+
+                  <section
+                    class="rubrics-tab__panel-section"
+                    data-panel="items"
+                    hidden
+                  >
+                    <header class="rubrics-tab__panel-head">
+                      <h3 class="rubrics-tab__panel-title">Items</h3>
+                      <p class="rubrics-tab__panel-desc">
+                        The specific behaviours the coach listens for,
+                        grouped by pillar. The Suggestable flag controls
+                        whether the coach can surface an item as a
+                        next-question suggestion.
+                      </p>
+                    </header>
+                    <div
+                      class="rubrics-tab__section-body"
+                      data-section-content="items"
+                    ></div>
+                  </section>
+
+                  <section
+                    class="rubrics-tab__panel-section"
+                    data-panel="fields"
+                    hidden
+                  >
+                    <header class="rubrics-tab__panel-head">
+                      <h3 class="rubrics-tab__panel-title">Captured fields</h3>
+                      <p class="rubrics-tab__panel-desc">
+                        Structured facts the coach extracts from the
+                        transcript and writes back to your fact sheet,
+                        grouped by category.
+                      </p>
+                    </header>
+                    <div
+                      class="rubrics-tab__section-body"
+                      data-section-content="fields"
+                    ></div>
+                  </section>
+
+                  <section
+                    class="rubrics-tab__panel-section"
+                    data-panel="flags"
+                    hidden
+                  >
+                    <header class="rubrics-tab__panel-head">
+                      <h3 class="rubrics-tab__panel-title">Live flags</h3>
+                      <p class="rubrics-tab__panel-desc">
+                        Real-time red/green signals the live model watches
+                        for during the call. Set the severity, when it can
+                        fire, and the detection rule.
+                      </p>
+                    </header>
+                    <div
+                      class="rubrics-tab__section-body"
+                      data-section-content="flags"
+                    ></div>
+                  </section>
+
+                  <section
+                    class="rubrics-tab__panel-section"
+                    data-panel="scoring"
+                    hidden
+                  >
+                    <header class="rubrics-tab__panel-head">
+                      <h3 class="rubrics-tab__panel-title">Scoring</h3>
+                      <p class="rubrics-tab__panel-desc">
+                        How pillar coverage rolls up into the post-call
+                        scorecard. Read-only — every non-synthetic pillar
+                        below appears in the scorecard.
+                      </p>
+                    </header>
+                    <div
+                      class="rubrics-tab__section-body"
+                      data-section-content="scoring"
+                    ></div>
+                  </section>
+
+                  <section
+                    class="rubrics-tab__panel-section rubrics-tab__panel-section--advanced"
+                    data-panel="advanced-prompts"
+                    hidden
+                  >
+                    <header class="rubrics-tab__panel-head">
+                      <h3 class="rubrics-tab__panel-title">Advanced — System prompts</h3>
+                      <p class="rubrics-tab__panel-desc">
+                        The raw prose templates that drive the AI coach and
+                        the live flag-detection model.
+                      </p>
+                    </header>
+                    <div
+                      class="rubrics-tab__warning rubrics-tab__warning--advanced"
+                      role="note"
+                    >
+                      These prompts drive the AI's behaviour. Only edit if
+                      you understand the existing instructions. Use
+                      <strong>Reset to default</strong> to restore.
+                    </div>
+                    <div
+                      class="rubrics-tab__section-body"
+                      data-section-content="advanced-prompts"
+                    ></div>
+                  </section>
+                </div>
               </div>
 
               <!-- Save bar. Sticks to the bottom of the scrolling tab

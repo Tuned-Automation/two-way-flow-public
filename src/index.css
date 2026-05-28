@@ -3470,13 +3470,14 @@ a,
   -webkit-app-region: no-drag;
   -webkit-user-select: text;
   user-select: text;
-  /* Widened 520 → 720 to give the dense Providers / Rubrics tabs
-   * room to breathe and to keep all 9 tab labels visible on a
-   * "normal sized" coach overlay window without horizontal scrolling.
-   * Narrower windows still clamp via calc(100% - 24px), and the
-   * .settings-modal__tabs scroll affordance below picks up the slack
-   * for the truly tiny case. */
-  width: min(720px, calc(100% - 24px));
+  /* Widened 520 → 720 → 1120 to host the redesigned Rubrics editor's
+   * two-column (section-nav rail + panel) layout and to give the dense
+   * Providers / Rubrics tabs real room to breathe. Narrower overlay
+   * windows still clamp via calc(100% - 24px) so the modal never
+   * overflows the frame; the .settings-modal__tabs scroll affordance
+   * below picks up the slack for the tiny case, and the Rubrics editor
+   * collapses its nav rail to a horizontal strip under ~760px. */
+  width: min(1120px, calc(100% - 24px));
   max-height: calc(100% - 24px);
   display: flex;
   flex-direction: column;
@@ -5238,129 +5239,205 @@ a,
   color: var(--accent-red);
 }
 
-/* ── Editor body (scrollable) ─────────────────────────────────────── */
-
+/* ── Editor: section-nav rail + panel ─────────────────────────────── *
+ *
+ * Two-column grid that fills the space between the (sticky) library
+ * bar and save bar. The nav rail and the panel each scroll
+ * independently so a long Items list never pushes the section list
+ * out of reach. Exactly one .rubrics-tab__panel-section is visible at
+ * a time — the renderer's selectRubricsSection() toggles `hidden`.
+ *
+ * Under ~760px (a very narrow overlay window) the rail collapses to a
+ * horizontal scroller above the panel — see the media query at the
+ * end of this block. */
 .rubrics-tab__editor {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
-  padding: 12px 18px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: 212px minmax(0, 1fr);
 }
 
 .rubrics-tab__editor[hidden] {
   display: none;
 }
 
-.rubrics-tab__editor::-webkit-scrollbar {
-  width: 5px;
+/* ── Section nav rail ─────────────────────────────────────────────── */
+
+.rubrics-tab__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 10px;
+  min-height: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border-soft);
+  background: rgba(0, 0, 0, 0.18);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
 }
 
-.rubrics-tab__editor::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.18);
-  border-radius: 2px;
+.rubrics-tab__nav-head {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding: 4px 10px 10px;
 }
 
-/* ── <details> accordion sections ─────────────────────────────────── */
-
-.rubrics-tab__section {
-  background: rgba(255, 255, 255, 0.03);
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  overflow: hidden;
-  transition: border-color 160ms ease;
-}
-
-.rubrics-tab__section:hover {
-  border-color: rgba(255, 255, 255, 0.14);
-}
-
-.rubrics-tab__section[open] {
-  border-color: rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.rubrics-tab__section-summary {
-  list-style: none;
-  cursor: pointer;
-  padding: 9px 12px 9px 28px;
+.rubrics-tab__nav-item {
+  -webkit-app-region: no-drag;
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 11px;
+  font: inherit;
   font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text-strong);
-  position: relative;
-  user-select: none;
-  outline: none;
+  font-weight: 500;
+  color: var(--text-med);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
 }
 
-/* Replace the native disclosure triangle with a chevron we control
- * so we can rotate it smoothly on open/close. */
-.rubrics-tab__section-summary::-webkit-details-marker {
+.rubrics-tab__nav-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-strong);
+}
+
+.rubrics-tab__nav-item--active {
+  background: rgba(96, 165, 250, 0.14);
+  border-color: rgba(96, 165, 250, 0.4);
+  color: var(--text-strong);
+}
+
+.rubrics-tab__nav-item:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 1px;
+}
+
+.rubrics-tab__nav-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: background 120ms ease;
+}
+
+.rubrics-tab__nav-item--active .rubrics-tab__nav-dot {
+  background: #60a5fa;
+}
+
+/* The amber-accented dot marks the power-user Advanced section. */
+.rubrics-tab__nav-item--advanced .rubrics-tab__nav-dot {
+  background: rgba(251, 191, 36, 0.7);
+}
+
+.rubrics-tab__nav-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.rubrics-tab__nav-count {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-faint);
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 1px 7px;
+}
+
+.rubrics-tab__nav-item--active .rubrics-tab__nav-count {
+  background: rgba(96, 165, 250, 0.2);
+  color: #93c5fd;
+}
+
+/* ── Panel (the scrolling section content area) ───────────────────── */
+
+.rubrics-tab__panel {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 22px 26px 28px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+
+.rubrics-tab__panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+.rubrics-tab__panel::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 3px;
+}
+
+.rubrics-tab__panel-section[hidden] {
   display: none;
 }
 
-.rubrics-tab__section-summary::before {
-  content: '';
-  position: absolute;
-  left: 12px;
-  top: 50%;
-  width: 6px;
-  height: 6px;
-  border-right: 1.5px solid var(--text-med);
-  border-bottom: 1.5px solid var(--text-med);
-  transform: translateY(-65%) rotate(-45deg);
-  transition: transform 160ms ease, border-color 160ms ease;
+.rubrics-tab__panel-section {
+  animation: rubrics-panel-fade 220ms ease;
 }
 
-.rubrics-tab__section[open] > .rubrics-tab__section-summary::before {
-  transform: translateY(-20%) rotate(45deg);
-  border-color: var(--text-strong);
+@keyframes rubrics-panel-fade {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
 }
 
-.rubrics-tab__section-summary:hover {
+.rubrics-tab__panel-head {
+  margin-bottom: 20px;
+}
+
+.rubrics-tab__panel-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
   color: var(--text-strong);
+  margin: 0;
 }
 
-.rubrics-tab__section-summary:focus-visible {
-  outline: 2px solid rgba(255, 255, 255, 0.4);
-  outline-offset: -2px;
+.rubrics-tab__panel-section--advanced .rubrics-tab__panel-title {
+  color: #fcd34d;
 }
 
+.rubrics-tab__panel-desc {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin: 6px 0 0;
+  max-width: 640px;
+}
+
+/* The section body is the vertical stack of cards / fields / lists the
+ * per-section renderers fill. Generous gap now that there's real width
+ * to work with. */
 .rubrics-tab__section-body {
-  padding: 4px 14px 14px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-}
-
-/* Advanced — System prompts is the "here be dragons" section. Tint
- * the section subtly (amber) and slot the warning banner above the
- * body content so the user reads the warning BEFORE they reach the
- * textareas. */
-.rubrics-tab__section--advanced {
-  border-color: rgba(251, 191, 36, 0.25);
-}
-
-.rubrics-tab__section--advanced[open] {
-  border-color: rgba(251, 191, 36, 0.45);
-  background: rgba(40, 32, 18, 0.25);
+  gap: 14px;
 }
 
 .rubrics-tab__warning {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 9px 12px;
+  padding: 10px 13px;
   border: 1px solid rgba(251, 191, 36, 0.35);
-  border-radius: 8px;
+  border-radius: 9px;
   background: rgba(40, 32, 18, 0.55);
   color: var(--text-med);
   font-size: 11.5px;
   line-height: 1.45;
-  margin: 8px 14px 0;
+  margin: 0 0 16px;
 }
 
 .rubrics-tab__warning--advanced::before {
@@ -5431,13 +5508,13 @@ a,
   appearance: none;
   width: 100%;
   box-sizing: border-box;
-  padding: 7px 10px;
+  padding: 9px 12px;
   font: inherit;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--text-strong);
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border-soft);
-  border-radius: 7px;
+  border-radius: 8px;
   transition: background 120ms ease, border-color 120ms ease;
   -webkit-app-region: no-drag;
 }
@@ -5534,7 +5611,7 @@ a,
 .rubrics-tab__list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -5543,8 +5620,8 @@ a,
 .rubrics-tab__group {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 0 4px;
+  gap: 10px;
+  padding: 16px 0 6px;
   border-top: 1px solid var(--border-soft);
 }
 
@@ -5609,11 +5686,11 @@ a,
 .rubrics-tab__card {
   background: rgba(20, 20, 30, 0.5);
   border: 1px solid var(--border-soft);
-  border-radius: 9px;
-  padding: 8px 10px;
+  border-radius: 10px;
+  padding: 12px 14px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   transition: border-color 160ms ease, background 160ms ease;
 }
 
@@ -6093,6 +6170,51 @@ a,
 
 .rubrics-tab__empty[hidden] {
   display: none;
+}
+
+/* Push the destructive Delete action to the far end of the library
+ * action row, away from the constructive buttons. */
+.rubrics-tab__library-actions .rubrics-tab__btn--danger {
+  margin-left: auto;
+}
+
+/* ── Responsive: collapse the nav rail on a narrow overlay window ─── *
+ * Under ~760px the side rail would crowd the panel, so it becomes a
+ * horizontal scroller above the panel (counts hidden to save space).
+ * Mirrors the supplied mockup's small-screen behaviour. */
+@media (max-width: 760px) {
+  .rubrics-tab__editor {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .rubrics-tab__nav {
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    gap: 4px;
+    padding: 10px 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .rubrics-tab__nav-head {
+    display: none;
+  }
+
+  .rubrics-tab__nav-item {
+    width: auto;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .rubrics-tab__nav-count {
+    display: none;
+  }
+
+  .rubrics-tab__panel {
+    padding: 18px 18px 22px;
+  }
 }
 
 /* ────────────────────────────────────────────────────────────────────
