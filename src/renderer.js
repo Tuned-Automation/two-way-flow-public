@@ -4589,7 +4589,7 @@ function selectSettingsTab(tabId) {
   }
 }
 
-async function openSettingsModal() {
+async function openSettingsModal(initialTabId) {
   if (!settingsModalEl) return;
   await ensureSettingsLoaded();
   // Audio tab device pickers: hydrate the dropdown contents on first
@@ -4618,7 +4618,20 @@ async function openSettingsModal() {
   if (window.rubrics?.list) {
     hydrateRubricsTab();
   }
-  selectSettingsTab('providers');
+  // Tab selection: caller can request a specific landing tab (used
+  // by the #rubricSwitcher pill in Task 10 to land on 'rubrics'). If
+  // the requested id isn't present in the markup, selectSettingsTab
+  // falls back silently and we use 'providers' instead so the user
+  // never sees an empty modal.
+  const tabId = typeof initialTabId === 'string' && initialTabId.length > 0
+    ? initialTabId
+    : 'providers';
+  selectSettingsTab(tabId);
+  // If the requested tab didn't exist (no matching button), the
+  // selectSettingsTab call above was a no-op and no section is
+  // marked active. Land on 'providers' as a safety net.
+  const anyActive = Array.from(settingsTabEls).some((b) => b.getAttribute('aria-selected') === 'true');
+  if (!anyActive) selectSettingsTab('providers');
   try {
     settingsModalEl.showModal();
   } catch (err) {
@@ -8142,6 +8155,68 @@ function onRubricsChanged(_payload) {
   // different rubric, the editor keeps that rubric loaded but its
   // active-state markers refresh.
   if (rubricsTabState.hydrated) hydrateRubricsTab();
+  // Always refresh the header switcher pill — it lives outside the
+  // Settings modal, so the lazy-hydration guard above must not gate
+  // it. Cheap IPC; no UI freeze.
+  hydrateRubricSwitcher();
+}
+
+/* ── #rubricSwitcher pill (Task 10) ─────────────────────────────────── *
+ *
+ * The pill in the coach header's status cluster surfaces the active
+ * rubric's name at-a-glance and acts as a shortcut into Settings →
+ * Rubrics. It has no editor state of its own; everything it renders
+ * comes from a fresh `window.rubrics.list()` call so we don't drift
+ * out of sync with the modal's view.
+ *
+ * Lifecycle:
+ *   - Boot:  hydrateRubricSwitcher() runs once during initial render.
+ *   - Idle:  refreshed on every `rubrics:changed` broadcast (see
+ *            onRubricsChanged above).
+ *   - Click: openSettingsModal('rubrics') lands the user on the
+ *            Rubrics tab. The hydrateRubricsTab() called inside
+ *            openSettingsModal() then re-fetches the list, so the
+ *            modal view is guaranteed fresh on landing.
+ *
+ * The pill stays hidden until the first successful hydrate. On IPC
+ * failure (e.g. main hasn't finished ensureSeeded yet) we leave it
+ * hidden — better to show nothing than a flickering "—".
+ * ───────────────────────────────────────────────────────────────────── */
+
+const rubricSwitcherEl = document.getElementById('rubricSwitcher');
+const rubricSwitcherLabelEl = rubricSwitcherEl?.querySelector('.rubric-switcher__label') || null;
+
+async function hydrateRubricSwitcher() {
+  if (!rubricSwitcherEl || !window.rubrics?.list) return;
+  try {
+    const result = await window.rubrics.list();
+    if (!result?.ok || !Array.isArray(result.rubrics)) return;
+    const active = result.rubrics.find((r) => r && r.isActive);
+    if (!active) {
+      // No active rubric known yet — keep the pill hidden. The
+      // next broadcast (after ensureSeeded promotes a default
+      // active id) will retrigger this hydrate.
+      rubricSwitcherEl.hidden = true;
+      return;
+    }
+    const name = (typeof active.name === 'string' && active.name.length > 0)
+      ? active.name
+      : (typeof active.id === 'string' ? active.id : 'Unnamed rubric');
+    if (rubricSwitcherLabelEl) rubricSwitcherLabelEl.textContent = name;
+    // The title attribute carries the "click to edit" hint; the
+    // aria-label is the static identity. Two-line title so the
+    // tooltip surfaces both the rubric name and the affordance.
+    rubricSwitcherEl.title = `Active rubric: ${name}\nClick to switch or edit.`;
+    rubricSwitcherEl.hidden = false;
+  } catch (err) {
+    console.warn('[rubric-switcher] hydrate failed:', err?.message || err);
+  }
+}
+
+if (rubricSwitcherEl) {
+  rubricSwitcherEl.addEventListener('click', () => {
+    openSettingsModal('rubrics');
+  });
 }
 
 if (rubricsLibrarySelectEl) {
@@ -8241,3 +8316,10 @@ applyInitialVersionBadge();
 // is idempotent — the same cache feeds the modal's lazy open path
 // without a second IPC roundtrip.
 ensureSettingsLoaded();
+
+// Hydrate the #rubricSwitcher pill in the header's status cluster
+// with the active rubric's name. The pill is hidden until this
+// resolves — see hydrateRubricSwitcher() for the IPC failure
+// semantics. Subsequent updates ride on the rubrics:changed
+// broadcast (see onRubricsChanged above).
+hydrateRubricSwitcher();

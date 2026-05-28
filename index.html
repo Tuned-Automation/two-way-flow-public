@@ -116,6 +116,28 @@
             title=""
             hidden
           ></span>
+
+          <!-- Active-rubric pill (Task 10). Painted once at boot from
+               window.rubrics.list() and refreshed on every
+               `rubrics:changed` broadcast. Click opens the Settings
+               modal scrolled to the Rubrics tab so the user can pick
+               a different rubric or edit the current one. The pill
+               carries the active rubric's name as its visible label
+               and (until Task 11 lands the scoped pill styling) sits
+               in the same row as the other status pills.
+               Hidden until populated so a "Rubric:" placeholder
+               never flashes pre-IPC. -->
+          <button
+            id="rubricSwitcher"
+            type="button"
+            class="rubric-switcher"
+            aria-label="Active rubric — click to edit"
+            title=""
+            hidden
+          >
+            <span class="rubric-switcher__caption" aria-hidden="true">Rubric:</span>
+            <span class="rubric-switcher__label">—</span>
+          </button>
         </div>
 
         <div class="coach__controls">
