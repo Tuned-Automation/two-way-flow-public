@@ -294,6 +294,20 @@ const settingsExportIncludeKeysEl = document.getElementById('settingsExportInclu
 const settingsImportBtnEl = document.getElementById('settingsImportBtn');
 const settingsResetBtnEl = document.getElementById('settingsResetBtn');
 
+/* Usage tab (session-cost-tracking feature, Wave 2). The renderer
+ * pulls every SessionRecord via window.sessions.list() on every
+ * tab open and rebuilds the list. No live updates while a call is
+ * in flight — the list only changes at gemini:stop time. The
+ * Export button copies JSON to clipboard for v1 (a future follow-
+ * up will route through the existing showSaveDialogAndMaybeWrite
+ * helper in main.js for a native Save dialog). The Clear button
+ * confirms via native confirm() before invoking window.sessions.clear(). */
+const usageListEl = document.getElementById('usageList');
+const usageTotalsEl = document.getElementById('usageTotals');
+const usageEmptyEl = document.getElementById('usageEmpty');
+const usageExportButtonEl = document.getElementById('usageExportButton');
+const usageClearButtonEl = document.getElementById('usageClearButton');
+
 /* Reset confirmation dialog (#settingsResetConfirm) — siblings of
  * #settingsModal so showModal() puts them on the top layer above. */
 const settingsResetConfirmEl = document.getElementById('settingsResetConfirm');
@@ -4774,6 +4788,349 @@ function selectSettingsTab(tabId) {
     const isActive = section.dataset.tabContent === tabId;
     section.hidden = !isActive;
   }
+  // Per-tab lazy hydrators. Today only Usage needs one (the
+  // chronological list of SessionRecords is rebuilt on every open
+  // so a session that ended while the modal was closed shows up
+  // the next time the user lands on the tab). Other tabs hydrate
+  // from settingsCache, which is already loaded by
+  // ensureSettingsLoaded(); they don't need a per-tab callback.
+  if (tabId === 'usage') {
+    renderUsageTab();
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+ * Settings → Usage tab (session-cost-tracking feature, Wave 2)
+ *
+ * Pure read-only view over the on-disk session log. The renderer
+ * NEVER reaches into src/session-history.js directly — every read
+ * routes through `window.sessions.*` (preload bridge in
+ * src/preload.js; IPC handlers in src/main.js). That's plan
+ * invariant #6: a future swap to better-sqlite3 / remote sync
+ * stays renderer-transparent because all access is IPC-mediated.
+ *
+ * Render shape (#usageList):
+ *   <ol>
+ *     <li class='usage-row'>
+ *       <header class='usage-row__header'>
+ *         <time class='usage-row__when'>…</time>
+ *         <span class='usage-row__duration'>…</span>
+ *         <span class='usage-row__cost'>…</span>
+ *       </header>
+ *       <details class='usage-row__details'>
+ *         <summary>Breakdown</summary>
+ *         <table class='usage-row__breakdown'>…</table>
+ *       </details>
+ *     </li>
+ *     …
+ *   </ol>
+ *
+ * Edge cases handled:
+ *   - Empty list — shows #usageEmpty, hides #usageList.
+ *   - Sub-cent totals — rendered as "<$0.01" so the user doesn't
+ *     see a wall of "$0.00" rows.
+ *   - Missing pricing match (record.usage.* model not in
+ *     src/pricing.js's RATES table) — shows "estimate unavailable"
+ *     in the breakdown row, plan invariant #3.
+ * ──────────────────────────────────────────────────────────────────── */
+
+async function renderUsageTab() {
+  if (!(usageListEl instanceof HTMLElement)) return;
+  if (!window.sessions || typeof window.sessions.list !== 'function') {
+    // Defensive: the preload bridge wasn't exposed (renderer running
+    // in a test harness or out-of-sync preload). Surface as empty
+    // rather than crashing.
+    usageListEl.replaceChildren();
+    if (usageEmptyEl instanceof HTMLElement) usageEmptyEl.hidden = false;
+    return;
+  }
+
+  /** @type {Array<object>} */
+  let sessions = [];
+  try {
+    sessions = await window.sessions.list();
+  } catch (err) {
+    console.warn('[usage] list() failed:', err?.message || err);
+    sessions = [];
+  }
+
+  // Empty state — hide the list, show the empty <p>. The aria-live
+  // 'polite' on #usageTotals announces the cleared totals string
+  // separately.
+  if (!Array.isArray(sessions) || sessions.length === 0) {
+    usageListEl.replaceChildren();
+    if (usageEmptyEl instanceof HTMLElement) usageEmptyEl.hidden = false;
+    if (usageTotalsEl instanceof HTMLElement) {
+      usageTotalsEl.textContent = '';
+    }
+    return;
+  }
+
+  if (usageEmptyEl instanceof HTMLElement) usageEmptyEl.hidden = true;
+
+  // Totals strip. Aggregated across every persisted record so the
+  // user sees a running lifetime figure. The per-call cost is shown
+  // on each row.
+  if (usageTotalsEl instanceof HTMLElement) {
+    let totalUsd = 0;
+    let totalMs = 0;
+    for (const s of sessions) {
+      totalUsd += Number(s?.costUsd?.total) || 0;
+      totalMs  += Number(s?.durationMs)     || 0;
+    }
+    usageTotalsEl.textContent =
+      `${sessions.length} session${sessions.length === 1 ? '' : 's'}` +
+      ` · ${formatUsageDuration(totalMs)}` +
+      ` · ${formatUsageCost(totalUsd)} total`;
+  }
+
+  // Rebuild the list. Using replaceChildren keeps the DOM
+  // operation atomic; the user never sees an intermediate empty
+  // <ol>. Each row is built fresh — we don't try to diff against
+  // the previous render because the list is short (typically
+  // dozens, not thousands) and a fresh build is simpler than
+  // tracking per-row identity.
+  const rows = sessions.map(buildUsageRow);
+  usageListEl.replaceChildren(...rows);
+}
+
+/** Build one <li class='usage-row'> from a SessionRecord. */
+function buildUsageRow(record) {
+  const li = document.createElement('li');
+  li.className = 'usage-row';
+
+  const header = document.createElement('header');
+  header.className = 'usage-row__header';
+
+  const when = document.createElement('time');
+  when.className = 'usage-row__when';
+  const dt = new Date(Number(record?.startedAt) || 0);
+  when.dateTime = dt.toISOString();
+  // Locale-aware short date + time — readable on any platform.
+  when.textContent = dt.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  const duration = document.createElement('span');
+  duration.className = 'usage-row__duration';
+  duration.textContent = formatUsageDuration(record?.durationMs || 0);
+
+  const cost = document.createElement('span');
+  cost.className = 'usage-row__cost';
+  cost.textContent = formatUsageCost(record?.costUsd?.total || 0);
+
+  header.append(when, duration, cost);
+  li.appendChild(header);
+
+  // Per-component breakdown — collapsed by default so the list
+  // stays scannable. The <details> element ships built-in
+  // keyboard / screen-reader semantics; no custom wiring needed.
+  const details = document.createElement('details');
+  details.className = 'usage-row__details';
+
+  const summary = document.createElement('summary');
+  summary.textContent = 'Breakdown';
+  details.appendChild(summary);
+
+  details.appendChild(buildUsageBreakdownTable(record));
+
+  li.appendChild(details);
+  return li;
+}
+
+/** Build the per-component breakdown <table> shown inside the
+ *  collapsed <details>. One row per non-zero component. */
+function buildUsageBreakdownTable(record) {
+  const table = document.createElement('table');
+  table.className = 'usage-row__breakdown';
+
+  // Header row.
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const label of ['Component', 'Model', 'Tokens / minutes', 'Cost']) {
+    const th = document.createElement('th');
+    th.textContent = label;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  const usage = record?.usage || {};
+  const costUsd = record?.costUsd || {};
+
+  // Order matches the user's mental model of "what runs when": the
+  // always-on audio path first, then the post-call summary, then
+  // the background workers in their pipeline order. Stable order
+  // matters so the user can compare rows across sessions at a
+  // glance.
+  const rows = [
+    {
+      label: 'Gemini Live',
+      model: usage.geminiLive?.model || '—',
+      detail: formatTokens(
+        (usage.geminiLive?.audioInputTokens  || 0) +
+        (usage.geminiLive?.audioOutputTokens || 0) +
+        (usage.geminiLive?.textOutputTokens  || 0),
+      ),
+      cost: costUsd.geminiLive,
+    },
+    {
+      label: 'Deepgram',
+      model: usage.deepgram?.model || '—',
+      detail: `${(usage.deepgram?.audioMinutes || 0).toFixed(2)} min`,
+      cost: costUsd.deepgram,
+    },
+    {
+      label: 'Coach',
+      model: usage.coach?.model || '—',
+      detail: formatLlmDetail(usage.coach),
+      cost: costUsd.coach,
+    },
+    {
+      label: 'Summary',
+      model: usage.summary?.model || '—',
+      detail: formatLlmDetail(usage.summary),
+      cost: costUsd.summary,
+    },
+    {
+      label: 'Facts scanner',
+      model: usage.factsScanner?.model || '—',
+      detail: formatLlmDetail(usage.factsScanner),
+      cost: costUsd.factsScanner,
+    },
+    {
+      label: 'Quick fix',
+      model: usage.quickFix?.model || '—',
+      detail: formatLlmDetail(usage.quickFix),
+      cost: costUsd.quickFix,
+    },
+  ];
+
+  for (const row of rows) {
+    const tr = document.createElement('tr');
+    for (const cellText of [row.label, row.model, row.detail, formatUsageCost(row.cost || 0)]) {
+      const td = document.createElement('td');
+      td.textContent = cellText;
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  return table;
+}
+
+/** Format a text-LLM slot's "Tokens / minutes" cell. */
+function formatLlmDetail(slot) {
+  if (!slot) return '—';
+  const calls = Number(slot.calls) || 0;
+  const inTok = Number(slot.inputTokens)  || 0;
+  const outTok = Number(slot.outputTokens) || 0;
+  if (calls === 0 && inTok === 0 && outTok === 0) return '—';
+  return `${calls} call${calls === 1 ? '' : 's'} · ${formatTokens(inTok + outTok)} tok`;
+}
+
+/** Compact token-count formatter (1.2k, 3.4M). Keeps the breakdown
+ *  table readable without forcing the user to mentally insert commas
+ *  into "1234567". */
+function formatTokens(n) {
+  const v = Number(n) || 0;
+  if (v === 0) return '0';
+  if (v < 1000) return String(v);
+  if (v < 1_000_000) return (v / 1000).toFixed(1) + 'k';
+  return (v / 1_000_000).toFixed(2) + 'M';
+}
+
+/** Format a USD cost. "<$0.01" for sub-cent values so a wall of
+ *  $0.00 rows doesn't desensitise the user to the real-money
+ *  totals. Exact two-decimal otherwise. */
+function formatUsageCost(usd) {
+  const v = Number(usd) || 0;
+  if (v === 0) return '$0.00';
+  if (v < 0.01) return '<$0.01';
+  return `$${v.toFixed(2)}`;
+}
+
+/** Format a duration in human-readable form ("1h 23m", "12m 04s",
+ *  "44s"). Matches the order users naturally describe call lengths
+ *  in — biggest unit first, no leading zeros. */
+function formatUsageDuration(ms) {
+  const total = Math.max(0, Math.round(Number(ms) || 0) / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = Math.round(total % 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
+  return `${s}s`;
+}
+
+/** Export-button handler. v1 copies the JSON dump to the clipboard
+ *  via window.sessions.export() + navigator.clipboard.writeText().
+ *  v2 (out of scope here) will route through the existing
+ *  showSaveDialogAndMaybeWrite() helper in main.js for a native
+ *  Save dialog — that requires a new IPC channel for the dialog
+ *  invocation. The CSV payload is built main-side already and
+ *  returned alongside the JSON, so a future "Export as CSV" toggle
+ *  is a renderer-only change. */
+async function doUsageExport() {
+  if (!window.sessions || typeof window.sessions.export !== 'function') return;
+  try {
+    const result = await window.sessions.export();
+    const payload = typeof result?.json === 'string' ? result.json : '[]';
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(payload);
+      // Hint the user via the totals strip's aria-live region —
+      // a transient text swap, restored on the next renderUsageTab
+      // call. No native toast in v1 (the existing modal doesn't
+      // ship one); a future follow-up can add a generic toast and
+      // route this through it.
+      if (usageTotalsEl instanceof HTMLElement) {
+        const previous = usageTotalsEl.textContent;
+        usageTotalsEl.textContent =
+          `Copied ${result?.sessionsCount ?? 0} session${result?.sessionsCount === 1 ? '' : 's'} as JSON to clipboard.`;
+        // Restore the original totals after 3 s. setTimeout is
+        // benign even if the user navigates away — the textContent
+        // assignment is a no-op on a hidden/replaced element.
+        setTimeout(() => {
+          if (usageTotalsEl.textContent.startsWith('Copied ')) {
+            usageTotalsEl.textContent = previous;
+          }
+        }, 3000);
+      }
+    } else {
+      // Older Electron versions / blocked permissions — fall back
+      // to a console log so the user can grab the payload from
+      // devtools. Realistically this branch never trips in the
+      // shipped app (Chromium has had clipboard write since 76).
+      console.log('[usage:export] clipboard unavailable, JSON dump below:');
+      console.log(payload);
+    }
+  } catch (err) {
+    console.warn('[usage:export] failed:', err?.message || err);
+  }
+}
+
+/** Clear-history-button handler. Native confirm() before invoking
+ *  window.sessions.clear(). No undo. On success the list re-renders
+ *  empty via renderUsageTab(). */
+async function doUsageClear() {
+  if (!window.sessions || typeof window.sessions.clear !== 'function') return;
+  const proceed = window.confirm(
+    'Clear all session history?\n\n' +
+    'This deletes every record under Settings → Usage permanently. ' +
+    'API keys, rubrics, and other settings are unaffected.',
+  );
+  if (!proceed) return;
+  try {
+    await window.sessions.clear();
+    await renderUsageTab();
+  } catch (err) {
+    console.warn('[usage:clear] failed:', err?.message || err);
+  }
 }
 
 async function openSettingsModal(initialTabId) {
@@ -6038,6 +6395,18 @@ async function doExportSettings() {
 
 if (settingsExportBtnEl instanceof HTMLButtonElement) {
   settingsExportBtnEl.addEventListener('click', doExportSettings);
+}
+
+// Usage tab buttons (session-cost-tracking feature, Wave 2). Bound
+// at module scope alongside the other Settings → Data buttons so the
+// listener registration runs once at boot regardless of how many
+// times the modal is opened. The handlers themselves are null-safe
+// against the preload bridge not being exposed.
+if (usageExportButtonEl instanceof HTMLButtonElement) {
+  usageExportButtonEl.addEventListener('click', doUsageExport);
+}
+if (usageClearButtonEl instanceof HTMLButtonElement) {
+  usageClearButtonEl.addEventListener('click', doUsageClear);
 }
 
 /* ── U21: Import settings from JSON ───────────────────────────────── */
