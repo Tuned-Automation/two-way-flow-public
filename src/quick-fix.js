@@ -231,6 +231,25 @@ const STAGE2_SYSTEM_PROMPT = [
   '       - medium → 1-2 inferred conversions OR 1 likely double-count.',
   '       - low    → >2 inferences, OR >1 unresolved double-count, OR',
   '                  contradictory facts, OR anchor divergence > 10%.',
+  '  8. ROW LABELS — each `breakdown[i].label` is a clean DESCRIPTOR-ONLY',
+  '     noun phrase explaining WHAT the cost or opportunity is. The',
+  '     amount column already shows the dollar value; do NOT repeat it',
+  '     in the label.',
+  '       GOOD labels:',
+  '         - "Duplicate work across team"',
+  '         - "Manual reporting time"',
+  '         - "Lost deals to slow follow-up"',
+  '         - "Consulting spend"',
+  '         - "Tool licence cost"',
+  '       BAD labels (these all leak into the live UI as garbage strings):',
+  '         - "$120K in duplicate work"        ← embeds the dollar amount',
+  '         - "thirty grand a year on consulting" ← echoes speech verbatim',
+  '         - "$20 in wasted time"             ← embeds + echoes',
+  '         - "$50 a year"                     ← only the amount, no descriptor',
+  '     If the only sensible descriptor IS a dollar phrase (e.g. the',
+  '     speaker only said the number with no context), fall back to the',
+  '     fact\'s `kind` capitalised (e.g. "Pain cost", "Revenue uplift")',
+  '     rather than embedding the figure.',
   '',
   '*** MONOTONIC CONSTRAINT (LOAD-BEARING) ***',
   '',
@@ -260,10 +279,10 @@ const STAGE2_SYSTEM_PROMPT = [
   '  If a `correction: true` entry IS present, you SHOULD adjust the',
   '  headline accordingly (the prospect explicitly revised a figure).',
   '',
-  '8. Return JSON only, matching the schema. No prose outside the JSON.',
-  '   Omit `correctionReason` (or set it to null) when there is no',
-  '   correction in play — populating it with empty/filler text would',
-  '   bypass the monotonic constraint.',
+  '  9. Return JSON only, matching the schema. No prose outside the JSON.',
+  '     Omit `correctionReason` (or set it to null) when there is no',
+  '     correction in play — populating it with empty/filler text would',
+  '     bypass the monotonic constraint.',
 ].join('\n');
 
 /**
@@ -291,7 +310,19 @@ const STAGE2_RESPONSE_SCHEMA = {
       items: {
         type: 'OBJECT',
         properties: {
-          label: { type: 'STRING', description: 'Short row label, ≤80 chars.' },
+          label: {
+            type: 'STRING',
+            description:
+              'Short descriptor-only row label, ≤80 chars. MUST be a clean '
+              + 'noun phrase describing what the cost or opportunity IS. MUST '
+              + 'NOT include dollar amounts (the amount column renders the '
+              + 'figure separately) and MUST NOT echo the speaker\'s literal '
+              + 'phrasing verbatim. '
+              + 'GOOD: "Duplicate work across team", "Manual reporting time", '
+              + '"Lost deals to slow follow-up". '
+              + 'BAD: "$120K in duplicate work", "thirty grand a year on '
+              + 'consulting", "$20 in wasted time".',
+          },
           amountUsdAnnual: { type: 'NUMBER', description: 'Row contribution to the headline in annual USD.' },
           source: { type: 'STRING', description: 'Source fact id from the input, OR the literal string "derived".' },
           notes: { type: 'STRING', description: '≤120 chars; may be empty.' },
