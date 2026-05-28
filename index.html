@@ -986,6 +986,210 @@
                   >Reset to defaults</button>
                 </div>
               </div>
+
+              <!-- Per-surface transparency editor.
+                   Lets the user tune outline / body / text alpha on
+                   each of the four controllable overlay surfaces
+                   (Coach card, Transcript pane, Captured column,
+                   Suggestion card). Three sliders write CSS vars
+                   synchronously for live preview AND debounce the
+                   same values into appearance.transparency.* via the
+                   existing settings:save IPC. Three preset slot cards
+                   below snapshot / restore the full transparency
+                   subtree with renameable labels.
+
+                   The "Open preview" button summons a second
+                   BrowserWindow (preview.html) so the user can see
+                   their changes on a sandbox copy of the overlay
+                   without unmounting their live session. See
+                   docs/superpowers/plans/2026-05-27-per-surface-
+                   transparency-settings.md for the full lifecycle. -->
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Transparency</h4>
+                <p class="settings-section__subtitle">
+                  Tune outline, body, and text alpha for each overlay surface. Changes apply live to the main window; open the preview to see the same edits side-by-side on a mock surface.
+                </p>
+
+                <div class="transparency-controls">
+                  <div class="transparency-controls__group">
+                    <label for="transparencySurface">Surface</label>
+                    <select id="transparencySurface" class="transparency-surface-select">
+                      <option value="coach">Coach card</option>
+                      <option value="transcript">Transcript pane</option>
+                      <option value="captured">Captured column</option>
+                      <option value="suggestion">Suggestion card</option>
+                    </select>
+                  </div>
+                  <button
+                    id="transparencyPreviewBtn"
+                    class="modal__btn"
+                    type="button"
+                    aria-pressed="false"
+                  >Open preview</button>
+                </div>
+
+                <!-- Each slider's `input` event drives applySurface-
+                     Transparency() in src/renderer.js for instant
+                     visual feedback AND queueTransparencySave() for a
+                     debounced settings.save. The percentage badges
+                     mirror the live integer (0–100) via aria-live so
+                     screen readers announce the new value as the
+                     user drags. -->
+                <div class="transparency-sliders">
+                  <div class="transparency-slider">
+                    <label for="transparencyOutline">Outline</label>
+                    <input
+                      type="range"
+                      id="transparencyOutline"
+                      data-channel="outline"
+                      min="0"
+                      max="100"
+                      step="1"
+                      class="transparency-slider__input"
+                      aria-describedby="transparencyOutlineValue transparencyOutlineHint"
+                    />
+                    <span
+                      id="transparencyOutlineValue"
+                      class="transparency-slider__value"
+                      data-channel="outline"
+                      aria-live="polite"
+                    >0%</span>
+                    <p
+                      id="transparencyOutlineHint"
+                      class="transparency-hint"
+                      data-channel="outline"
+                      hidden
+                    >Very low outline alpha may show a faint macOS shadow ring around the surface — this is expected.</p>
+                  </div>
+                  <div class="transparency-slider">
+                    <label for="transparencyBody">Body</label>
+                    <input
+                      type="range"
+                      id="transparencyBody"
+                      data-channel="body"
+                      min="0"
+                      max="100"
+                      step="1"
+                      class="transparency-slider__input"
+                      aria-describedby="transparencyBodyValue"
+                    />
+                    <span
+                      id="transparencyBodyValue"
+                      class="transparency-slider__value"
+                      data-channel="body"
+                      aria-live="polite"
+                    >0%</span>
+                  </div>
+                  <div class="transparency-slider">
+                    <label for="transparencyText">Text</label>
+                    <input
+                      type="range"
+                      id="transparencyText"
+                      data-channel="text"
+                      min="0"
+                      max="100"
+                      step="1"
+                      class="transparency-slider__input"
+                      aria-describedby="transparencyTextValue transparencyTextHint"
+                    />
+                    <span
+                      id="transparencyTextValue"
+                      class="transparency-slider__value"
+                      data-channel="text"
+                      aria-live="polite"
+                    >0%</span>
+                    <p
+                      id="transparencyTextHint"
+                      class="transparency-hint"
+                      data-channel="text"
+                      hidden
+                    >Text below 40% alpha may be hard to read on busy backgrounds.</p>
+                  </div>
+                </div>
+
+                <div class="transparency-actions">
+                  <button
+                    id="transparencyResetSurface"
+                    class="modal__btn modal__btn--ghost"
+                    type="button"
+                  >Reset surface to default</button>
+                </div>
+
+                <!-- Three reusable preset slots. Each card has a
+                     renameable label (debounced 400 ms before
+                     writing to appearance.transparencyPresets.slotN.
+                     name), a Load button that restores that slot's
+                     values into appearance.transparency, and a Save
+                     Current button that snapshots the live
+                     transparency block into the slot. data-preset-
+                     slot lets renderer.js identify each card without
+                     positional indexing. -->
+                <div class="transparency-presets" role="group" aria-label="Transparency presets">
+                  <div class="transparency-preset" data-preset-slot="slot1">
+                    <input
+                      type="text"
+                      class="transparency-preset__name"
+                      maxlength="20"
+                      aria-label="Preset 1 name"
+                      placeholder="Preset 1"
+                    />
+                    <div class="transparency-preset__actions">
+                      <button
+                        type="button"
+                        class="modal__btn transparency-preset__load"
+                        data-action="load"
+                      >Load</button>
+                      <button
+                        type="button"
+                        class="modal__btn modal__btn--ghost transparency-preset__save"
+                        data-action="save"
+                      >Save current</button>
+                    </div>
+                  </div>
+                  <div class="transparency-preset" data-preset-slot="slot2">
+                    <input
+                      type="text"
+                      class="transparency-preset__name"
+                      maxlength="20"
+                      aria-label="Preset 2 name"
+                      placeholder="Preset 2"
+                    />
+                    <div class="transparency-preset__actions">
+                      <button
+                        type="button"
+                        class="modal__btn transparency-preset__load"
+                        data-action="load"
+                      >Load</button>
+                      <button
+                        type="button"
+                        class="modal__btn modal__btn--ghost transparency-preset__save"
+                        data-action="save"
+                      >Save current</button>
+                    </div>
+                  </div>
+                  <div class="transparency-preset" data-preset-slot="slot3">
+                    <input
+                      type="text"
+                      class="transparency-preset__name"
+                      maxlength="20"
+                      aria-label="Preset 3 name"
+                      placeholder="Preset 3"
+                    />
+                    <div class="transparency-preset__actions">
+                      <button
+                        type="button"
+                        class="modal__btn transparency-preset__load"
+                        data-action="load"
+                      >Load</button>
+                      <button
+                        type="button"
+                        class="modal__btn modal__btn--ghost transparency-preset__save"
+                        data-action="save"
+                      >Save current</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </section>
             <!-- Audio tab. Phase 1 ships an empty stub — Phase 2 will
                  fill it with the mic / system-audio device selectors,

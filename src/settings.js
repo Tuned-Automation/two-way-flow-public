@@ -15,9 +15,14 @@ import path from 'node:path';
  *     T5 autoGainControl, T14 deepgramModel, V10 hideAecBadge.
  *
  *   Phase 3 — Appearance expansion  (settings.appearance.*)
- *     V2 accent, V3 opacity, V6 windowSize, V7/V8 windowPosition,
- *     V9 alwaysOnTop, V13 railStyle, V14 capturedPaneVisible,
- *     V15 suggestionCardStyle, V16 pillarTintsEnabled, V20 summaryGlass.
+ *     V2 accent, V6 windowSize, V7/V8 windowPosition, V9 alwaysOnTop,
+ *     V13 railStyle, V14 capturedPaneVisible, V15 suggestionCardStyle,
+ *     V16 pillarTintsEnabled, V20 summaryGlass.
+ *     (V3 "opacity" is now landed as `appearance.transparency` —
+ *      per-surface 0..1 alpha for outline / body / text on the four
+ *      controllable overlay surfaces, plus three named preset slots
+ *      under `appearance.transparencyPresets`. Supersedes the original
+ *      single-knob V3 design.)
  *
  *   Phase 4 — Coach tuning  (settings.coach.*)
  *     T6 tickMs, T7 pauseThresholdMs, T9 kickstartDelayMs,
@@ -71,8 +76,34 @@ import path from 'node:path';
  *         you:   '#f0f0f0',   // YOU transcript-label colour
  *         other: '#c7d2fe',   // PROSPECT transcript-label colour
  *       },
+ *       transparency: {
+ *         // Per-surface 0..1 alpha for outline / body / text on the
+ *         // four controllable overlay surfaces (.coach, .transcript-pane,
+ *         // .captured, .suggestion). The renderer mirrors these into
+ *         // --surface-<name>-{outline,body,text}-alpha on every
+ *         // settings:changed broadcast; src/index.css composes the
+ *         // final rgba via color-mix(...). Defaults below match the
+ *         // pre-refactor literal alphas exactly so a fresh install or
+ *         // a back-filled older settings file boots visually identical.
+ *         coach:      { outline, body, text },
+ *         transcript: { outline, body, text },
+ *         captured:   { outline, body, text },
+ *         suggestion: { outline, body, text },
+ *       },
+ *       transparencyPresets: {
+ *         // Three reusable preset slots. Each slot has a renameable
+ *         // `name` label and a `values` block that mirrors the shape of
+ *         // `appearance.transparency`. Loading a preset writes only into
+ *         // `appearance.transparency` — other appearance.* fields stay
+ *         // intact. Slot defaults: 'Day' (legible on bright screens),
+ *         // 'Night' (today's literal look), 'Demo' (punchy borders for
+ *         // screenshots).
+ *         slot1: { name, values: { coach, transcript, captured, suggestion } },
+ *         slot2: { ... },
+ *         slot3: { ... },
+ *       },
  *       // Phase 3 — Appearance expansion will land here:
- *       //   accent, opacity, density, windowSize, windowPosition,
+ *       //   accent, density, windowSize, windowPosition,
  *       //   alwaysOnTop, railStyle, capturedPaneVisible,
  *       //   suggestionCardStyle, pillarTintsEnabled, summaryGlass.
  *     },
@@ -263,6 +294,54 @@ export const DEFAULT_SETTINGS = Object.freeze({
     tagColors: {
       you: '#f0f0f0',
       other: '#c7d2fe',
+    },
+    // Per-surface alpha for the four controllable overlay surfaces.
+    // Values are raw 0..1 numerics; src/index.css composes the final
+    // colour via color-mix(in srgb, <hue> calc(var(--surface-X-Y-alpha)
+    // * 100%), transparent). Defaults below MUST equal the pre-refactor
+    // literal alphas in src/index.css so a fresh install (or a deep-
+    // merge back-fill of an older settings file) boots visually
+    // identical to the version that shipped without this block.
+    transparency: {
+      coach:      { outline: 0,    body: 0.9,  text: 0.94 },
+      transcript: { outline: 0.08, body: 0.03, text: 0.94 },
+      captured:   { outline: 0.08, body: 0.03, text: 0.66 },
+      suggestion: { outline: 0.08, body: 0.10, text: 0.94 },
+    },
+    // Three reusable preset slots. `name` is a short renameable label
+    // (≤20 chars in the editor UI); `values` mirrors the shape of
+    // `appearance.transparency`. Loading a preset writes ONLY into
+    // `appearance.transparency` — never into other appearance.* fields.
+    // Slot 2 ("Night") exactly equals the live default so the current
+    // look is always one click away after the user starts experimenting.
+    transparencyPresets: {
+      slot1: {
+        name: 'Day',
+        values: {
+          coach:      { outline: 0,    body: 0.65, text: 0.94 },
+          transcript: { outline: 0.12, body: 0.08, text: 0.94 },
+          captured:   { outline: 0.12, body: 0.08, text: 0.78 },
+          suggestion: { outline: 0.12, body: 0.18, text: 0.94 },
+        },
+      },
+      slot2: {
+        name: 'Night',
+        values: {
+          coach:      { outline: 0,    body: 0.9,  text: 0.94 },
+          transcript: { outline: 0.08, body: 0.03, text: 0.94 },
+          captured:   { outline: 0.08, body: 0.03, text: 0.66 },
+          suggestion: { outline: 0.08, body: 0.10, text: 0.94 },
+        },
+      },
+      slot3: {
+        name: 'Demo',
+        values: {
+          coach:      { outline: 0,    body: 0.4,  text: 1.0 },
+          transcript: { outline: 0.2,  body: 0.05, text: 1.0 },
+          captured:   { outline: 0.2,  body: 0.05, text: 0.9 },
+          suggestion: { outline: 0.2,  body: 0.18, text: 1.0 },
+        },
+      },
     },
   },
   /**

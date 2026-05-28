@@ -360,6 +360,16 @@ let liveSession = null;
 let coachSession = null;
 let deepgramSession = null;
 let mainWindowRef = null;
+/**
+ * Secondary BrowserWindow used by the Appearance tab's transparency
+ * preview. Lazy-created the first time the user clicks "Open preview"
+ * (appearance:open-preview IPC); destroyed on appearance:close-preview
+ * or when the main window closes. See createPreviewWindow() below for
+ * the WebPreferences contract — it re-uses the same preload bridge as
+ * the main window so window.api.settings.onChanged is available in
+ * the preview renderer for the live-update path.
+ */
+let previewWindowRef = null;
 let sessionStartedAt = 0;
 
 /**
@@ -1834,11 +1844,118 @@ const createWindow = () => {
 
   mainWindow.on('closed', () => {
     if (mainWindowRef === mainWindow) mainWindowRef = null;
+    // The preview window is conceptually a sidecar of the main
+    // overlay — without an overlay to compare against it has no
+    // reason to exist, and a stale preview hanging around after
+    // the main quits looks like an app bug. Tear it down here so
+    // a future re-open of the main window starts with a clean
+    // slate. We dispose explicitly rather than relying on
+    // BrowserWindow.getAllWindows() so we don't accidentally
+    // catch any other top-level window a later plan might add.
+    if (previewWindowRef && !previewWindowRef.isDestroyed()) {
+      previewWindowRef.destroy();
+    }
+    previewWindowRef = null;
   });
 
   mainWindowRef = mainWindow;
   return mainWindow;
 };
+
+/**
+ * Build the preview BrowserWindow used by the transparency editor.
+ *
+ * Cloned from createWindow() with three intentional differences:
+ *
+ *   1. `alwaysOnTop: false` — we want the user to be able to focus
+ *      the main settings tab while the preview sits beside it.
+ *      Forcing it to float would mean clicks on the Appearance tab
+ *      get masked by the preview if it overlaps.
+ *
+ *   2. Smaller default dimensions (480 × 360, min 360 × 280) —
+ *      the preview is a styling sandbox, not a working surface,
+ *      so it shouldn't compete with the main overlay for screen
+ *      real estate.
+ *
+ *   3. Positioned to the LEFT of the main window if the main is
+ *      alive, else top-left of the workArea. Keeps the two
+ *      windows side-by-side without overlapping on first open;
+ *      the user can drag the preview wherever they like
+ *      afterwards (frame:false + transparent:true + the existing
+ *      app-region drag handle in preview.html).
+ *
+ * `hasShadow: false` is preserved from the main window for the same
+ * macOS reason — see the long comment in createWindow() above. With
+ * frame:false + transparent:true the OS would otherwise rasterise a
+ * 1px ring around the preview's alpha mask, and we want the preview
+ * to look pixel-identical to the main overlay so the user's edits
+ * read accurately.
+ */
+function createPreviewWindow() {
+  const { workArea } = screen.getPrimaryDisplay();
+  const PREVIEW_WIDTH = 480;
+  const PREVIEW_HEIGHT = 360;
+  const PREVIEW_MIN_WIDTH = 360;
+  const PREVIEW_MIN_HEIGHT = 280;
+
+  let x = workArea.x + EDGE_MARGIN;
+  let y = workArea.y + EDGE_MARGIN;
+  if (mainWindowRef && !mainWindowRef.isDestroyed()) {
+    const mainBounds = mainWindowRef.getBounds();
+    // Place the preview to the LEFT of the main, vertically centred
+    // on the main. Clamp so the preview stays inside the work area
+    // if the main is already snug against the right edge with no
+    // room on its left.
+    const proposedX = mainBounds.x - PREVIEW_WIDTH - 16;
+    x = Math.max(workArea.x + EDGE_MARGIN, proposedX);
+    y = Math.max(
+      workArea.y + EDGE_MARGIN,
+      mainBounds.y + Math.floor((mainBounds.height - PREVIEW_HEIGHT) / 2),
+    );
+  }
+
+  const previewWindow = new BrowserWindow({
+    width: PREVIEW_WIDTH,
+    height: PREVIEW_HEIGHT,
+    minWidth: PREVIEW_MIN_WIDTH,
+    minHeight: PREVIEW_MIN_HEIGHT,
+    x,
+    y,
+    frame: false,
+    transparent: true,
+    /* The preview is NOT alwaysOnTop — see top-of-function comment. */
+    alwaysOnTop: false,
+    resizable: true,
+    /* See createWindow() above for the full hasShadow:false rationale.
+     * Briefly: macOS's native NSWindow shadow stacks on top of the CSS
+     * box-shadow and rasterises as a sharp 1px ring around the alpha
+     * mask. Disabling the OS shadow lets the CSS box-shadow alone do
+     * the elevation, and the preview looks pixel-identical to the
+     * main overlay. */
+    hasShadow: false,
+    skipTaskbar: false,
+    backgroundColor: '#00000000',
+    title: 'Two Way Flow — Transparency Preview',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+    },
+  });
+
+  if (typeof PREVIEW_WINDOW_VITE_DEV_SERVER_URL !== 'undefined' && PREVIEW_WINDOW_VITE_DEV_SERVER_URL) {
+    previewWindow.loadURL(PREVIEW_WINDOW_VITE_DEV_SERVER_URL);
+  } else {
+    previewWindow.loadFile(
+      path.join(__dirname, `../renderer/${PREVIEW_WINDOW_VITE_NAME}/preview.html`),
+    );
+  }
+
+  previewWindow.on('closed', () => {
+    if (previewWindowRef === previewWindow) previewWindowRef = null;
+  });
+
+  previewWindowRef = previewWindow;
+  return previewWindow;
+}
 
 /**
  * Bring the overlay window forward from any state. Used by:
@@ -1963,6 +2080,27 @@ function send(channel, payload) {
   const w = mainWindowRef;
   if (!w || w.isDestroyed()) return;
   w.webContents.send(channel, payload);
+}
+
+/**
+ * Broadcast a `settings:changed` payload to every live renderer that
+ * cares about appearance state — currently the main window and (if
+ * open) the transparency preview window. We keep this separate from
+ * the generic `send()` above on purpose: most main → renderer
+ * channels (gemini:*, transcript:*, coach:*, connection:*) are only
+ * meaningful to the main window's renderer, so blindly fan-outing
+ * them through getAllWindows() would dump noise into the preview's
+ * console and risk wiring confusion later. Settings broadcasts are
+ * the ONE channel both renderers genuinely need.
+ *
+ * Safe to call before either window is alive — each branch no-ops
+ * when its ref is null or destroyed.
+ */
+function broadcastSettings(payload) {
+  const m = mainWindowRef;
+  if (m && !m.isDestroyed()) m.webContents.send('settings:changed', payload);
+  const p = previewWindowRef;
+  if (p && !p.isDestroyed()) p.webContents.send('settings:changed', payload);
 }
 
 /**
@@ -2504,8 +2642,10 @@ function registerIpcHandlers() {
     // Main itself doesn't subscribe — its plumbing reads settings
     // live via getCoach() / loadSettings() each tick, so an
     // in-process listener would be redundant. Single-direction
-    // broadcast keeps the contract simple.
-    send('settings:changed', payload);
+    // broadcast keeps the contract simple. broadcastSettings() also
+    // fans the payload out to the transparency preview window when
+    // it's open so slider edits reach both renderers in lock-step.
+    broadcastSettings(payload);
     return payload;
   });
 
@@ -2589,8 +2729,9 @@ function registerIpcHandlers() {
     // the difference, which is intentional. A reset IS a wholesale
     // save; the only special-casing is on the renderer's own button-
     // click code path that calls applySettingsToForm() after this
-    // resolves.
-    send('settings:changed', payload);
+    // resolves. broadcastSettings() also re-skins the transparency
+    // preview window if it's open so a reset wipes its surfaces too.
+    broadcastSettings(payload);
     return payload;
   });
 
@@ -2655,8 +2796,39 @@ function registerIpcHandlers() {
     const result = applyImportedSettings(parsed);
     if (!result.ok) return result;
     const payload = { ...result.settings, _envAvailability: getProviderEnvAvailability() };
-    send('settings:changed', payload);
+    broadcastSettings(payload);
     return { ok: true, settings: payload };
+  });
+
+  /* ── Settings → Appearance → Transparency preview window ──────────
+   *
+   * Two lifecycle handlers for the second BrowserWindow used by the
+   * transparency editor. The preview is a styling sandbox only — it
+   * loads preview.html, subscribes to the settings:changed broadcast
+   * via the same preload bridge as the main window, and applies the
+   * --surface-*-alpha CSS variables on every payload. It NEVER
+   * mutates settings (invariant 5 in the plan); all edits flow from
+   * the main window's Appearance tab.
+   *
+   * Idempotent: open-preview on an already-open window just lifts
+   * and focuses it; close-preview on an already-closed window
+   * returns { ok: true } harmlessly. */
+  ipcMain.handle('appearance:open-preview', () => {
+    if (!previewWindowRef || previewWindowRef.isDestroyed()) {
+      createPreviewWindow();
+    } else {
+      if (previewWindowRef.isMinimized()) previewWindowRef.restore();
+      previewWindowRef.show();
+      previewWindowRef.focus();
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('appearance:close-preview', () => {
+    if (previewWindowRef && !previewWindowRef.isDestroyed()) {
+      previewWindowRef.close();
+    }
+    return { ok: true };
   });
 
   ipcMain.handle('gemini:start', async () => {

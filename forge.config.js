@@ -243,6 +243,17 @@ module.exports = {
             name: 'main_window',
             config: 'vite.renderer.config.mjs',
           },
+          // Preview window — a second BrowserWindow that lives next to
+          // the main overlay and mirrors the per-surface alpha CSS
+          // variables driven by the Appearance tab's transparency
+          // editor. plugin-vite injects PREVIEW_WINDOW_VITE_DEV_SERVER_URL
+          // (dev / HMR) and PREVIEW_WINDOW_VITE_NAME (packaged build)
+          // constants which src/main.js → createPreviewWindow() reads to
+          // load preview.html in either environment.
+          {
+            name: 'preview_window',
+            config: 'vite.preview.config.mjs',
+          },
         ],
       },
     },

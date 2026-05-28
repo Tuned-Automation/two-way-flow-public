@@ -79,6 +79,31 @@
    * src/settings.js — keep them in sync. */
   --speaker-color-you: #f0f0f0;
   --speaker-color-other: #c7d2fe;
+
+  /* Per-surface transparency channels (settings-driven).
+   * Each of the four controllable overlay surfaces — .coach,
+   * .transcript-pane, .captured, .suggestion — exposes three raw
+   * 0.0–1.0 alpha knobs (outline / body / text) consumed via
+   * color-mix(in srgb, <hue> calc(var(--surface-X-Y-alpha) * 100%),
+   * transparent). The renderer mirrors these from
+   * appearance.transparency on every settings:changed broadcast and
+   * overrides them on every slider input. The CSS defaults below
+   * MUST equal DEFAULT_SETTINGS.appearance.transparency in
+   * src/settings.js so a fresh first-paint (before the renderer's
+   * first applySurfaceTransparency call) matches the persisted
+   * shape. */
+  --surface-coach-outline-alpha: 0;
+  --surface-coach-body-alpha: 0.9;
+  --surface-coach-text-alpha: 0.94;
+  --surface-transcript-outline-alpha: 0.08;
+  --surface-transcript-body-alpha: 0.03;
+  --surface-transcript-text-alpha: 0.94;
+  --surface-captured-outline-alpha: 0.08;
+  --surface-captured-body-alpha: 0.03;
+  --surface-captured-text-alpha: 0.66;
+  --surface-suggestion-outline-alpha: 0.08;
+  --surface-suggestion-body-alpha: 0.10;
+  --surface-suggestion-text-alpha: 0.94;
 }
 
 html,
@@ -162,7 +187,24 @@ a,
   height: calc(100vh - 48px);
   margin: 20px 20px 28px;
   border-radius: var(--radius-card);
-  background: var(--bg-card);
+  /* Settings-driven body alpha. The :root default of 0.9 reproduces
+   * the original --bg-card rgba(18, 20, 24, 0.9). The renderer
+   * (src/renderer.js → applySurfaceTransparency) overrides
+   * --surface-coach-body-alpha on every slider input. */
+  background: color-mix(
+    in srgb,
+    rgb(18 20 24) calc(var(--surface-coach-body-alpha) * 100%),
+    transparent
+  );
+  /* Shadow --text-strong so all descendants inside the coach card
+   * (transcript pane, captured pane, suggestion card, etc.) inherit
+   * the surface text alpha. Sub-surfaces below override this again
+   * with their own surface-X-text-alpha. */
+  --text-strong: color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-coach-text-alpha) * 100%),
+    transparent
+  );
   box-shadow:
     0 22px 56px -12px rgba(0, 0, 0, 0.55),
     0 8px 20px -8px rgba(0, 0, 0, 0.35);
@@ -1043,6 +1085,18 @@ a,
   height: 100%;
   display: flex;
   flex-direction: column;
+  /* Surface text-alpha shadow. Children inside .transcript-pane
+   * read the per-surface text alpha via the cascade. The outer
+   * dark backdrop below (rgba(0,0,0,0.18)) is structural — it's
+   * the dark frame that differentiates the transcript area from
+   * the coach card; it is NOT user-settings-driven. Body / outline
+   * alpha apply to the white-tinted overlays in the footer + state
+   * variants below. */
+  --text-strong: color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-transcript-text-alpha) * 100%),
+    transparent
+  );
   background: rgba(0, 0, 0, 0.18);
   /* Belt-and-braces clip. The flex children below are sized so
    * nothing overflows in practice, but if something inside the
@@ -1167,8 +1221,17 @@ a,
   flex-direction: column;
   gap: 6px;
   padding: 8px 14px 10px;
-  border-top: 1px solid var(--border-soft);
-  background: rgba(255, 255, 255, 0.03);
+  /* Settings-driven outline + body alpha for the drawer chrome. */
+  border-top: 1px solid color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-transcript-outline-alpha) * 100%),
+    transparent
+  );
+  background: color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-transcript-body-alpha) * 100%),
+    transparent
+  );
   height: var(--drawer-h, auto);
   flex: 0 0 auto;
   min-height: 0;
@@ -1442,8 +1505,29 @@ a,
   gap: 3px;
   padding: 8px 10px;
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  /* Settings-driven body + outline alpha. The [data-asked='true']
+   * state variant + the [data-color] tints below intentionally
+   * compose on TOP of these defaults (their own color-mix layers
+   * paint the green / amber / red signal over the surface body),
+   * so dialling the suggestion body alpha up or down still leaves
+   * the state-change signal visible. */
+  background: color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-suggestion-body-alpha) * 100%),
+    transparent
+  );
+  border: 1px solid color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-suggestion-outline-alpha) * 100%),
+    transparent
+  );
+  /* Surface text alpha. Cascades to suggestion body copy, kind /
+   * pillar chips, and the Skip / Mark-asked pills via --text-strong. */
+  --text-strong: color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-suggestion-text-alpha) * 100%),
+    transparent
+  );
   /* Border-colour transition so the card greens in smoothly when the
    * coach fires mark_question_asked rather than snapping. Keeps the
    * "saw you ask it" feedback visible for a beat without feeling
@@ -2192,7 +2276,30 @@ a,
   container-type: inline-size;
   container-name: captured;
   padding: 14px 14px;
-  border-left: 1px solid var(--border-soft);
+  /* Settings-driven outline + body alpha. Body default (0.03) is a
+   * near-invisible lift over the .coach backdrop; users can dial
+   * it up to make the captured column read as a distinct surface
+   * for screen-share / privacy / readability needs. Outline default
+   * (0.08) matches the prior --border-soft alpha. */
+  background: color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-captured-body-alpha) * 100%),
+    transparent
+  );
+  border-left: 1px solid color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-captured-outline-alpha) * 100%),
+    transparent
+  );
+  /* Surface text alpha. Cascades to all .captured__* children that
+   * read --text-strong. Other text variables (--text-med,
+   * --text-dim, --text-faint) inherit from :root unchanged so the
+   * captured-internal visual hierarchy is preserved. */
+  --text-strong: color-mix(
+    in srgb,
+    rgb(255 255 255) calc(var(--surface-captured-text-alpha) * 100%),
+    transparent
+  );
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -3731,6 +3838,196 @@ a,
 .appearance-reset-btn:hover {
   color: rgba(255, 255, 255, 0.85);
   border-color: rgba(255, 255, 255, 0.25);
+}
+
+/* ── Per-surface transparency editor (Appearance tab) ──────────────
+ *
+ * Lives in the Settings modal's Appearance tab below the speaker-
+ * label tag-colour grid. Three sliders drive --surface-*-alpha
+ * variables synchronously for instant live preview and queue a
+ * debounced settings.save for persistence. Three preset slot cards
+ * snapshot / restore the full transparency subtree.
+ *
+ * Visual register: matches the existing settings-section weight so
+ * the editor reads as a sibling of the speaker-label section rather
+ * than a separate destination. Uses --text-strong / --text-med /
+ * --text-dim tokens and the existing .modal__btn family for buttons
+ * — no new colour tokens.
+ */
+.transparency-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.transparency-controls__group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.transparency-controls__group > label {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.transparency-surface-select {
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 120px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.transparency-surface-select:hover {
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.transparency-surface-select:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.35);
+  outline-offset: 1px;
+}
+
+.transparency-sliders {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.transparency-slider {
+  display: grid;
+  /* label | track | percentage badge. The label column floors at
+   * 72px so the three labels (Outline / Body / Text) align under
+   * each other; the value column is fixed-width so the slider
+   * track stays the same width as the percentage rolls up and
+   * down between 0% and 100%. */
+  grid-template-columns: 72px 1fr 44px;
+  align-items: center;
+  gap: 10px;
+}
+
+.transparency-slider > label {
+  font-size: 11.5px;
+  color: var(--text-med);
+}
+
+.transparency-slider__input {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.transparency-slider__input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 80ms ease;
+}
+
+.transparency-slider__input::-webkit-slider-thumb:hover {
+  transform: scale(1.08);
+}
+
+.transparency-slider__input:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid rgba(255, 255, 255, 0.45);
+  outline-offset: 2px;
+}
+
+.transparency-slider__value {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.transparency-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.transparency-presets {
+  margin-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.transparency-preset {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  background: rgba(20, 20, 30, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+}
+
+.transparency-preset__name {
+  appearance: none;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-strong);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 5px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  -webkit-app-region: no-drag;
+}
+
+.transparency-preset__name:hover,
+.transparency-preset__name:focus {
+  border-color: rgba(255, 255, 255, 0.22);
+  outline: none;
+}
+
+.transparency-preset__actions {
+  display: flex;
+  gap: 4px;
+}
+
+.transparency-preset__actions > .modal__btn {
+  flex: 1 1 0;
+  padding: 4px 6px;
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+/* Inline hint below a slider — used by Task 9 to surface low-alpha
+ * foot-guns (macOS native-shadow ring at very low outline alpha,
+ * illegibility at low text alpha). Renderer toggles [hidden] based
+ * on the current slider value. */
+.transparency-hint {
+  grid-column: 2 / 4;
+  margin: -4px 0 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  font-style: italic;
 }
 
 /* Bottom-of-tab footer note. Reads as a subtle hint with a warning
