@@ -6201,6 +6201,211 @@ a,
   font-weight: 600;
 }
 
+/* ────────────────────────────────────────────────────────────────────
+ * Settings → Error Log tab (Wave 3 feature/error-log)
+ *
+ * Sibling of the Usage tab — same scoped-selector pattern under
+ * #settingsTabLogs, same .data-action button reuse for Clear /
+ * Reveal, same card background + hairline border so the two
+ * observability tabs read as a pair.
+ *
+ * Level distinction (error vs warn) lives on a left-edge accent
+ * bar coloured red / amber AND on the .log-row__level pill background
+ * — both data-driven via [data-level='error'|'warn'] on the row, so
+ * any future level (e.g. 'info' for a verbose debug toggle) is one
+ * rule addition.
+ *
+ * Source distinction is intentionally NOT colour-keyed today. The pill
+ * uses a single neutral indigo tint. If a future filter UI needs per-
+ * source colours, add a `[data-source='coach'|'facts-scanner'|…]`
+ * selector under .log-row__source — the data attribute is already
+ * present on the renderer-emitted markup.
+ *
+ * Not opted into the --surface-X-Y-alpha system. Same reasoning as
+ * the Usage tab: the settings modal is a system overlay, not one of
+ * the four user-controllable surfaces, so making it bound to the
+ * transparency sliders would let the user accidentally render it
+ * unreadable. ──────────────────────────────────────────────────── */
+
+#settingsTabLogs .error-log-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#settingsTabLogs .error-log-empty {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 16px 12px;
+  background: rgba(20, 20, 30, 0.4);
+  border: 1px dashed rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  margin: 12px 0 0;
+  text-align: center;
+}
+
+#settingsTabLogs .log-row {
+  background: rgba(20, 20, 30, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  /* The left-edge accent bar — colour overridden by [data-level] below.
+   * Default transparent so a row without a known level still aligns
+   * vertically with the coloured ones. */
+  border-left: 3px solid transparent;
+  border-radius: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background-color 120ms ease-out, border-color 120ms ease-out;
+}
+
+#settingsTabLogs .log-row:hover {
+  background: rgba(28, 30, 38, 0.72);
+}
+
+#settingsTabLogs .log-row.is-expanded {
+  background: rgba(28, 30, 38, 0.85);
+}
+
+#settingsTabLogs .log-row[data-level='error'] {
+  border-left-color: rgba(239, 68, 68, 0.85);
+}
+
+#settingsTabLogs .log-row[data-level='warn'] {
+  border-left-color: rgba(245, 158, 11, 0.85);
+}
+
+#settingsTabLogs .log-row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+
+#settingsTabLogs .log-row__time {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+#settingsTabLogs .log-row__level,
+#settingsTabLogs .log-row__source {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+#settingsTabLogs .log-row__level {
+  /* Fallback styling — overridden by [data-level] on the parent row. */
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-med);
+}
+
+#settingsTabLogs .log-row[data-level='error'] .log-row__level {
+  background: rgba(239, 68, 68, 0.18);
+  color: rgba(252, 165, 165, 0.95);
+}
+
+#settingsTabLogs .log-row[data-level='warn'] .log-row__level {
+  background: rgba(245, 158, 11, 0.18);
+  color: rgba(252, 211, 77, 0.95);
+}
+
+#settingsTabLogs .log-row__source {
+  background: rgba(99, 102, 241, 0.16);
+  color: rgba(165, 180, 252, 0.95);
+}
+
+#settingsTabLogs .log-row__provider {
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+#settingsTabLogs .log-row__message {
+  color: var(--text-strong);
+  /* flex item that takes the remaining space and truncates with
+   * ellipsis. min-width: 0 is the standard fix for "flex item with
+   * overflow: hidden won't shrink below its content's intrinsic
+   * width" — without it the ellipsis never engages. */
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#settingsTabLogs .log-row__details {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: rgba(0, 0, 0, 0.28);
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--text-med);
+  /* `hidden` attribute on the renderer's <div> handles show/hide via
+   * the browser's default `[hidden] { display: none; }`. We don't
+   * set `display` here so that default still wins. */
+}
+
+#settingsTabLogs .log-row__details-list {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 12px;
+  row-gap: 4px;
+  margin: 0;
+}
+
+#settingsTabLogs .log-row__details-list dt {
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  margin: 0;
+}
+
+#settingsTabLogs .log-row__details-list dd {
+  margin: 0;
+  color: var(--text-med);
+  word-break: break-word;
+}
+
+#settingsTabLogs .log-row__details-heading {
+  margin: 10px 0 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+#settingsTabLogs .log-row__details-raw {
+  margin: 0;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.78);
+  /* pre-wrap preserves the linebreaks from the SDK's raw body while
+   * letting long unwrapped lines (e.g. minified JSON) wrap inside
+   * the panel. max-height + overflow: auto bounds the panel for
+   * stack-trace-style outputs that exceed the modal's vertical
+   * budget. */
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow: auto;
+}
+
 /* Reduced motion: drop the recording-dot pulse and the coach thinking pulse.
  * Also disable the rail-overlay slide transition. */
 @media (prefers-reduced-motion: reduce) {
@@ -6228,6 +6433,12 @@ a,
     transform: none;
   }
   .rubrics-tab__section[open] > .rubrics-tab__section-summary::before {
+    transition: none;
+  }
+  /* Error Log tab (Wave 3 feature/error-log): drop the row hover /
+   * expand transitions so a screen-reader user navigating row-by-row
+   * doesn't get a flashy background-colour shift on each tab stop. */
+  #settingsTabLogs .log-row {
     transition: none;
   }
 }
