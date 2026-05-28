@@ -261,11 +261,18 @@ export class Coach {
    * model invokes `mark_question_asked`. Main updates the matching
    * history entry and re-broadcasts to the renderer.
    */
-  constructor({ provider, getContext, onItemStateChange, onFieldCaptured, onSuggestion, onMeetingFact, onQuestionAsked, getSuggestionContext, onError, onTickStart, onTickEnd, tickMs }) {
+  constructor({ provider, getContext, onItemStateChange, onFieldCaptured, onSuggestion, onMeetingFact, onQuestionAsked, getSuggestionContext, onError, onTickStart, onTickEnd, tickMs, usageAccumulator }) {
     if (!provider || typeof provider.generateContent !== 'function') {
       throw new Error('Coach: provider with generateContent() is required');
     }
     this.provider = provider;
+    // Optional per-session usage accumulator. When supplied (always,
+    // in current main.js wiring), the Coach forwards every successful
+    // generateContent() call's `usage` into it via recordLlmCall().
+    // Optional + null-safe so a future test harness can drive the
+    // Coach without piping a full session through. See
+    // `src/usage-accumulator.js` for the contract.
+    this.usageAccumulator = usageAccumulator || null;
     this.getContext = getContext;
     this.onItemStateChange = onItemStateChange;
     this.onFieldCaptured = onFieldCaptured;
@@ -903,6 +910,12 @@ export class Coach {
         tools: functionDeclarations,
         userMessage: userText,
       });
+
+      // Forward per-tick token usage into the session accumulator
+      // (cost-tracking feature). Null-safe in both directions: a
+      // missing accumulator OR a provider that didn't return usage
+      // metadata is silently dropped — invariant #2.
+      this.usageAccumulator?.recordLlmCall('coach', result?.usage);
 
       // Abandonment check (D7): a priority Recap tick may have
       // bypassed our in-flight gate and stamped our hash as abandoned.

@@ -513,7 +513,7 @@ function buildUserMessage(chunk, priorFacts) {
  * the rollup scheduling — that responsibility stays with main so
  * teardown can fan-out cleanly.
  */
-export function createFactsScanner({ getNewTranscriptLines, getEntries, appendEntry, onError, intervalMs }) {
+export function createFactsScanner({ getNewTranscriptLines, getEntries, appendEntry, onError, intervalMs, usageAccumulator }) {
   if (typeof getNewTranscriptLines !== 'function') {
     throw new Error('facts-scanner: getNewTranscriptLines() is required');
   }
@@ -602,6 +602,12 @@ export function createFactsScanner({ getNewTranscriptLines, getEntries, appendEn
         responseMimeType: 'application/json',
         responseSchema: FACTS_SCHEMA,
       });
+
+      // Forward token usage into the per-session accumulator (cost-
+      // tracking feature). Null-safe both ways — a missing accumulator
+      // (older test harness) OR a provider that didn't return usage
+      // metadata is silently dropped per invariant #2.
+      usageAccumulator?.recordLlmCall('factsScanner', result?.usage);
 
       const raw = typeof result?.text === 'string' ? result.text : '';
       if (!raw) return;

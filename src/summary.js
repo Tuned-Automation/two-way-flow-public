@@ -105,7 +105,7 @@ const DEBRIEF_SCHEMA = {
  * provider degrades gracefully into a transcript-only summary so a
  * misconfigured key doesn't block the Stop flow.
  */
-export async function generateSummary({ provider, coachContext }) {
+export async function generateSummary({ provider, coachContext, usageAccumulator }) {
   const ctx = coachContext || {};
   const transcriptLines = Array.isArray(ctx.transcriptLines) ? ctx.transcriptLines : [];
   const itemStates = normaliseItemStates(ctx.itemStates);
@@ -118,7 +118,12 @@ export async function generateSummary({ provider, coachContext }) {
   const factsTable = buildFactsTable(capturedFields);
   const transcript = transcriptLines.filter((line) => typeof line === 'string' && line.length > 0).join('\n');
 
-  const debrief = await generateDebrief({ provider, transcript, scorecard, factsTable });
+  // `usageAccumulator` is optional and forwarded into the LLM call
+  // path so the post-call debrief contributes to the per-session
+  // cost record. Null-safe — a missing accumulator is silently
+  // ignored (older test harnesses that call generateSummary without
+  // wiring the accumulator still work).
+  const debrief = await generateDebrief({ provider, transcript, scorecard, factsTable, usageAccumulator });
 
   const structured = { scorecard, factsTable, transcript, debrief, durationMs };
   const asJSON = JSON.stringify(structured, null, 2);
@@ -218,7 +223,7 @@ function buildFactsTable(capturedFields) {
  * AI debrief
  * ──────────────────────────────────────────────────────────────────────── */
 
-async function generateDebrief({ provider, transcript, scorecard, factsTable }) {
+async function generateDebrief({ provider, transcript, scorecard, factsTable, usageAccumulator }) {
   const empty = { wentWell: '', missed: '', improvements: ['', '', ''] };
 
   if (!provider || typeof provider.generateContent !== 'function') {
@@ -258,6 +263,10 @@ async function generateDebrief({ provider, transcript, scorecard, factsTable }) 
       responseMimeType: 'application/json',
       responseSchema: DEBRIEF_SCHEMA,
     });
+
+    // Forward token usage into the per-session accumulator (cost-
+    // tracking feature). Null-safe in both directions per invariant #2.
+    usageAccumulator?.recordLlmCall('summary', result?.usage);
 
     const raw = typeof result?.text === 'string' ? result.text : '';
     if (!raw) return { ...empty, wentWell: '(Debrief unavailable: empty response.)' };
