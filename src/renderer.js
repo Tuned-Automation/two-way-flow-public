@@ -838,6 +838,15 @@ const state = {
    *   { id, kind, amount, unit, period, basis, quote, recordedAt, supersedes }
    */
   quickFixEntries: [],
+  /**
+   * Strategy A / Work-stream C: in-memory flag for the .quick-fix__details-toggle.
+   * false → #quickFix carries data-details='collapsed' (per-row notes
+   *         and the bottom assumptions list are CSS-hidden).
+   * true  → data-details='expanded' (everything visible).
+   * Reset to false in clearScoringState so Start always opens collapsed.
+   * No persistence — by design for v1.
+   */
+  quickFixDetailsExpanded: false,
   /** Fired live flags in arrival order, deduped by id. */
   flags: [],
 
@@ -2691,6 +2700,28 @@ function renderQuickFix() {
       delete statusEl.dataset.status;
     }
   }
+
+  // Details toggle — flips data-details on #quickFix and updates the
+  // aria-expanded + chevron glyph. State is mirrored on
+  // state.quickFixDetailsExpanded so it survives re-renders. Reset to
+  // collapsed in clearScoringState().
+  const toggleBtn = quickFixEl.querySelector('.quick-fix__details-toggle');
+  if (toggleBtn instanceof HTMLButtonElement) {
+    const expanded = Boolean(state.quickFixDetailsExpanded);
+    quickFixEl.dataset.details = expanded ? 'expanded' : 'collapsed';
+    toggleBtn.setAttribute('aria-expanded', String(expanded));
+    const chevronEl = toggleBtn.querySelector('.quick-fix__details-toggle-chevron');
+    if (chevronEl instanceof HTMLElement) {
+      chevronEl.textContent = expanded ? '▴' : '▾';
+    }
+    // Reassign .onclick (not addEventListener) so we don't accumulate
+    // duplicate handlers across re-renders. Same pattern as the export
+    // button above.
+    toggleBtn.onclick = () => {
+      state.quickFixDetailsExpanded = !state.quickFixDetailsExpanded;
+      renderQuickFix();
+    };
+  }
 }
 
 /**
@@ -2939,6 +2970,7 @@ function clearScoringState() {
   // renderQuickFix below renders this as "hidden" when null.
   state.quickFix = null;
   state.quickFixEntries = [];
+  state.quickFixDetailsExpanded = false;
   state.pillarStatus = Object.fromEntries(PILLARS.map((p) => [p.id, 'idle']));
   state.transcript = {
     committed: [],
