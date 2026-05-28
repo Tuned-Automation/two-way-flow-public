@@ -62,6 +62,33 @@ const DEBUG_DEEPGRAM = false;
  * that don't pass through a settings-driven model. */
 const DEFAULT_MODEL = 'nova-3';
 
+/* ────────────────────────────────────────────────────────────────────
+ * Cost-tracking note (session-cost-tracking feature, Wave 2)
+ *
+ * The DeepgramSession does NOT track per-channel connected-seconds for
+ * billing. Instead, the v1 cost-tracking path derives audio minutes at
+ * `gemini:stop` in src/main.js as:
+ *
+ *     audioMinutes = (durationMs / 1000 / 60) * 2  // two channels
+ *
+ * Why the simpler path:
+ *   - Both channels run for the entire session — there's no scenario
+ *     where one connection closes mid-call (a hiccup re-opens via the
+ *     existing _openChannel reconnect plumbing in this file).
+ *   - The ~5% accuracy gap from brief reconnect gaps is acceptable for
+ *     a first cut; the user-facing cost figure is an estimate, not an
+ *     invoice line item.
+ *   - Avoids touching the WebSocket open/close lifecycle in this file,
+ *     keeping the cost-tracking change additive and reversible.
+ *
+ * A future per-channel-accuracy v2 (better than ~95%) can adopt the
+ * `recordTranscriptionSeconds(channel, seconds, model)` method on
+ * src/usage-accumulator.js — it's already there, just uncalled by v1.
+ * The persisted SessionRecord schema is unchanged either way: the
+ * accumulator's snapshot() returns a single `audioMinutes` figure.
+ * ──────────────────────────────────────────────────────────────────── */
+
+
 /* Per-connection live options. One mono stream at 16kHz Int16 PCM —
  * matches the existing PCM worklet output, no resampling needed.
  *

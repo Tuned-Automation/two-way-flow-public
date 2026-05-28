@@ -624,7 +624,7 @@ function buildStage2UserMessage(activeEntries, previousHeadlineUsdAnnual, anchor
  *   debounceMs?: number,
  * }} deps
  */
-export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs }) {
+export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs, usageAccumulator }) {
   if (typeof getEntries !== 'function') {
     throw new Error('quick-fix: getEntries() is required');
   }
@@ -733,6 +733,10 @@ export function createQuickFixRoller({ getEntries, onRollup, onError, debounceMs
         responseMimeType: 'application/json',
         responseSchema: STAGE2_RESPONSE_SCHEMA,
       });
+
+      // Forward token usage into the per-session accumulator (cost-
+      // tracking feature). Null-safe both ways per invariant #2.
+      usageAccumulator?.recordLlmCall('quickFix', result?.usage);
 
       const raw = typeof result?.text === 'string' ? result.text : '';
       if (!raw) {

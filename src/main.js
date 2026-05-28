@@ -262,6 +262,14 @@ import { getProvider } from './providers/index.js';
 import * as rubricStore from './rubric-store.js';
 import { reloadActiveRubric } from './rubric.js';
 import { DEFAULT_RUBRIC } from './rubric-defaults.js';
+import {
+  appendSession,
+  listSessions,
+  clearAllSessions,
+  sessionsFilePath,
+} from './session-history.js';
+import { computeCost, PRICING_VERSION } from './pricing.js';
+import { createUsageAccumulator } from './usage-accumulator.js';
 
 if (started) {
   app.quit();
@@ -672,6 +680,35 @@ const coachContext = {
    * with a clean slate.
    */
   suggestionHistory: new Map(),
+
+  /**
+   * Per-session usage accumulator (session-cost-tracking feature).
+   *
+   * Single mutation surface for every billable event in the session:
+   *   - text-LLM calls          via accumulator.recordLlmCall(component, usage)
+   *   - Gemini Live audio       via accumulator.recordLiveAudio({ … })
+   *   - Deepgram audio minutes  via accumulator.recordTranscriptionSeconds(channel, sec, model)
+   *
+   * The accumulator is constructed eagerly here so any pre-session
+   * code path that reaches into coachContext.usageAccumulator (e.g.
+   * a unit test or a future "warm up" sequence) gets a real
+   * accumulator instead of `null`. `resetCoachContext()` replaces
+   * the field with a fresh accumulator at every `gemini:start` so
+   * each session has its own clean counter.
+   *
+   * On `gemini:stop` the accumulator is snapshotted, fed through
+   * `src/pricing.js::computeCost()` per component, and the resulting
+   * SessionRecord is appended to the on-disk store via
+   * `src/session-history.js::appendSession()`.
+   *
+   * Field appended at the END of the literal (not after
+   * `suggestionHistory`) so the parallel `feature/reform-cap-pivot`
+   * branch — which adds its OWN field at the same insertion point
+   * — auto-merges without collision. See plan kickoff prompt's
+   * "shared region" note for the rationale; preserve the END-of-
+   * literal placement convention when adding future fields.
+   */
+  usageAccumulator: createUsageAccumulator(),
 };
 
 const COACH_TRANSCRIPT_WINDOW_LINES = 40; // cap context size
@@ -977,6 +1014,23 @@ function resetCoachContext() {
     clearTimeout(reformulateTimer);
     reformulateTimer = null;
   }
+
+  // Fresh per-session usage accumulator (session-cost-tracking
+  // feature). Replacing the field — not calling a reset() on the
+  // existing instance — keeps `src/usage-accumulator.js` strictly
+  // factory-style with no public reset API, and guarantees that any
+  // stale reference held by a long-lived async (e.g. a late summary
+  // .then callback) can't accidentally double-write into the new
+  // session's bucket.
+  //
+  // Append at the END of resetCoachContext() (NOT next to the other
+  // field-reset lines above) so the parallel `feature/reform-cap-
+  // pivot` branch — which adds its OWN reset line at the same
+  // insertion point — auto-merges without collision. See plan
+  // kickoff prompt's "shared region" note for the rationale;
+  // preserve the END-of-function placement convention when adding
+  // future resets.
+  coachContext.usageAccumulator = createUsageAccumulator();
 }
 
 /**
@@ -1088,6 +1142,17 @@ async function openGeminiLiveSession({ apiKey }) {
       // call doesn't end — but live flag detection stops until the
       // reconnect lands. Capped at MAX_GEMINI_RECONNECTS attempts.
       reconnectGeminiLive({ apiKey });
+    },
+    // Per-message usage forwarding (session-cost-tracking feature).
+    // The Live API emits `usageMetadata` periodically over the WS;
+    // GeminiSession's _handleUsageMetadata parses the modality-detail
+    // arrays and calls back here with audio/text token counts. We
+    // record against the LIVE accumulator on coachContext, NOT a
+    // captured reference, so a mid-session resetCoachContext (rare
+    // but possible) routes subsequent counts to the new session's
+    // bucket rather than the abandoned one.
+    onUsage: (payload) => {
+      coachContext.usageAccumulator?.recordLiveAudio(payload);
     },
   });
   await created.open();
@@ -2653,6 +2718,111 @@ function flushPendingTranscripts() {
   }
 }
 
+/* ────────────────────────────────────────────────────────────────────
+ * Session cost persistence (session-cost-tracking feature, Wave 2)
+ * ──────────────────────────────────────────────────────────────────── */
+
+/**
+ * Snapshot the per-session usage accumulator, run it through the
+ * pricing table, and append the resulting SessionRecord to the
+ * on-disk store (`~/Library/Application Support/Two Way Flow/
+ * sessions.json` on macOS — see src/session-history.js for the full
+ * path resolution).
+ *
+ * Called from the `gemini:stop` handler's summary-completion
+ * callback so the summary call's tokens are counted in the same
+ * session record as the rest of the call (the .then() / .catch()
+ * branches both call this — a failed summary should NOT lose the
+ * rest of the call's cost data).
+ *
+ * Deepgram audio minutes are derived from session duration × 2
+ * channels (v1 path — see plan Task 6 §3 for the rationale and the
+ * doc-block in src/deepgram-session.js for the future v2 hook).
+ *
+ * Tolerance contract:
+ *   - durationMs ≤ 0 → skip persistence entirely. Catches the
+ *     "Start failed before sessionStartedAt was set" and the
+ *     "double-Stop while teardown was already in flight" edge
+ *     cases without writing zero-value records.
+ *   - appendSession() throwing is caught + logged. The user sees no
+ *     error; they just won't see the session in the Usage tab. The
+ *     console warning is the diagnostic crumb.
+ *   - Any computeCost() call returning `{ matched: false }` produces
+ *     a 0 for that component's costUsd — the SessionRecord still
+ *     persists so the user can see the per-component token figures
+ *     (and a future "estimate unavailable" badge in the UI per
+ *     plan invariant #3).
+ */
+async function persistSessionRecord({ accumulator, startedAt, durationMs }) {
+  if (!accumulator || !Number.isFinite(durationMs) || durationMs <= 0) return;
+
+  const usageSnapshot = accumulator.snapshot();
+
+  // Override the Deepgram minutes with the duration-derived figure.
+  // See the doc-block in src/deepgram-session.js for why the v1 path
+  // takes this shortcut instead of per-channel recording. Both
+  // channels run for the full session by construction; we multiply
+  // by 2 because Deepgram bills per channel-second.
+  usageSnapshot.deepgram.audioMinutes = (durationMs / 1000 / 60) * 2;
+  // Stamp the model the live session was using so the pricing
+  // lookup hits the right rate even if the accumulator's record-
+  // path never received a model name (v1 doesn't call
+  // recordTranscriptionSeconds — invariant: the accumulator's
+  // deepgram.model may be null, in which case we fall back to the
+  // settings default).
+  if (!usageSnapshot.deepgram.model) {
+    usageSnapshot.deepgram.model = getAudio().deepgramModel || 'nova-3';
+  }
+
+  const cost = {
+    geminiLive: computeCost({
+      provider: 'gemini',
+      model: usageSnapshot.geminiLive.model,
+      audioInputTokens: usageSnapshot.geminiLive.audioInputTokens,
+      audioOutputTokens: usageSnapshot.geminiLive.audioOutputTokens,
+      textOutputTokens: usageSnapshot.geminiLive.textOutputTokens,
+    }).usd,
+    deepgram: computeCost({
+      provider: 'deepgram',
+      model: usageSnapshot.deepgram.model,
+      audioMinutes: usageSnapshot.deepgram.audioMinutes,
+    }).usd,
+    coach: computeCost(usageSnapshot.coach).usd,
+    summary: computeCost(usageSnapshot.summary).usd,
+    factsScanner: computeCost(usageSnapshot.factsScanner).usd,
+    quickFix: computeCost(usageSnapshot.quickFix).usd,
+  };
+  cost.total =
+    cost.geminiLive +
+    cost.deepgram +
+    cost.coach +
+    cost.summary +
+    cost.factsScanner +
+    cost.quickFix;
+
+  /** @type {import('./session-history.js').SessionRecord | object} */
+  const record = {
+    id: new Date(startedAt).toISOString(),
+    startedAt,
+    endedAt: startedAt + durationMs,
+    durationMs,
+    usage: usageSnapshot,
+    costUsd: cost,
+    pricingVersion: PRICING_VERSION,
+  };
+
+  try {
+    await appendSession(record);
+    console.log(
+      '[history] session recorded · id:', record.id,
+      '· duration:', (durationMs / 1000).toFixed(1) + 's',
+      '· total: $' + cost.total.toFixed(4),
+    );
+  } catch (err) {
+    console.warn('[history] failed to persist session record:', err?.message || err);
+  }
+}
+
 function registerIpcHandlers() {
   /**
    * Settings IPC. Both handlers return the FULL current settings
@@ -2996,6 +3166,11 @@ function registerIpcHandlers() {
     });
     coachSession = new Coach({
       provider: coachProvider,
+      // Hand the per-session usage accumulator to the Coach so each
+      // generateContent() tick is forwarded into the cost-tracking
+      // record. Null-safe on the Coach side; passing it
+      // unconditionally is harmless.
+      usageAccumulator: coachContext.usageAccumulator,
       getContext: buildCoachContextSnapshot,
       onItemStateChange: (payload) => {
         // Idempotent guard: if the state we just received is identical
@@ -3181,6 +3356,10 @@ function registerIpcHandlers() {
     if (factsScannerConfig.enabled) {
       if (!quickFixRoller) {
         quickFixRoller = createQuickFixRoller({
+          // Forward Stage-2 LLM token usage into the per-session
+          // accumulator (cost-tracking feature). Null-safe on the
+          // roller side.
+          usageAccumulator: coachContext.usageAccumulator,
           getEntries: () => coachContext.factsSheet.entries,
           onRollup: (rollup, activeEntries) => {
             coachContext.factsSheet.quickFix = rollup;
@@ -3202,6 +3381,10 @@ function registerIpcHandlers() {
       }
       factsScanner = createFactsScanner({
         intervalMs: factsScannerConfig.intervalMs,
+        // Forward Stage-1 scan LLM token usage into the per-session
+        // accumulator (cost-tracking feature). Null-safe on the
+        // scanner side.
+        usageAccumulator: coachContext.usageAccumulator,
         getEntries: () => coachContext.factsSheet.entries,
         getNewTranscriptLines: () => {
           // Hand back lines committed since the previous scan and
@@ -3298,8 +3481,17 @@ function registerIpcHandlers() {
   });
 
   ipcMain.handle('gemini:stop', async () => {
-    // Snapshot the duration before teardown clears sessionStartedAt.
+    // Snapshot the duration + start time + accumulator reference
+    // BEFORE teardown clears sessionStartedAt and before any
+    // resetCoachContext() (which would swap the accumulator) can
+    // fire. The captured `sessionAccumulator` survives a mid-call
+    // re-Start because resetCoachContext() replaces the FIELD on
+    // coachContext rather than mutating the existing instance —
+    // a still-in-flight summary keeps recording into the original
+    // session's bucket.
     const durationMs = sessionStartedAt > 0 ? Date.now() - sessionStartedAt : 0;
+    const sessionStartedAtSnapshot = sessionStartedAt;
+    const sessionAccumulator = coachContext.usageAccumulator;
     sessionStartedAt = 0;
 
     await teardownSession();
@@ -3336,9 +3528,26 @@ function registerIpcHandlers() {
     generateSummary({
       provider: summaryProvider,
       coachContext: snapshot,
+      // Forward the captured accumulator so the summary's debrief
+      // LLM call gets counted in this session's cost record. Use
+      // the captured reference (not coachContext.usageAccumulator)
+      // because a mid-call re-Start would have already swapped the
+      // live field to a fresh accumulator by the time the .then()
+      // below fires.
+      usageAccumulator: sessionAccumulator,
     })
       .then((summary) => {
         send('summary:ready', summary);
+        // Finalise + persist the cost record AFTER summary's tokens
+        // have been recorded into the accumulator. A failed summary
+        // still triggers persistence via the .catch() below — a
+        // failed debrief shouldn't lose the rest of the call's
+        // cost data.
+        return persistSessionRecord({
+          accumulator: sessionAccumulator,
+          startedAt: sessionStartedAtSnapshot,
+          durationMs,
+        });
       })
       .catch((err) => {
         console.warn('[summary] generation threw:', err?.message || err);
@@ -3351,9 +3560,95 @@ function registerIpcHandlers() {
           asJSON: '{}',
           asMarkdown: '# Discovery Call Summary\n\n_Summary generation failed._',
         });
+        // Persist the session record even though the summary failed —
+        // the rest of the call's cost data is too valuable to lose.
+        return persistSessionRecord({
+          accumulator: sessionAccumulator,
+          startedAt: sessionStartedAtSnapshot,
+          durationMs,
+        });
       });
 
     return { ok: true };
+  });
+
+  /* ── Session-cost-tracking IPC ────────────────────────────────────
+   *
+   * Three thin handlers fronting `src/session-history.js`:
+   *
+   *   sessions:list   → SessionRecord[] (newest first)
+   *   sessions:clear  → { removed: number }
+   *   sessions:export → { json: string, csv: string }
+   *
+   * No new persisted state lives here — the disk store is owned by
+   * session-history.js and all writes happen there. The renderer's
+   * `window.sessions.*` preload bridge (src/preload.js, Task 8) is
+   * the only consumer; the Settings → Usage tab renders the result.
+   *
+   * `sessions:export` builds BOTH a pretty-printed JSON dump and a
+   * one-row-per-session CSV with the headline cost fields. The
+   * detailed per-component breakdown stays in the JSON only — CSV
+   * is meant for quick spreadsheet ingestion / monthly reconciliation,
+   * not for a full audit (the JSON is the audit format).
+   * ──────────────────────────────────────────────────────────────── */
+
+  ipcMain.handle('sessions:list', async () => {
+    try {
+      return await listSessions();
+    } catch (err) {
+      console.warn('[sessions:list] failed:', err?.message || err);
+      return [];
+    }
+  });
+
+  ipcMain.handle('sessions:clear', async () => {
+    try {
+      return await clearAllSessions();
+    } catch (err) {
+      console.warn('[sessions:clear] failed:', err?.message || err);
+      return { removed: 0, error: err?.message || 'clear_failed' };
+    }
+  });
+
+  ipcMain.handle('sessions:export', async () => {
+    try {
+      const sessions = await listSessions();
+      const json = JSON.stringify(sessions, null, 2);
+      // CSV with one row per session. Headers chosen for monthly
+      // reconciliation: who-ran-when + total + per-component USD.
+      // Per-component token figures stay in the JSON export — adding
+      // them to the CSV would balloon the column count without
+      // helping the typical "what did this month cost" question.
+      const header =
+        'id,startedAt,endedAt,durationMs,totalUsd,' +
+        'coachUsd,summaryUsd,factsScannerUsd,quickFixUsd,' +
+        'geminiLiveUsd,deepgramUsd\n';
+      const rows = sessions.map((s) => {
+        const c = s.costUsd || {};
+        return [
+          s.id,
+          s.startedAt,
+          s.endedAt,
+          s.durationMs,
+          Number(c.total || 0).toFixed(6),
+          Number(c.coach || 0).toFixed(6),
+          Number(c.summary || 0).toFixed(6),
+          Number(c.factsScanner || 0).toFixed(6),
+          Number(c.quickFix || 0).toFixed(6),
+          Number(c.geminiLive || 0).toFixed(6),
+          Number(c.deepgram || 0).toFixed(6),
+        ].join(',');
+      });
+      return {
+        json,
+        csv: header + rows.join('\n'),
+        sessionsCount: sessions.length,
+        filePath: sessionsFilePath(),
+      };
+    } catch (err) {
+      console.warn('[sessions:export] failed:', err?.message || err);
+      return { json: '[]', csv: '', sessionsCount: 0, error: err?.message || 'export_failed' };
+    }
   });
 
   /* ── Generic dialog plumbing (dialog:open / dialog:save) ──────────

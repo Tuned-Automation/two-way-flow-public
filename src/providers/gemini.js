@@ -90,6 +90,7 @@ export class GeminiProvider {
     return {
       toolCalls: extractToolCalls(result),
       text: extractText(result),
+      usage: extractUsage(result, this.model),
     };
   }
 
@@ -159,6 +160,31 @@ function extractText(result) {
     if (typeof p?.text === 'string') buf.push(p.text);
   }
   return buf.join('');
+}
+
+/**
+ * Pull a universal `{ provider, model, inputTokens, outputTokens }`
+ * payload out of a @google/genai response. Gemini exposes the figures
+ * under `result.usageMetadata.{promptTokenCount, candidatesTokenCount}`.
+ *
+ * Returns `null` if usage metadata is missing (the Coach tick never
+ * crashes on missing usage — invariant #2 of the cost-tracking plan).
+ *
+ * NOTE: this extractor handles the TEXT models only. The Gemini Live
+ * native-audio loop in `src/gemini-session.js` has its own modality-
+ * aware extractor because the Live SDK splits the figures by AUDIO /
+ * TEXT under nested detail arrays — keeping that logic in the WS
+ * session module avoids leaking Live-specific shape knowledge here.
+ */
+function extractUsage(result, model) {
+  const meta = result?.usageMetadata;
+  if (!meta || typeof meta !== 'object') return null;
+  return {
+    provider: 'gemini',
+    model,
+    inputTokens: Number(meta.promptTokenCount) || 0,
+    outputTokens: Number(meta.candidatesTokenCount) || 0,
+  };
 }
 
 function friendlyError(err) {

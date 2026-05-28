@@ -720,3 +720,52 @@ contextBridge.exposeInMainWorld('rubrics', {
   getDefaultPrompts: () => ipcRenderer.invoke('rubrics:get-default-prompts'),
   onChanged: subscribe('rubrics:changed'),
 });
+
+/* ────────────────────────────────────────────────────────────────────
+ * Session cost tracking bridge (session-cost-tracking feature, Wave 2)
+ *
+ * Exposes the three `sessions:*` IPC channels under `window.sessions.*`.
+ * Used by the Settings → Usage tab in src/renderer.js to render the
+ * chronological list of session cost records and to wire the Export
+ * and Clear buttons.
+ *
+ * Namespace placement
+ *   Peer top-level namespace, NOT nested under `window.gemini.*`.
+ *   Follows the precedent set by Wave 1's `window.rubrics` namespace
+ *   (see the doc-block on that contextBridge call directly above).
+ *   `window.gemini` continues to own the live-session lifecycle +
+ *   coach IPC; `window.rubrics` owns the rubric library; `window.sessions`
+ *   owns the read-only cost-record store. Splitting by domain keeps
+ *   each namespace small enough to scan in one screen and avoids one
+ *   giant `gemini.*` god-object.
+ *
+ *   The coordinator can consolidate under `gemini.sessions` later if
+ *   the peer-namespace count becomes unwieldy — that's a one-line
+ *   move on the renderer side because the IPC channels are unchanged.
+ *
+ * Methods
+ *   list()    → SessionRecord[] (newest first)
+ *               Source of truth for the Usage tab's <ol>.
+ *   clear()   → { removed: number }
+ *               Wipes the on-disk store. The renderer's "Clear history"
+ *               button confirms via native confirm() before calling
+ *               this — there's no undo.
+ *   export()  → { json, csv, sessionsCount, filePath }
+ *               Returns BOTH JSON (full per-component breakdown) and
+ *               CSV (one row per session, headline cost figures) so
+ *               the renderer's Export flow can route either format
+ *               into the native Save dialog (v2; v1 copies JSON to
+ *               clipboard — see plan Task 10 §4 for the migration
+ *               path).
+ *
+ * Architecture invariant honoured here: the renderer NEVER imports
+ * src/session-history.js or src/pricing.js directly (per plan
+ * invariant #6). All access is through these three thin invokes so
+ * a future swap to better-sqlite3 / remote sync stays renderer-
+ * transparent.
+ * ──────────────────────────────────────────────────────────────────── */
+contextBridge.exposeInMainWorld('sessions', {
+  list: () => ipcRenderer.invoke('sessions:list'),
+  clear: () => ipcRenderer.invoke('sessions:clear'),
+  export: () => ipcRenderer.invoke('sessions:export'),
+});

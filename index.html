@@ -719,6 +719,22 @@
               aria-selected="false"
               aria-controls="settingsTabRubrics"
             >Rubrics</button>
+            <!-- Usage tab (session-cost-tracking feature, Wave 2).
+                 Slot chosen: between Rubrics and General per the
+                 kickoff prompt — user-facing tabs cluster at the
+                 front, Help stays at the end. Final tab order:
+                 Providers → Audio → Appearance → Coach → Rubrics →
+                 Usage → General → Help. Wave 3 (feature/error-log)
+                 will add a 9th tab; sequence with this branch on
+                 merge. -->
+            <button
+              type="button"
+              class="settings-modal__tab"
+              data-tab="usage"
+              role="tab"
+              aria-selected="false"
+              aria-controls="settingsTabUsage"
+            >Usage</button>
             <button
               type="button"
               class="settings-modal__tab"
@@ -1870,6 +1886,83 @@
                 <p>
                   No rubric selected. Pick one from the dropdown above
                   to edit, or click <strong>New…</strong> to create one.
+                </p>
+              </div>
+            </section>
+            <!-- Usage tab (session-cost-tracking feature, Wave 2).
+                 Populated lazily by src/renderer.js's renderUsageTab()
+                 on every Settings → Usage open: pulls
+                 window.sessions.list() and renders a chronological
+                 <ol>. Empty until the first recording lands a
+                 SessionRecord on disk via gemini:stop. Export copies
+                 the JSON payload to the clipboard for v1; a future
+                 follow-up will route through a native Save dialog
+                 (the helper exists in main.js under
+                 showSaveDialogAndMaybeWrite). -->
+            <section
+              id="settingsTabUsage"
+              class="settings-tab"
+              data-tab-content="usage"
+              role="tabpanel"
+              aria-label="Usage"
+              hidden
+            >
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Session log</h4>
+                <p class="settings-section__subtitle">
+                  Every recording is logged locally with timestamps,
+                  tokens, and an estimated cost. Stored in
+                  <code>sessions.json</code> under your app data
+                  folder.
+                </p>
+
+                <!-- Live totals strip. Renderer fills with
+                     "N sessions · M min · $X.XX total" or clears
+                     when the list is empty. aria-live='polite' so
+                     screen readers announce updates after Clear /
+                     post-call refresh without interrupting. -->
+                <div
+                  id="usageTotals"
+                  class="usage-totals"
+                  aria-live="polite"
+                ></div>
+
+                <!-- Action row mirrors the General-tab Data subsection's
+                     button placement. Export copies JSON to clipboard
+                     in v1; Clear wipes the on-disk store via
+                     window.sessions.clear() after a native confirm(). -->
+                <div class="usage-actions">
+                  <button
+                    type="button"
+                    id="usageExportButton"
+                    class="data-action__btn"
+                  >Export…</button>
+                  <button
+                    type="button"
+                    id="usageClearButton"
+                    class="data-action__btn data-action__btn--danger"
+                  >Clear history…</button>
+                </div>
+
+                <!-- Sessions list. Renderer replaces children with
+                     <li class='usage-row'> elements per record; each
+                     row carries a <details class='usage-row__details'>
+                     wrapping the per-component breakdown table. -->
+                <ol
+                  id="usageList"
+                  class="usage-list"
+                  aria-label="Sessions, newest first"
+                ></ol>
+
+                <!-- Empty state. Surfaces when window.sessions.list()
+                     returns 0 entries — first install OR post-Clear. -->
+                <p
+                  id="usageEmpty"
+                  class="usage-empty"
+                  hidden
+                >
+                  No sessions logged yet. Start a recording — the
+                  first cost record will appear here when you stop it.
                 </p>
               </div>
             </section>

@@ -83,15 +83,34 @@ export class GeminiSession {
    *   onFlag: (payload: { id: string, evidence: string }) => void;
    *   onError: (message: string) => void;
    *   onClose: (reason: string) => void;
+   *   onUsage?: (payload: {
+   *     model: string,
+   *     audioInputTokens: number,
+   *     audioOutputTokens: number,
+   *     textOutputTokens: number,
+   *   }) => void;
    * }} deps
+   *
+   * `onUsage` is fired whenever the Live API emits a `usageMetadata`
+   * payload on the WebSocket (periodically, not every message). The
+   * payload is broken down by modality (AUDIO / TEXT) under nested
+   * detail arrays — the parser in `_handleUsageMetadata()` extracts
+   * audio in, audio out, and text out token counts and hands them
+   * pre-parsed to the callback so SDK-shape knowledge doesn't leak
+   * into the cost-tracking accumulator.
+   *
+   * Optional: omitting `onUsage` is fine for any caller that doesn't
+   * care about per-session cost tallying (e.g. a future unit-test
+   * harness). The parser still runs, the no-op callback discards.
    */
-  constructor({ apiKey, onTranscript, onTurnComplete, onFlag, onError, onClose }) {
+  constructor({ apiKey, onTranscript, onTurnComplete, onFlag, onError, onClose, onUsage }) {
     this.apiKey = apiKey;
     this.onTranscript = onTranscript;
     this.onTurnComplete = onTurnComplete;
     this.onFlag = onFlag;
     this.onError = onError;
     this.onClose = onClose;
+    this.onUsage = typeof onUsage === 'function' ? onUsage : () => {};
 
     this.client = null;
     this.session = null;
@@ -175,9 +194,66 @@ export class GeminiSession {
   }
 
   _handleMessage(message) {
-    // Tool calls and serverContent arrive in the same message envelope.
+    // Tool calls, serverContent, and usage metadata arrive in the same
+    // message envelope. Each handler is no-op safe when its field is
+    // absent so the order doesn't matter.
     this._handleToolCall(message);
     this._handleServerContent(message);
+    this._handleUsageMetadata(message);
+  }
+
+  /**
+   * Parse a `usageMetadata` payload (if present on the message) and
+   * forward the extracted token counts to `this.onUsage`. The Live API
+   * splits the figures by modality under two nested detail arrays:
+   *
+   *   usageMetadata.promptTokensDetails[]   — input side
+   *   usageMetadata.responseTokensDetails[] — output side
+   *     each entry: { modality: 'AUDIO'|'TEXT'|'IMAGE'|…, tokenCount }
+   *
+   * We're only billed on AUDIO in / AUDIO out / TEXT out today. Other
+   * modalities (e.g. IMAGE) aren't possible on this Live route but the
+   * parser tolerates them by ignoring unknown entries.
+   *
+   * Defensive against partial / missing detail arrays: each lookup
+   * defaults to 0 so a SDK version that omits one dimension still
+   * produces a usable payload. Top-level promptTokenCount /
+   * responseTokenCount are NOT consulted — they're aggregate totals
+   * that conflate modalities, and our pricing dimension is
+   * per-modality.
+   */
+  _handleUsageMetadata(message) {
+    const meta = message?.usageMetadata;
+    if (!meta || typeof meta !== 'object') return;
+
+    const findCount = (details, modality) => {
+      if (!Array.isArray(details)) return 0;
+      for (const entry of details) {
+        if (entry && entry.modality === modality) {
+          return Number(entry.tokenCount) || 0;
+        }
+      }
+      return 0;
+    };
+
+    const audioInputTokens  = findCount(meta.promptTokensDetails,   'AUDIO');
+    const audioOutputTokens = findCount(meta.responseTokensDetails, 'AUDIO');
+    const textOutputTokens  = findCount(meta.responseTokensDetails, 'TEXT');
+
+    // If literally every dimension is zero, skip — there's nothing to
+    // record. This avoids a spurious accumulator call on the no-op
+    // `usageMetadata: {}` envelopes the SDK sometimes sends on
+    // session-open/close transitions.
+    if (audioInputTokens === 0 && audioOutputTokens === 0 && textOutputTokens === 0) {
+      return;
+    }
+
+    this.onUsage({
+      model: GEMINI_MODEL,
+      audioInputTokens,
+      audioOutputTokens,
+      textOutputTokens,
+    });
   }
 
   _handleServerContent(message) {

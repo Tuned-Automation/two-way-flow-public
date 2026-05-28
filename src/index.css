@@ -6037,6 +6037,170 @@ a,
   display: none;
 }
 
+/* ────────────────────────────────────────────────────────────────────
+ * Settings → Usage tab (session-cost-tracking feature, Wave 2)
+ *
+ * All selectors scoped under #settingsTabUsage so any future tab
+ * that wanted to reuse the .usage-* classes for a different purpose
+ * stays unaffected by these rules. Design language matches the
+ * Settings → General → Data subsection (.data-action) so the two
+ * tabs read as siblings:
+ *   - same rgba(20, 20, 30, 0.6) card background
+ *   - same rgba(255, 255, 255, 0.08) hairline border
+ *   - same 10px border-radius, 12px padding, 8px row gap
+ *   - same .data-action__btn / __btn--danger button reuse for the
+ *     action row (the buttons themselves carry the .data-action__btn
+ *     classes in the HTML — no separate button rules needed here)
+ *
+ * Not opted into the --surface-X-Y-alpha system. The settings modal
+ * is a system overlay (not one of the four user-controllable
+ * surfaces — coach / transcript / captured / suggestion); applying
+ * the transparency variables here would let the user accidentally
+ * make the Usage tab unreadable via the Appearance sliders. The
+ * .data-action style this mirrors makes the same choice. ─────── */
+
+#settingsTabUsage .usage-totals {
+  font-size: 12px;
+  color: var(--text-med);
+  min-height: 18px;
+  margin-bottom: 10px;
+}
+
+#settingsTabUsage .usage-totals:empty {
+  display: none;
+}
+
+#settingsTabUsage .usage-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+#settingsTabUsage .usage-empty {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 16px 12px;
+  background: rgba(20, 20, 30, 0.4);
+  border: 1px dashed rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  margin: 0;
+}
+
+#settingsTabUsage .usage-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#settingsTabUsage .usage-row {
+  background: rgba(20, 20, 30, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+#settingsTabUsage .usage-row__header {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 12px;
+}
+
+#settingsTabUsage .usage-row__when {
+  color: var(--text-strong);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+#settingsTabUsage .usage-row__duration {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Cost figure picks up a slightly warmer tone so the bottom-line
+ * number is the first thing the eye lands on — without using the
+ * red danger hue (reserved for irreversible actions) or the green
+ * recording hue (reserved for live-call state). */
+#settingsTabUsage .usage-row__cost {
+  color: rgba(250, 204, 21, 0.85);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+#settingsTabUsage .usage-row__details {
+  margin-top: 6px;
+}
+
+#settingsTabUsage .usage-row__details > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-dim);
+  user-select: none;
+  list-style: none;
+  /* Default ::-webkit-details-marker is a tiny triangle that clashes
+   * with our typographic scale — hide it; the open/closed state of
+   * the parent <details> is communicated by the table appearing
+   * below the summary when expanded. */
+}
+
+#settingsTabUsage .usage-row__details > summary::-webkit-details-marker {
+  display: none;
+}
+
+#settingsTabUsage .usage-row__details > summary:hover {
+  color: var(--text-med);
+}
+
+#settingsTabUsage .usage-row__details[open] > summary {
+  margin-bottom: 8px;
+  color: var(--text-med);
+}
+
+#settingsTabUsage .usage-row__breakdown {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+#settingsTabUsage .usage-row__breakdown thead th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 4px 8px 4px 0;
+}
+
+#settingsTabUsage .usage-row__breakdown thead th:last-child {
+  text-align: right;
+  padding-right: 0;
+}
+
+#settingsTabUsage .usage-row__breakdown tbody td {
+  padding: 4px 8px 4px 0;
+  color: var(--text-med);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+#settingsTabUsage .usage-row__breakdown tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+#settingsTabUsage .usage-row__breakdown tbody td:last-child {
+  text-align: right;
+  padding-right: 0;
+  color: rgba(250, 204, 21, 0.7);
+  font-weight: 600;
+}
+
 /* Reduced motion: drop the recording-dot pulse and the coach thinking pulse.
  * Also disable the rail-overlay slide transition. */
 @media (prefers-reduced-motion: reduce) {
