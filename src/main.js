@@ -1441,6 +1441,32 @@ function buildCoachContextSnapshot() {
     // suggestion history is stored. See getRecapWindow() doc-block
     // for fallback semantics when no question has been asked yet.
     recapWindow: getRecapWindow(),
+    // Recent past wordings of the currently-pinned item (excluding
+    // the pin itself). The Coach's `_tick` prepends a `PREVIOUS
+    // WORDINGS for this item` block to the user message when
+    // `kind === 'reformulate'` so the model can vary the angle
+    // rather than trivially paraphrasing. Empty array when no pin
+    // is live, or when the pin has no history-mate sharing its
+    // itemId.
+    //
+    // Walks every history entry and keeps the ones whose itemId
+    // matches the currently-pinned item (excluding the pin itself).
+    // Capped at the most recent 5 in insertion order — with the
+    // cap-of-1 reformulate path the list will usually be 1, but
+    // the surface tolerates higher caps if we ever raise it.
+    recentWordingsForPinnedItem: (() => {
+      if (!currentPinnedSuggestionId) return [];
+      const pinned = coachContext.suggestionHistory.get(currentPinnedSuggestionId);
+      if (!pinned) return [];
+      const out = [];
+      for (const entry of coachContext.suggestionHistory.values()) {
+        if (entry.id === pinned.id) continue;
+        if (entry.itemId !== pinned.itemId) continue;
+        if (typeof entry.questionText !== 'string' || !entry.questionText) continue;
+        out.push(entry.questionText);
+      }
+      return out.slice(-5);
+    })(),
   };
 }
 

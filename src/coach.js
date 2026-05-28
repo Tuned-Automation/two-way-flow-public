@@ -249,6 +249,7 @@ export class Coach {
    *     itemStates: Record<string, { state: string, evidence?: string, confidence?: number, at?: number }>,
    *     capturedFields: Record<string, { value: string }>,
    *     recentSellerTurns?: string[],
+   *     recentWordingsForPinnedItem?: string[],
    *   };
    *   onItemStateChange: (payload: { itemId: string, state: 'in_progress'|'covered'|'logged', evidence: string, confidence: number }) => void;
    *   onFieldCaptured: (payload: { fieldId: string, value: string, evidence: string }) => void;
@@ -889,10 +890,34 @@ export class Coach {
       // Prepend the per-kind directive when a suggestion is queued so
       // the model has explicit, turn-scoped guidance on which selection
       // logic to apply (next vs deeper vs pivot vs pause vs targeted vs
-      // reformulate). For `targeted` and `reformulate`, append a
-      // TARGETED_ITEM line right after the directive so the model
-      // knows which exact rubric id to honour.
+      // reformulate vs pivot_within_pillar). For `targeted` and
+      // `reformulate`, append a TARGETED_ITEM line right after the
+      // directive so the model knows which exact rubric id to honour;
+      // for `pivot_within_pillar`, append a TARGETED_PILLAR line.
       const parts = [stateBlock];
+
+      // PREVIOUS WORDINGS block — only on reformulate ticks, and only
+      // when main supplied a non-empty array. Lets the model see what
+      // it has already said for this item so it can vary the angle
+      // rather than producing a trivial paraphrase. Sits ABOVE
+      // PENDING SUGGESTIONS so the prompt reads top-down as: rubric
+      // state → previous wordings → pending suggestions → directive
+      // → targeted lines → transcript.
+      if (wantSuggest && requestedKind === 'reformulate') {
+        const wordings = Array.isArray(ctx.recentWordingsForPinnedItem)
+          ? ctx.recentWordingsForPinnedItem
+          : [];
+        if (wordings.length > 0) {
+          const lines = [
+            '',
+            'PREVIOUS WORDINGS for this item (do not paraphrase trivially — vary the angle, not just the verb):',
+          ];
+          wordings.forEach((w, i) => {
+            lines.push(`${i + 1}. "${w}"`);
+          });
+          parts.push(...lines);
+        }
+      }
 
       if (wantMarkAsked) {
         const lines = ['', 'PENDING SUGGESTIONS (not yet asked):'];
