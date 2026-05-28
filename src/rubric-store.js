@@ -29,7 +29,7 @@
  * ─────────────────
  *   The seed (`src/rubric-defaults.js`) deliberately excludes the two
  *   synthetic pillars (`live_signals`, `logged_questions`). They are
- *   re-injected at runtime by `src/rubric.js:_applyRubric()` and must
+ *   re-injected at runtime by `src/rubric.js:applyRubric()` and must
  *   NEVER appear in a persisted rubric — the validator rejects them.
  *
  * Extension point

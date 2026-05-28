@@ -26,7 +26,7 @@
  *
  * The prompt TEMPLATES deliberately stop before the dynamic catalogue
  * sections ("Checklist items:" / "Captured fields:" / "Coaching flags:").
- * `src/rubric.js:_applyRubric()` rebuilds those sections from the active
+ * `src/rubric.js:applyRubric()` rebuilds those sections from the active
  * rubric's data and concatenates them onto the templates at load time.
  * Storing only the prose template means editing the prompt in the Rubrics
  * tab can never desynchronise the catalogue render.

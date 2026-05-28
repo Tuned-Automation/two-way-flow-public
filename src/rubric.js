@@ -3,26 +3,45 @@
  *
  * Pre-feature this file owned a hard-coded `const` catalogue. Post-feature
  * the catalogue lives in `userData/rubrics/<id>.json` (seeded from
- * `src/rubric-defaults.js`) and this module is a thin loader that exposes
- * the same named exports as `let` LIVE BINDINGS pointing at the active
- * rubric's data.
+ * `src/rubric-defaults.js`) and this module exposes the same named exports
+ * as `let` LIVE BINDINGS that can be re-pointed at any rubric shape via
+ * `applyRubric(rubricData)`.
+ *
+ * IMPORTANT — renderer safety
+ * ───────────────────────────
+ *   This file MUST stay renderer-safe (no `electron`, no `node:fs`,
+ *   no `node:path`). `src/renderer.js` imports `{ PILLARS, ITEMS, … }`
+ *   from here at module load. If you re-introduce a Node-only static
+ *   import the renderer bundle will crash with "__dirname is not
+ *   defined" before any code runs.
+ *
+ *   The disk-reading logic lives in `src/rubric-store.js`. Main process
+ *   wires the two together via `applyRubric(rubricStore.loadActiveRubric())`
+ *   (see src/main.js). Renderer initialises with `DEFAULT_RUBRIC` and
+ *   can re-hydrate on `rubrics:changed` IPC by re-fetching the rubric
+ *   through `window.rubrics.*` and calling `applyRubric(...)` itself.
  *
  * Why `let` matters
  * ─────────────────
  *   ES modules already give callers *live bindings*: when an exporter
- *   reassigns a `let` binding, every importer sees the new value on
- *   the next read. That's the trick that lets the renderer, the coach,
- *   the live-session, the facts scanner, the quick-fix worker, etc.
- *   keep importing `{ PILLARS, ITEMS, … }` exactly as before — no
- *   getter functions, no namespace objects — and silently pick up the
- *   new active rubric after `reloadActiveRubric()`.
+ *   reassigns a `let` binding, every importer in the SAME JS realm
+ *   sees the new value on the next read. That's the trick that lets
+ *   the coach, the live-session, the facts scanner, the quick-fix
+ *   worker, etc. keep importing `{ PILLARS, ITEMS, … }` exactly as
+ *   before — no getter functions, no namespace objects — and silently
+ *   pick up the new active rubric after `applyRubric(...)`.
+ *
+ *   Cross-realm propagation (main ↔ renderer) is a SEPARATE concern:
+ *   each realm has its own copy of these bindings. After a rubric
+ *   swap in main, the renderer must also call `applyRubric(...)` in
+ *   its own realm to stay in sync.
  *
  *   Consumers that capture a binding into a module-level constant
  *   (e.g. `const x = ITEMS;` at module scope) would NOT pick up
  *   reloads. The only known previous offender was `src/coach.js`'s
  *   four tool-schema constants — Task 4 moves them into per-instance
  *   construction. All other consumers call through to live exports
- *   at call-time (see plan §"Note on consumers NOT in MODIFIED").
+ *   at call-time.
  *
  * Surface — every named export pre-feature is preserved:
  *   PILLARS, PILLARS_BY_ID, ITEMS, ITEMS_BY_ID, ITEMS_BY_PILLAR,
@@ -33,21 +52,17 @@
  *   RUBRIC_SYSTEM_INSTRUCTION, COACH_SYSTEM_INSTRUCTION,
  *   formatCoachState.
  *
- * Newly added:
- *   reloadActiveRubric()      — re-reads the on-disk active rubric and
- *                               recomputes every exported binding.
- *                               Called by `main.js` after a successful
- *                               `rubrics:set-active` (and after a save
- *                               that mutated the active rubric).
- *   getActiveRubricMeta()     — pass-through to the store; returns
- *                               `{ id, name }` for the switcher pill /
- *                               window title.
+ * Public hydration hook:
+ *   applyRubric(rubricData)   — recomputes every exported binding from
+ *                               a rubric shape. Caller decides where
+ *                               the shape comes from (disk in main,
+ *                               IPC in renderer).
  *
  * Imported by:
  *   - src/gemini-session.js    → tool schemas + RUBRIC_SYSTEM_INSTRUCTION
  *   - src/coach.js             → COACH_SYSTEM_INSTRUCTION + enums
  *   - src/renderer.js          → rail / checklist / captured pane
- *   - src/main.js              → reloadActiveRubric() after swap
+ *   - src/main.js              → applyRubric() after swap / save / boot
  *   - src/summary.js, src/facts-scanner.js, src/quick-fix.js,
  *     src/deepgram-session.js, src/providers/*  → call-time reads
  *
@@ -57,17 +72,14 @@
  * they don't replace it.
  */
 
-import {
-  loadActiveRubric,
-  getActiveRubricMeta as _loadActiveMeta,
-} from './rubric-store.js';
+import { DEFAULT_RUBRIC } from './rubric-defaults.js';
 
 /* ────────────────────────────────────────────────────────────────────
  * Synthetic pillars — runtime-only injection
  * ────────────────────────────────────────────────────────────────────
  * These two pillars never live in the persisted rubric (the store's
  * validator actively rejects them). They are re-injected at the top of
- * PILLARS by `_applyRubric` so the rail / renderer can keep their
+ * PILLARS by `applyRubric` so the rail / renderer can keep their
  * existing "first row is signals, second is logged" assumption.
  *
  *   live_signals    — owns flag display, populated by `record_flag`
@@ -98,7 +110,7 @@ const SYNTHETIC_PILLARS = Object.freeze([
 /* ────────────────────────────────────────────────────────────────────
  * Live-binding exports
  * ────────────────────────────────────────────────────────────────────
- * Declared with `let` so `_applyRubric` can reassign them on rubric
+ * Declared with `let` so `applyRubric` can reassign them on rubric
  * swap. ES modules propagate `let` reassignment to every importer's
  * binding — that's the whole reason this design works without a
  * getter API.
@@ -182,7 +194,7 @@ export let COACH_SYSTEM_INSTRUCTION;
 export const SUGGESTION_SENTINEL_ITEM_IDS = ['freeform.deeper', 'freeform.recap'];
 
 /* ────────────────────────────────────────────────────────────────────
- * Catalogue-block formatters (take data as arguments so `_applyRubric`
+ * Catalogue-block formatters (take data as arguments so `applyRubric`
  * can compose the new instructions BEFORE assigning the bindings —
  * avoids any read-before-write hazard on reload).
  * ──────────────────────────────────────────────────────────────────── */
@@ -223,16 +235,21 @@ function formatFlagBlock(flags) {
 }
 
 /* ────────────────────────────────────────────────────────────────────
- * _applyRubric — internal helper that recomputes every exported binding
- * from a freshly-loaded rubric.
+ * applyRubric — public hydration hook that recomputes every exported
+ * binding from a rubric shape.
  *
- * Called once at module init, and again by `reloadActiveRubric()` after
- * a successful set-active swap. Composes derived shapes locally and
- * THEN assigns them to the exports, so a concurrent reader can never
- * observe a half-applied state.
+ * Called once at module init with `DEFAULT_RUBRIC`, and again by callers
+ * that have a more current rubric to hand (main process: after disk load
+ * or set-active swap; renderer: on `rubrics:changed` IPC). Composes
+ * derived shapes locally and THEN assigns them to the exports, so a
+ * concurrent reader can never observe a half-applied state.
+ *
+ * Safe to call any number of times. Pass the same in-memory `DEFAULT_RUBRIC`
+ * to reset bindings. Pass anything matching the persisted rubric shape
+ * (see `src/rubric-defaults.js` doc-block) to install a new active rubric.
  * ──────────────────────────────────────────────────────────────────── */
 
-function _applyRubric(rubric) {
+export function applyRubric(rubric) {
   const persistedPillars = Array.isArray(rubric?.pillars) ? rubric.pillars : [];
   const persistedItems = Array.isArray(rubric?.items) ? rubric.items : [];
   const persistedFields = Array.isArray(rubric?.capturedFields) ? rubric.capturedFields : [];
@@ -297,8 +314,8 @@ function _applyRubric(rubric) {
   /* Atomic-ish assignment block. Each `export let` reassignment is a
    * single statement and ESM bindings update on read, so a reader
    * that wedges itself between two lines below will see a brief
-   * mixed state. In practice that doesn't matter — `reloadActiveRubric`
-   * is only called when the live session is idle (the set-active IPC
+   * mixed state. In practice that doesn't matter — `applyRubric` is
+   * only called when the live session is idle (the set-active IPC
    * handler in main.js gates that), so there is no concurrent consumer. */
   PILLARS = allPillars;
   PILLARS_BY_ID = pillarsById;
@@ -321,41 +338,17 @@ function _applyRubric(rubric) {
 }
 
 /* ────────────────────────────────────────────────────────────────────
- * Public reload API
- * ──────────────────────────────────────────────────────────────────── */
-
-/**
- * Re-read the active rubric from disk and recompute every exported
- * binding. Called by `main.js` after a successful `rubrics:set-active`
- * (and after a `rubrics:save` that mutated the active rubric, when the
- * live session is idle).
- *
- * Safe to call any number of times. If the disk store is unreadable
- * (e.g. corruption), the loader falls back to the in-memory DEFAULT_RUBRIC
- * — see `rubric-store.js:loadActiveRubric()`.
- */
-export function reloadActiveRubric() {
-  _applyRubric(loadActiveRubric());
-}
-
-/** Returns `{ id, name }` for the active rubric. Cheaper than
- *  loadActiveRubric() when callers only need to render the switcher
- *  pill or update a window title. */
-export function getActiveRubricMeta() {
-  return _loadActiveMeta();
-}
-
-/* ────────────────────────────────────────────────────────────────────
  * Module init — populate every export so first imports get real values.
  * ────────────────────────────────────────────────────────────────────
- * `loadActiveRubric` calls `ensureSeeded` internally if the disk store
- * is missing, so this works on first launch too. main.js ALSO calls
- * `rubricStore.ensureSeeded()` explicitly before the first Coach is
- * constructed, as a defence-in-depth: if a future refactor lazy-loads
- * this module, the explicit seed call still guarantees the rubric is
- * on disk before anyone reads it.
+ * Initialises from the in-memory DEFAULT_RUBRIC so this file stays
+ * renderer-safe (no Node-only imports — see header doc-block).
+ *
+ * Main process calls `applyRubric(rubricStore.loadActiveRubric())` after
+ * `app.whenReady()` to swap in the on-disk active rubric. Renderer can
+ * re-hydrate the same way using IPC (`window.rubrics.list()` →
+ * `window.rubrics.load(id)` → `applyRubric(...)`).
  */
-_applyRubric(loadActiveRubric());
+applyRubric(DEFAULT_RUBRIC);
 
 /* ────────────────────────────────────────────────────────────────────
  * formatCoachState — per-turn state block prepended to the transcript

@@ -414,7 +414,7 @@ export class Coach {
    * Reads `ITEM_IDS`, `FIELD_IDS`, `SUGGESTABLE_ITEM_IDS`, and
    * `SUGGESTION_SENTINEL_ITEM_IDS` from the live ESM bindings exposed
    * by src/rubric.js. Those bindings are `let`s populated by
-   * `_applyRubric` on the active rubric — so this method always
+   * `applyRubric` on the active rubric — so this method always
    * reflects the rubric the Coach is being asked to coach against.
    *
    * @returns {{ UPDATE_ITEM_STATE: object, RECORD_FIELD: object, SUGGEST_NEXT_QUESTION: object, MARK_QUESTION_ASKED: object }}

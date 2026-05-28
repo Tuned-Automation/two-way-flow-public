@@ -260,7 +260,7 @@ import {
 } from './settings.js';
 import { getProvider } from './providers/index.js';
 import * as rubricStore from './rubric-store.js';
-import { reloadActiveRubric } from './rubric.js';
+import { applyRubric } from './rubric.js';
 import { DEFAULT_RUBRIC } from './rubric-defaults.js';
 import {
   appendSession,
@@ -4298,9 +4298,12 @@ function registerIpcHandlers() {
    *
    * Idle path of `rubrics:set-active`:
    *   1. store.setActiveRubric(id)           — persist the swap
-   *   2. reloadActiveRubric()                — re-pull catalogues into
-   *                                            src/rubric.js's live
-   *                                            bindings
+   *   2. applyRubric(store.loadActiveRubric()) — re-pull catalogues
+   *                                            into src/rubric.js's
+   *                                            live bindings (main
+   *                                            realm only — renderer
+   *                                            re-hydrates on the
+   *                                            rubrics:changed event)
    *   3. coachSession?.stop() + null         — defensive (should be
    *                                            null already when idle)
    *   4. broadcastRubricsChanged             — renderers re-render
@@ -4349,7 +4352,7 @@ function registerIpcHandlers() {
     let applied = false;
     if (isActive && idle) {
       try {
-        reloadActiveRubric();
+        applyRubric(rubricStore.loadActiveRubric());
         broadcastRubricsChanged({ activeId: id, reason: 'save' });
         applied = true;
       } catch (err) {
@@ -4395,9 +4398,9 @@ function registerIpcHandlers() {
     if (!result.ok) return result;
 
     try {
-      reloadActiveRubric();
+      applyRubric(rubricStore.loadActiveRubric());
     } catch (err) {
-      console.warn('[rubrics:set-active] reloadActiveRubric failed:', err?.message || err);
+      console.warn('[rubrics:set-active] applyRubric failed:', err?.message || err);
       return { ok: false, reason: 'reload_failed' };
     }
 
@@ -4472,21 +4475,27 @@ function registerIpcHandlers() {
 
 app.whenReady().then(async () => {
   /**
-   * Seed the on-disk rubric library on first launch.
+   * Seed the on-disk rubric library on first launch, then hydrate the
+   * in-memory `src/rubric.js` bindings from the on-disk active rubric.
    *
-   * Defence-in-depth: src/rubric.js already calls loadActiveRubric() at
-   * module init time, and the store falls back to ensureSeeded() if
-   * the directory is missing. But because the explicit seed is cheap
-   * (idempotent, single-file existsSync check) and the failure mode of
-   * silently shipping an empty rubric library would be hard to debug,
-   * we run it again here BEFORE registerIpcHandlers wires up the
-   * `rubrics:list` channel. By the time the renderer can call that
-   * channel the seed has run.
+   * src/rubric.js initialises its exports from DEFAULT_RUBRIC at module
+   * load (to stay renderer-safe — no Node-only imports in that file).
+   * Main is responsible for swapping the bindings to the on-disk active
+   * rubric here, BEFORE `registerIpcHandlers` wires up `rubrics:list`
+   * and BEFORE the first Coach is constructed. If the disk store is
+   * unreadable, `loadActiveRubric` falls back to the in-memory
+   * DEFAULT_RUBRIC and the bindings stay on the seed — same observable
+   * behaviour as a first launch.
    */
   try {
     rubricStore.ensureSeeded();
   } catch (err) {
     console.warn('[main] rubricStore.ensureSeeded threw:', err?.message || err);
+  }
+  try {
+    applyRubric(rubricStore.loadActiveRubric());
+  } catch (err) {
+    console.warn('[main] applyRubric at boot threw:', err?.message || err);
   }
 
   // Auto-grant media (mic/camera) permission requests from the renderer.
