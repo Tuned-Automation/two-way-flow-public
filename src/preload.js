@@ -97,6 +97,16 @@ import { contextBridge, ipcRenderer } from 'electron';
  *                                { ok, settings? | error? }; main
  *                                broadcasts `settings:changed` on
  *                                success.
+ *     appearance:open-preview  — open / focus the transparency
+ *                                preview window (second
+ *                                BrowserWindow used by the
+ *                                Appearance tab's slider editor).
+ *                                Lazy-created on first invoke;
+ *                                idempotent if already open.
+ *                                Returns { ok: true }.
+ *     appearance:close-preview — destroy the transparency preview
+ *                                window if alive. Idempotent.
+ *                                Returns { ok: true }.
  *     dialog:open              — { title?, defaultPath?, filters?,
  *                                  properties?, readAs? } — show a
  *                                native Open dialog. If `readAs:
@@ -419,6 +429,23 @@ contextBridge.exposeInMainWorld('gemini', {
      * Main broadcasts `settings:changed` on success.
      */
     applyImport: (json) => ipcRenderer.invoke('settings:apply-import', json),
+  },
+
+  /**
+   * Appearance-tab sidecar plumbing — currently just the transparency
+   * preview window. Read-only bridge: open / close lifecycle only.
+   * The preview window itself reads the current transparency settings
+   * via the existing `settings.load` + `onSettingsChanged` plumbing
+   * exposed on this same bridge (the preview's preload IS this file).
+   *
+   * No `transparency.*` methods here on purpose — slider edits flow
+   * through the existing `settings.save` path so they round-trip
+   * through `settings:changed` and reach every subscriber (main
+   * renderer + preview renderer + any future window).
+   */
+  appearance: {
+    openPreview: () => ipcRenderer.invoke('appearance:open-preview'),
+    closePreview: () => ipcRenderer.invoke('appearance:close-preview'),
   },
 
   /**
