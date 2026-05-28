@@ -39,6 +39,27 @@
         >×</button>
       </div>
 
+      <!-- Header-collapse feature (see docs/superpowers/plans/
+           2026-05-27-collapsible-top-toolbar.md). The reveal strip is
+           always present at the top of .coach; in expanded mode it's a
+           0-height invisible spacer, in collapsed mode it grows to 8px
+           and hosts the drag region + a hover-revealed mini controls
+           cluster + an optional ghost status pill while recording. -->
+      <div id="coachRevealStrip" class="coach__reveal-strip" aria-hidden="true">
+        <div id="coachGhostPill" class="coach__ghost-pill" hidden>
+          <span class="coach__ghost-pill__dot" aria-hidden="true"></span>
+          <span id="coachGhostPillTimer" class="coach__ghost-pill__timer">00:00</span>
+        </div>
+        <div class="coach__mini-controls" aria-hidden="true">
+          <button id="coachMiniMinButton" type="button"
+                  class="coach__mini-icon-btn" tabindex="-1"
+                  aria-label="Minimise" title="Minimise">—</button>
+          <button id="coachMiniCloseButton" type="button"
+                  class="coach__mini-icon-btn" tabindex="-1"
+                  aria-label="Close" title="Close (⌘W)">×</button>
+        </div>
+      </div>
+
       <header class="coach__header">
         <div class="rec" id="recIndicator" aria-live="polite">
           <span class="rec__dot" aria-hidden="true"></span>
@@ -141,6 +162,23 @@
         </div>
 
         <div class="coach__controls">
+          <!-- Header-collapse chevron (see plan: 2026-05-27-collapsible-
+               top-toolbar.md). Leftmost in the controls cluster so the
+               affordance to hide the whole row is immediately discoverable.
+               aria-expanded mirrors !state.headerCollapsed so assistive
+               tech announces the relationship; aria-controls names the
+               .coach root whose chrome it shows/hides. -->
+          <button
+            id="headerCollapseBtn"
+            type="button"
+            class="coach__icon-btn"
+            aria-label="Hide toolbar"
+            title="Hide toolbar (⌘⇧T)"
+            aria-controls="coach"
+            aria-expanded="true"
+          >
+            <span aria-hidden="true">∧</span>
+          </button>
           <!-- Settings entry point. Opens the modal Settings dialog
                (#settingsModal below) on click. Lives leftmost in the
                control cluster so it reads as a passive utility, not
