@@ -10358,3 +10358,127 @@ hydrateRubricSwitcher();
     setTimeout(() => runCheck({ manual: false }), 4000);
   }
 })();
+
+/* ── First-run setup wizard ──────────────────────────────────────────
+ *
+ * Onboards non-technical users: welcome -> Gemini key -> Deepgram key ->
+ * permissions -> done. Shown automatically on first launch when no Gemini
+ * key is configured, and re-openable from Settings → General. Keys save
+ * through the same pushProviderKey path as the Settings inputs. */
+(() => {
+  const wizardEl = document.getElementById('setupWizard');
+  if (!wizardEl) return;
+
+  const STEPS = ['welcome', 'gemini', 'deepgram', 'permissions', 'done'];
+  const DONE_KEY = 'twf.setupDone';
+
+  const stepEls = Array.from(wizardEl.querySelectorAll('.setup-wizard__step'));
+  const backBtn = document.getElementById('setupWizardBack');
+  const nextBtn = document.getElementById('setupWizardNext');
+  const skipBtn = document.getElementById('setupWizardSkip');
+  const dotsEl = document.getElementById('setupWizardDots');
+  const geminiInput = document.getElementById('setupGeminiKey');
+  const deepgramInput = document.getElementById('setupDeepgramKey');
+  const grantMicBtn = document.getElementById('setupGrantMic');
+  const openScreenBtn = document.getElementById('setupOpenScreen');
+  const reopenBtn = document.getElementById('setupWizardReopen');
+
+  let stepIndex = 0;
+
+  function renderStep() {
+    const key = STEPS[stepIndex];
+    for (const s of stepEls) s.hidden = s.dataset.step !== key;
+    if (backBtn) backBtn.hidden = stepIndex === 0;
+    if (nextBtn) nextBtn.textContent = stepIndex === STEPS.length - 1 ? 'Finish' : 'Next';
+    if (skipBtn) skipBtn.hidden = stepIndex === STEPS.length - 1;
+    if (dotsEl) {
+      dotsEl.textContent = STEPS.map((_, i) => (i === stepIndex ? '●' : '○')).join(' ');
+    }
+  }
+
+  function openWizard() {
+    stepIndex = 0;
+    renderStep();
+    wizardEl.hidden = false;
+  }
+
+  function finishWizard() {
+    try { localStorage.setItem(DONE_KEY, '1'); } catch { /* ignore */ }
+    wizardEl.hidden = true;
+  }
+
+  // Persist whatever the current step captured before advancing.
+  function commitStep() {
+    const key = STEPS[stepIndex];
+    if (key === 'gemini' && geminiInput instanceof HTMLInputElement) {
+      const v = geminiInput.value.trim();
+      if (v) pushProviderKey('gemini', v);
+    } else if (key === 'deepgram' && deepgramInput instanceof HTMLInputElement) {
+      const v = deepgramInput.value.trim();
+      if (v) pushProviderKey('deepgram', v);
+    }
+  }
+
+  if (nextBtn) {
+    nextBtn.addEventListener('click', () => {
+      commitStep();
+      if (stepIndex >= STEPS.length - 1) {
+        finishWizard();
+        return;
+      }
+      stepIndex += 1;
+      renderStep();
+    });
+  }
+  if (backBtn) {
+    backBtn.addEventListener('click', () => {
+      if (stepIndex > 0) { stepIndex -= 1; renderStep(); }
+    });
+  }
+  if (skipBtn) {
+    skipBtn.addEventListener('click', () => {
+      // Commit any key already typed before skipping the rest.
+      commitStep();
+      finishWizard();
+    });
+  }
+  if (grantMicBtn) {
+    grantMicBtn.addEventListener('click', async () => {
+      grantMicBtn.disabled = true;
+      try {
+        const res = await window.gemini.requestMicrophone?.();
+        grantMicBtn.textContent = res?.status === 'granted' ? 'Granted ✓' : 'Requested';
+      } catch { grantMicBtn.textContent = 'Requested'; }
+    });
+  }
+  if (openScreenBtn) {
+    openScreenBtn.addEventListener('click', () => {
+      try { window.gemini.openScreenRecordingSettings?.(); } catch { /* ignore */ }
+      openScreenBtn.textContent = 'Opened ✓';
+    });
+  }
+  if (reopenBtn) {
+    reopenBtn.addEventListener('click', () => {
+      // Re-running setup also closes the Settings modal so the wizard
+      // isn't buried behind it.
+      try { closeSettingsModal(); } catch { /* ignore */ }
+      openWizard();
+    });
+  }
+
+  // First-launch trigger: show the wizard when setup hasn't been
+  // completed/skipped AND no Gemini key is configured (settings key or
+  // env). Runs after settings load so we read a real value.
+  let done = false;
+  try { done = localStorage.getItem(DONE_KEY) === '1'; } catch { /* ignore */ }
+  if (!done) {
+    (async () => {
+      try {
+        const settings = await window.gemini.settings?.load?.();
+        const hasKey = !!(settings?.providers?.gemini?.apiKey)
+          || !!(settings?._envAvailability && settings._envAvailability.gemini);
+        if (!hasKey) openWizard();
+      } catch { /* if settings can't load, don't block the app */ }
+    })();
+  }
+})();

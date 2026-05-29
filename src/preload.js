@@ -566,6 +566,8 @@ contextBridge.exposeInMainWorld('gemini', {
   // Phase 4: macOS Screen Recording permission helpers.
   openScreenRecordingSettings: () => ipcRenderer.invoke('system:open-screen-recording-settings'),
   getScreenRecordingStatus: () => ipcRenderer.invoke('system:screen-recording-status'),
+  // First-run wizard: trigger the OS microphone prompt up front.
+  requestMicrophone: () => ipcRenderer.invoke('system:request-microphone'),
 
   /**
    * Window-chrome controls for the frameless overlay. The visible

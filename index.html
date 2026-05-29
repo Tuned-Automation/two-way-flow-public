@@ -2323,6 +2323,25 @@
               </div>
 
               <div class="settings-section">
+                <h4 class="settings-section__heading">Setup</h4>
+                <div class="data-action">
+                  <div class="data-action__info">
+                    <strong class="data-action__title">First-time setup</strong>
+                    <span class="data-action__desc">
+                      Re-run the welcome wizard (API keys + permissions).
+                    </span>
+                  </div>
+                  <div class="data-action__controls">
+                    <button
+                      type="button"
+                      id="setupWizardReopen"
+                      class="data-action__btn"
+                    >Run setup</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="settings-section">
                 <h4 class="settings-section__heading">Data</h4>
                 <p class="settings-section__subtitle">
                   Move your settings between devices, share team defaults,
@@ -2553,6 +2572,104 @@
     <!-- Captured-field recap tooltip. Positioned via JS on mouseenter;
          pointer-events:none so it never blocks panel interaction. -->
     <div id="capturedTooltip" class="captured-tooltip" role="tooltip" aria-hidden="true"></div>
+
+    <!-- First-run setup wizard. Shown by the renderer on first launch
+         when no Gemini key is configured (and re-openable from
+         Settings → General). Walks a non-technical user through keys +
+         permissions. Steps are toggled via [data-step]; nav is in
+         src/renderer.js. -->
+    <div
+      id="setupWizard"
+      class="setup-wizard"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="setupWizardTitle"
+      hidden
+    >
+      <div class="setup-wizard__panel">
+        <h2 id="setupWizardTitle" class="setup-wizard__title">Welcome to Two Way Flow</h2>
+
+        <section class="setup-wizard__step" data-step="welcome">
+          <p class="setup-wizard__lead">
+            Two Way Flow listens to your sales calls and coaches you live —
+            what to ask next, what you're missing, and how you're tracking.
+          </p>
+          <p class="setup-wizard__lead">
+            This quick setup takes about a minute: add your AI keys and grant
+            microphone + screen access. You can skip and do it later in
+            Settings.
+          </p>
+        </section>
+
+        <section class="setup-wizard__step" data-step="gemini" hidden>
+          <p class="setup-wizard__lead">
+            <strong>Gemini key (required)</strong> — powers live transcription
+            and coaching. Paste your Google AI Studio key.
+          </p>
+          <input
+            type="password"
+            id="setupGeminiKey"
+            class="setup-wizard__input"
+            placeholder="Paste your Gemini API key"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Gemini API key"
+          />
+        </section>
+
+        <section class="setup-wizard__step" data-step="deepgram" hidden>
+          <p class="setup-wizard__lead">
+            <strong>Deepgram key (recommended)</strong> — transcribes the
+            prospect's side of the call. Without it, only your side is
+            transcribed. You can add this later.
+          </p>
+          <input
+            type="password"
+            id="setupDeepgramKey"
+            class="setup-wizard__input"
+            placeholder="Paste your Deepgram API key (optional)"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Deepgram API key"
+          />
+        </section>
+
+        <section class="setup-wizard__step" data-step="permissions" hidden>
+          <p class="setup-wizard__lead">
+            Two Way Flow needs two macOS permissions to hear the call:
+          </p>
+          <div class="setup-wizard__perm">
+            <div>
+              <strong>Microphone</strong>
+              <span class="setup-wizard__perm-desc">Your side of the call.</span>
+            </div>
+            <button type="button" id="setupGrantMic" class="setup-wizard__btn">Grant</button>
+          </div>
+          <div class="setup-wizard__perm">
+            <div>
+              <strong>Screen Recording</strong>
+              <span class="setup-wizard__perm-desc">The prospect's audio. Opens System Settings — toggle it on, then come back.</span>
+            </div>
+            <button type="button" id="setupOpenScreen" class="setup-wizard__btn">Open settings</button>
+          </div>
+        </section>
+
+        <section class="setup-wizard__step" data-step="done" hidden>
+          <p class="setup-wizard__lead">
+            <strong>You're all set.</strong> Press the record button in the
+            overlay to start a call. You can change keys and settings anytime
+            from the gear icon.
+          </p>
+        </section>
+
+        <footer class="setup-wizard__nav">
+          <button type="button" id="setupWizardSkip" class="setup-wizard__skip">Skip for now</button>
+          <span id="setupWizardDots" class="setup-wizard__dots" aria-hidden="true"></span>
+          <button type="button" id="setupWizardBack" class="setup-wizard__btn" hidden>Back</button>
+          <button type="button" id="setupWizardNext" class="setup-wizard__btn setup-wizard__btn--primary">Next</button>
+        </footer>
+      </div>
+    </div>
 
     <!-- Force-update gate. Shown (non-dismissible) by the renderer when
          the running version is below the manifest's minSupported. The

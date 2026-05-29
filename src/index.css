@@ -4701,6 +4701,156 @@ a,
   border-color: rgba(96, 165, 250, 0.85);
 }
 
+/* ── First-run setup wizard ───────────────────────────────────────── */
+
+.setup-wizard {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+  background: rgba(6, 6, 10, 0.82);
+  backdrop-filter: blur(4px);
+  -webkit-app-region: no-drag;
+}
+
+.setup-wizard[hidden] { display: none; }
+
+.setup-wizard__panel {
+  width: min(480px, 100%);
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-card);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+  padding: 24px 26px;
+}
+
+.setup-wizard__title {
+  margin: 0 0 14px;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.setup-wizard__step {
+  min-height: 132px;
+}
+
+.setup-wizard__lead {
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text-med);
+}
+
+.setup-wizard__lead strong { color: var(--text-strong); }
+
+.setup-wizard__input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+}
+
+.setup-wizard__input:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.5);
+  outline-offset: 1px;
+}
+
+.setup-wizard__perm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 13px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.setup-wizard__perm strong {
+  display: block;
+  font-size: 13px;
+  color: var(--text-strong);
+}
+
+.setup-wizard__perm-desc {
+  display: block;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.setup-wizard__nav {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.setup-wizard__dots {
+  flex: 1 1 auto;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 3px;
+  color: var(--text-faint);
+}
+
+.setup-wizard__skip {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 6px 4px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.setup-wizard__skip:hover { color: var(--text-med); }
+
+.setup-wizard__btn {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.setup-wizard__btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.11);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.setup-wizard__btn:disabled { opacity: 0.55; cursor: default; }
+
+.setup-wizard__btn--primary {
+  border-color: rgba(96, 165, 250, 0.6);
+  background: rgba(96, 165, 250, 0.2);
+  color: #bfdbfe;
+}
+
+.setup-wizard__btn--primary:hover:not(:disabled) {
+  background: rgba(96, 165, 250, 0.3);
+  border-color: rgba(96, 165, 250, 0.85);
+}
+
 /* Modal extras for the reset confirmation + import preview dialogs.
  * Both reuse the .modal__panel chrome (already defined further up in
  * this file). The additions below cover the per-dialog body bits:

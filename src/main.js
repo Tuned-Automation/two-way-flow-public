@@ -4099,6 +4099,21 @@ function registerIpcHandlers() {
   });
 
   /**
+   * Request microphone access via the OS prompt. Used by the first-run
+   * setup wizard so the user grants mic up front rather than discovering
+   * it's blocked mid-call. Resolves { ok, status: 'granted'|'denied' }.
+   */
+  ipcMain.handle('system:request-microphone', async () => {
+    if (process.platform !== 'darwin') return { ok: true, status: 'unknown' };
+    try {
+      const granted = await systemPreferences.askForMediaAccess('microphone');
+      return { ok: true, status: granted ? 'granted' : 'denied' };
+    } catch (err) {
+      return { ok: false, error: err?.message || 'request_failed' };
+    }
+  });
+
+  /**
    * Enumerate desktop audio sources (screens + windows) so the
    * renderer's Audio tab can offer a system-audio picker. Returns
    * [{ id, name }] — we strip the thumbnail dataUrl because
