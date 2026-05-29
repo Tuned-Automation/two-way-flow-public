@@ -199,6 +199,14 @@ export const DEFAULT_SETTINGS = Object.freeze({
       apiKey: '',
       defaultModel: 'gpt-5.5',
     },
+    // Deepgram is speech-to-text (prospect-side transcription), not an
+    // LLM coach provider — so it has no defaultModel here (the model is
+    // chosen on the Audio tab via settings.audio.deepgramModel). Only
+    // the API key lives here so getApiKey('deepgram') resolves it the
+    // same settings-first / env-fallback way as the LLM providers.
+    deepgram: {
+      apiKey: '',
+    },
   },
   models: {
     // Post-call debrief is Gemini-only today. 3.5 Flash is described
@@ -451,6 +459,7 @@ const PROVIDER_ENV_VARS = Object.freeze({
   gemini: 'GEMINI_API_KEY',
   anthropic: 'ANTHROPIC_API_KEY',
   openai: 'OPENAI_API_KEY',
+  deepgram: 'DEEPGRAM_API_KEY',
 });
 
 /** Provider → env var (publicly exported so the renderer can render

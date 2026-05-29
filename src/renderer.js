@@ -375,6 +375,7 @@ const audioAecEl = document.getElementById('audioAec');
 const audioNoiseSuppressionEl = document.getElementById('audioNoiseSuppression');
 const audioAutoGainControlEl = document.getElementById('audioAutoGainControl');
 const audioDeepgramModelEl = document.getElementById('audioDeepgramModel');
+const audioDeepgramKeyEl = document.getElementById('audioDeepgramKey');
 const audioHideAecBadgeEl = document.getElementById('audioHideAecBadge');
 const audioApplyHintEl = document.getElementById('audioApplyHint');
 
@@ -3630,7 +3631,7 @@ async function startCapture() {
     if (sysStream) sysStream.getTracks().forEach((t) => t.stop());
     showConnectionError(
       result?.error === 'missing_api_key'
-        ? 'Missing GEMINI_API_KEY in .env'
+        ? 'Missing Gemini API key — add one in Settings → Providers.'
         : 'Connection lost',
     );
     setStatus('idle');
@@ -4676,6 +4677,22 @@ function applySettingsToForm(settings) {
       modelSelect.value = wanted;
     }
     refreshProviderStatusBadge(card, settings, envAvail);
+  }
+
+  // Deepgram key lives on the Audio tab (not a provider card), so
+  // hydrate it explicitly from providers.deepgram.apiKey.
+  if (audioDeepgramKeyEl instanceof HTMLInputElement) {
+    const dgVal = typeof settings.providers?.deepgram?.apiKey === 'string'
+      ? settings.providers.deepgram.apiKey
+      : '';
+    audioDeepgramKeyEl.value = dgVal;
+    audioDeepgramKeyEl.type = 'password';
+    settingsKeyLastFlushed.deepgram = dgVal;
+    const dgEye = document.querySelector('[data-eye-for="deepgram"]');
+    if (dgEye instanceof HTMLElement) {
+      dgEye.setAttribute('aria-pressed', 'false');
+      dgEye.setAttribute('aria-label', 'Show key');
+    }
   }
 
   // Appearance tab — speaker-label tag colours. Form sync + live
@@ -5787,7 +5804,10 @@ function flushPendingKeySave(provider) {
   clearTimeout(timer);
   settingsKeyDebounceTimers[provider] = null;
   const card = settingsProviderCardEls.find((c) => c.dataset.provider === provider);
-  const input = card?.querySelector(`[data-provider-key="${provider}"]`);
+  // Fall back to a document-wide lookup for key inputs that don't live
+  // inside a provider card (e.g. the Deepgram key on the Audio tab).
+  const input = card?.querySelector(`[data-provider-key="${provider}"]`)
+    || document.querySelector(`[data-provider-key="${provider}"]`);
   if (input instanceof HTMLInputElement) {
     pushProviderKey(provider, input.value);
   }
@@ -6042,6 +6062,7 @@ if (settingsModalEl) {
     // the single reliable place to undo the open-time window expansion.
     try { window.gemini?.window?.setSettingsOpen?.(false); } catch { /* bridge missing */ }
     for (const provider of PROVIDER_IDS) flushPendingKeySave(provider);
+    flushPendingKeySave('deepgram');
     flushAppearanceSave();
     if (settingsResetConfirmEl instanceof HTMLDialogElement && settingsResetConfirmEl.open) {
       try { settingsResetConfirmEl.close(); } catch { /* not open */ }
@@ -6121,6 +6142,32 @@ for (const card of settingsProviderCardEls) {
   if (modelSelect instanceof HTMLSelectElement) {
     modelSelect.addEventListener('change', () => {
       pushProviderModel(provider, modelSelect.value);
+    });
+  }
+}
+
+// Deepgram key (Audio tab) — wired separately from the provider cards
+// (it has no model select or Test button), but reuses the same
+// debounced-save + eye-toggle behaviour and persists to
+// providers.deepgram.apiKey via pushProviderKey.
+if (audioDeepgramKeyEl instanceof HTMLInputElement) {
+  audioDeepgramKeyEl.addEventListener('input', () => {
+    clearTimeout(settingsKeyDebounceTimers.deepgram);
+    settingsKeyDebounceTimers.deepgram = setTimeout(() => {
+      settingsKeyDebounceTimers.deepgram = null;
+      pushProviderKey('deepgram', audioDeepgramKeyEl.value);
+    }, SETTINGS_IDLE_SAVE_MS);
+  });
+  audioDeepgramKeyEl.addEventListener('blur', () => {
+    flushPendingKeySave('deepgram');
+  });
+  const dgEye = document.querySelector('[data-eye-for="deepgram"]');
+  if (dgEye instanceof HTMLElement) {
+    dgEye.addEventListener('click', () => {
+      const showing = audioDeepgramKeyEl.type === 'text';
+      audioDeepgramKeyEl.type = showing ? 'password' : 'text';
+      dgEye.setAttribute('aria-pressed', String(!showing));
+      dgEye.setAttribute('aria-label', !showing ? 'Hide key' : 'Show key');
     });
   }
 }

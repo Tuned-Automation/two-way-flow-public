@@ -75,7 +75,14 @@ module.exports = {
     // .env yet — without the guard, electron-packager throws and the
     // whole build fails. The empty fallback is just a missing-key
     // problem at runtime, which is recoverable via Settings.
-    extraResource: fs.existsSync(path.resolve(__dirname, '.env'))
+    // Only bundle the developer's .env into the build when TWF_BUNDLE_ENV=1
+    // is set (scripts/install-local.sh sets it for the dev's own local
+    // install). Distribution builds (npm run publish / release) leave it
+    // OFF, so the shipped app contains NO API keys — each end user enters
+    // their own in Settings → Providers (Gemini / Deepgram / etc.). This
+    // is the distribution-safety gate referenced in the security note above.
+    extraResource: (process.env.TWF_BUNDLE_ENV === '1'
+      && fs.existsSync(path.resolve(__dirname, '.env')))
       ? ['.env']
       : [],
     // NOTE on macOS signing: we *deliberately* don't set `osxSign` here.

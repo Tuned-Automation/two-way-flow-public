@@ -1477,18 +1477,48 @@
                 </div>
               </div>
 
-              <!-- Section 3 — Speech-to-text. Deepgram model select.
-                   The model is baked into the WebSocket query string
-                   at connect time, so a change here only takes effect
-                   when the next call starts. The Deepgram API key
-                   stays env-only for now (see DEEPGRAM_API_KEY in
-                   .env.example); moving it to Settings is a Phase 5
-                   follow-up. -->
+              <!-- Section 3 — Speech-to-text. Deepgram API key + model.
+                   The key resolves via getApiKey('deepgram') (Settings
+                   first, DEEPGRAM_API_KEY env fallback). The model is
+                   baked into the WebSocket query string at connect time,
+                   so a change here only takes effect on the next call.
+                   The key input is NOT inside a data-provider card, so
+                   it's wired separately in src/renderer.js (it has no
+                   model select or Test button). -->
               <div class="settings-section">
                 <h4 class="settings-section__heading">Speech-to-text</h4>
                 <p class="settings-section__subtitle">
-                  Deepgram model used for prospect-side transcription.
-                  Higher tiers give better accuracy at higher cost.
+                  Deepgram powers prospect-side transcription. Paste your
+                  Deepgram API key, then pick a model below.
+                </p>
+
+                <div class="provider-card__key-row">
+                  <div class="provider-card__input-wrap">
+                    <input
+                      type="password"
+                      class="provider-card__input"
+                      id="audioDeepgramKey"
+                      data-provider-key="deepgram"
+                      placeholder="Paste your Deepgram API key"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-label="Deepgram API key"
+                    />
+                    <button
+                      type="button"
+                      class="provider-card__eye"
+                      data-eye-for="deepgram"
+                      aria-label="Show key"
+                      aria-pressed="false"
+                      title="Show / hide key"
+                    >
+                      <span aria-hidden="true">👁</span>
+                    </button>
+                  </div>
+                </div>
+                <p class="settings-section__subtitle" id="audioDeepgramKeyHint">
+                  Without a key, prospect-side transcription is disabled
+                  and the call falls back to mic-only (your side only).
                 </p>
 
                 <div class="provider-card__model-row">

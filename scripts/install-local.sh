@@ -132,7 +132,10 @@ echo "==> install-local: target bundle = $APP_BUNDLE"
 # bundle we want to drop into /Applications.
 echo "==> Phase 1/8: building bundle via 'npm run package'"
 cd "$REPO_ROOT"
-npm run package
+# TWF_BUNDLE_ENV=1 tells forge.config.js to bundle the local .env (your
+# API keys) into THIS personal install. Distribution builds (npm run
+# publish / release) omit this var and ship without any keys.
+TWF_BUNDLE_ENV=1 npm run package
 
 # ----- Phase 2/8: terminate running instances ----------------------
 # `cp -R` over a running .app on macOS will partially succeed

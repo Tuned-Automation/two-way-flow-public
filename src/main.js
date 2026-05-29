@@ -1134,7 +1134,7 @@ async function reconnectDeepgram() {
   // saying at the exact moment the WebSocket closed.
   flushPendingTranscripts();
   try {
-    const key = process.env.DEEPGRAM_API_KEY;
+    const key = getApiKey('deepgram');
     // Re-read settings on reconnect so a model change made while the
     // call was in flight takes effect on the next WS open. Settings
     // changes don't hot-swap an existing connection but a reconnect
@@ -3273,7 +3273,7 @@ function registerIpcHandlers() {
     // on; Gemini's inputTranscription fallback fills in for the 'you'
     // channel and the renderer just won't see a separate 'other'
     // stream until the user provisions a key.
-    const deepgramKey = process.env.DEEPGRAM_API_KEY;
+    const deepgramKey = getApiKey('deepgram');
     if (deepgramKey) {
       // Read the model fresh at session start so the latest Audio-tab
       // selection takes effect on this call. Phase 2 plumbs this onto
