@@ -317,6 +317,9 @@ const RENDERER_EVENTS = [
   // subscribes via `window.gemini.onLogsEntry(cb)` and prepends a
   // .log-row to #errorLogList in real time.
   'logs:entry',
+  // Updater download progress ({ receivedBytes, totalBytes, percent }).
+  // The renderer's Updates UI subscribes via window.gemini.updates.onProgress.
+  'updates:progress',
 ];
 
 function subscribe(channel) {
@@ -610,6 +613,22 @@ contextBridge.exposeInMainWorld('gemini', {
    * main → renderer channel.
    */
   getAppVersion: () => ipcRenderer.invoke('app:version'),
+
+  /**
+   * In-app updater bridge (backed by src/updater.js via main IPC).
+   *   check()              -> { ok, currentVersion, latestVersion,
+   *                             updateAvailable, mustUpdate, notes, asset }
+   *   download(asset)      -> { ok, filePath, verified } | { ok:false, reason }
+   *                           (reason 'integrity_mismatch' = SHA-256 failed)
+   *   reveal(filePath)     -> show the verified download in Finder
+   *   onProgress(cb)       <- 'updates:progress' { receivedBytes, totalBytes, percent }
+   */
+  updates: {
+    check: () => ipcRenderer.invoke('updates:check'),
+    download: (asset) => ipcRenderer.invoke('updates:download', asset),
+    reveal: (filePath) => ipcRenderer.invoke('updates:reveal', filePath),
+    onProgress: subscribe('updates:progress'),
+  },
 
   onOpened: subscribe('gemini:opened'),
   onTranscript: subscribe('gemini:transcript'),

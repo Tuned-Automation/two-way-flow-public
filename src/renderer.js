@@ -10200,3 +10200,161 @@ ensureSettingsLoaded();
 // semantics. Subsequent updates ride on the rubrics:changed
 // broadcast (see onRubricsChanged above).
 hydrateRubricSwitcher();
+
+/* ── In-app updater UI ───────────────────────────────────────────────
+ *
+ * Drives the Settings → General "Updates" section + the force-update
+ * gate. Talks to window.gemini.updates (backed by src/updater.js). Since
+ * unsigned builds can't silently self-apply, the flow is: check → show
+ * notes → download (with progress + SHA-256 verify in main) → reveal the
+ * DMG in Finder for a one-drag install. */
+(() => {
+  const updatesApi = window.gemini?.updates;
+  if (!updatesApi) return;
+
+  const checkBtn = document.getElementById('updatesCheckBtn');
+  const currentVersionEl = document.getElementById('updatesCurrentVersion');
+  const statusEl = document.getElementById('updatesStatus');
+  const availableEl = document.getElementById('updatesAvailable');
+  const latestVersionEl = document.getElementById('updatesLatestVersion');
+  const notesEl = document.getElementById('updatesNotes');
+  const downloadBtn = document.getElementById('updatesDownloadBtn');
+  const progressEl = document.getElementById('updatesProgress');
+  const progressFillEl = document.getElementById('updatesProgressFill');
+  const progressLabelEl = document.getElementById('updatesProgressLabel');
+
+  const forceOverlayEl = document.getElementById('forceUpdateOverlay');
+  const forceNotesEl = document.getElementById('forceUpdateNotes');
+  const forceDownloadBtn = document.getElementById('forceUpdateDownloadBtn');
+  const forceProgressEl = document.getElementById('forceUpdateProgress');
+  const forceProgressFillEl = document.getElementById('forceUpdateProgressFill');
+  const forceProgressLabelEl = document.getElementById('forceUpdateProgressLabel');
+
+  // The asset descriptor from the last successful check; download uses it.
+  let pendingAsset = null;
+  let downloading = false;
+
+  const LAST_CHECK_KEY = 'twf.lastUpdateCheck';
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  function setStatus(msg) {
+    if (!statusEl) return;
+    statusEl.textContent = msg || '';
+    statusEl.hidden = !msg;
+  }
+
+  function setProgress(percent) {
+    const pct = Math.max(0, Math.min(100, Number(percent) || 0));
+    const label = `${pct}%`;
+    if (progressEl) progressEl.hidden = false;
+    if (progressFillEl) progressFillEl.style.width = `${pct}%`;
+    if (progressLabelEl) progressLabelEl.textContent = label;
+    // Mirror onto the force-update overlay's bar when it's visible.
+    if (forceOverlayEl && !forceOverlayEl.hidden) {
+      if (forceProgressEl) forceProgressEl.hidden = false;
+      if (forceProgressFillEl) forceProgressFillEl.style.width = `${pct}%`;
+      if (forceProgressLabelEl) forceProgressLabelEl.textContent = label;
+    }
+  }
+
+  updatesApi.onProgress?.((p) => setProgress(p?.percent));
+
+  async function doDownload(triggerBtn) {
+    if (downloading || !pendingAsset) return;
+    downloading = true;
+    if (triggerBtn) { triggerBtn.disabled = true; triggerBtn.textContent = 'Downloading…'; }
+    setStatus('Downloading update…');
+    setProgress(0);
+    try {
+      const res = await updatesApi.download(pendingAsset);
+      if (res?.ok) {
+        setStatus('Downloaded. Opening Finder — drag Two Way Flow into Applications, then reopen.');
+        await updatesApi.reveal(res.filePath);
+        if (triggerBtn) triggerBtn.textContent = 'Downloaded ✓';
+      } else if (res?.reason === 'integrity_mismatch') {
+        setStatus('Download failed an integrity check and was discarded. Please try again.');
+        if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.textContent = 'Download update'; }
+      } else {
+        setStatus(`Download failed: ${res?.reason || 'unknown error'}.`);
+        if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.textContent = 'Download update'; }
+      }
+    } catch (err) {
+      setStatus(`Download failed: ${err?.message || err}.`);
+      if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.textContent = 'Download update'; }
+    } finally {
+      downloading = false;
+    }
+  }
+
+  function showForceGate(result) {
+    if (!forceOverlayEl) return;
+    pendingAsset = result.asset || pendingAsset;
+    if (forceNotesEl) forceNotesEl.textContent = result.notes || '';
+    forceOverlayEl.hidden = false;
+  }
+
+  function applyCheckResult(result, { manual }) {
+    if (currentVersionEl && result?.currentVersion) {
+      currentVersionEl.textContent = result.currentVersion;
+    }
+    if (!result?.ok) {
+      if (manual) setStatus(`Could not check for updates: ${result?.reason || 'network error'}.`);
+      return;
+    }
+    // Force-update takes precedence over the normal "available" UI.
+    if (result.mustUpdate) {
+      pendingAsset = result.asset;
+      showForceGate(result);
+    }
+    if (result.updateAvailable && result.asset) {
+      pendingAsset = result.asset;
+      if (latestVersionEl) latestVersionEl.textContent = result.latestVersion;
+      if (notesEl) notesEl.textContent = result.notes || '';
+      if (availableEl) availableEl.hidden = false;
+      setStatus('');
+    } else {
+      if (availableEl) availableEl.hidden = true;
+      if (manual) setStatus(`You're up to date (v${result.currentVersion}).`);
+    }
+  }
+
+  async function runCheck({ manual }) {
+    if (manual) setStatus('Checking…');
+    try {
+      localStorage.setItem(LAST_CHECK_KEY, String(Date.now()));
+    } catch { /* storage unavailable */ }
+    let result = null;
+    try {
+      result = await updatesApi.check();
+    } catch (err) {
+      result = { ok: false, reason: err?.message || 'check_failed' };
+    }
+    applyCheckResult(result, { manual });
+  }
+
+  if (checkBtn) {
+    checkBtn.addEventListener('click', () => runCheck({ manual: true }));
+  }
+  if (downloadBtn) {
+    downloadBtn.addEventListener('click', () => doDownload(downloadBtn));
+  }
+  if (forceDownloadBtn) {
+    forceDownloadBtn.addEventListener('click', () => doDownload(forceDownloadBtn));
+  }
+
+  // Paint the current version immediately (independent of the network).
+  if (currentVersionEl) {
+    window.gemini.getAppVersion?.().then((v) => {
+      if (v?.pkgVersion) currentVersionEl.textContent = v.pkgVersion;
+    }).catch(() => {});
+  }
+
+  // Launch auto-check, throttled to once per day. Force-update always
+  // surfaces regardless of the throttle on the next check.
+  let lastCheck = 0;
+  try { lastCheck = Number(localStorage.getItem(LAST_CHECK_KEY)) || 0; } catch { /* ignore */ }
+  if (Date.now() - lastCheck > DAY_MS) {
+    // Small delay so it doesn't compete with first-frame rendering.
+    setTimeout(() => runCheck({ manual: false }), 4000);
+  }
+})();

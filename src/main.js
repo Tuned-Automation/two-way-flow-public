@@ -259,6 +259,7 @@ import {
   getFactsScanner,
 } from './settings.js';
 import { getProvider } from './providers/index.js';
+import { checkForUpdate, downloadUpdate, revealDownload } from './updater.js';
 import * as rubricStore from './rubric-store.js';
 import { applyRubric } from './rubric.js';
 import { DEFAULT_RUBRIC } from './rubric-defaults.js';
@@ -4238,6 +4239,20 @@ function registerIpcHandlers() {
    * state at process boot). Cached after first read.
    */
   ipcMain.handle('app:version', () => computeAppVersion());
+
+  /* In-app updater (see src/updater.js). Unsigned builds can't use
+   * Squirrel.Mac, so this is a check -> download -> guided-install flow.
+   * The renderer drives cadence (launch check + manual button) and the
+   * force-update gate; main just does the network + integrity work. */
+  ipcMain.handle('updates:check', () => checkForUpdate());
+  ipcMain.handle('updates:download', async (event, asset) => downloadUpdate(asset, (p) => {
+    try {
+      if (event.sender && !event.sender.isDestroyed()) {
+        event.sender.send('updates:progress', p);
+      }
+    } catch { /* sender gone */ }
+  }));
+  ipcMain.handle('updates:reveal', (_event, filePath) => revealDownload(filePath));
 
   // Renderer asks the coach for a fresh suggestion (seller pressed Skip
   // on the active suggestion card, or pressed → at the live edge of

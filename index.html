@@ -2264,6 +2264,64 @@
               aria-label="General"
               hidden
             >
+              <!-- Updates. In-app update checker (src/updater.js via
+                   window.gemini.updates). Unsigned builds can't silently
+                   self-apply, so this checks the public releases repo,
+                   shows release notes, downloads + integrity-verifies the
+                   DMG, then reveals it for a one-drag install. -->
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Updates</h4>
+                <p class="settings-section__subtitle">
+                  Two Way Flow checks for new versions on launch. You can
+                  also check manually.
+                </p>
+
+                <div class="data-action">
+                  <div class="data-action__info">
+                    <strong class="data-action__title">Current version</strong>
+                    <span class="data-action__desc" id="updatesCurrentVersion">&mdash;</span>
+                  </div>
+                  <div class="data-action__controls">
+                    <button
+                      type="button"
+                      id="updatesCheckBtn"
+                      class="data-action__btn"
+                    >Check for updates</button>
+                  </div>
+                </div>
+
+                <p
+                  id="updatesStatus"
+                  class="settings-section__subtitle"
+                  role="status"
+                  aria-live="polite"
+                  hidden
+                ></p>
+
+                <div id="updatesAvailable" class="data-action data-action--update" hidden>
+                  <div class="data-action__info">
+                    <strong class="data-action__title">
+                      Update available: <span id="updatesLatestVersion"></span>
+                    </strong>
+                    <span class="data-action__desc" id="updatesNotes"></span>
+                  </div>
+                  <div class="data-action__controls">
+                    <button
+                      type="button"
+                      id="updatesDownloadBtn"
+                      class="data-action__btn data-action__btn--primary"
+                    >Download update</button>
+                  </div>
+                </div>
+
+                <div id="updatesProgress" class="updates-progress" hidden>
+                  <div class="updates-progress__track">
+                    <div id="updatesProgressFill" class="updates-progress__fill"></div>
+                  </div>
+                  <span id="updatesProgressLabel" class="updates-progress__label">0%</span>
+                </div>
+              </div>
+
               <div class="settings-section">
                 <h4 class="settings-section__heading">Data</h4>
                 <p class="settings-section__subtitle">
@@ -2495,6 +2553,41 @@
     <!-- Captured-field recap tooltip. Positioned via JS on mouseenter;
          pointer-events:none so it never blocks panel interaction. -->
     <div id="capturedTooltip" class="captured-tooltip" role="tooltip" aria-hidden="true"></div>
+
+    <!-- Force-update gate. Shown (non-dismissible) by the renderer when
+         the running version is below the manifest's minSupported. The
+         only remote lever to retire a broken/insecure old build. -->
+    <div
+      id="forceUpdateOverlay"
+      class="force-update"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="forceUpdateTitle"
+      hidden
+    >
+      <div class="force-update__panel">
+        <h2 id="forceUpdateTitle" class="force-update__title">Update required</h2>
+        <p class="force-update__desc">
+          A newer version of Two Way Flow is required to keep going.
+          Download it, drag it into your Applications folder, and reopen.
+        </p>
+        <p class="force-update__notes" id="forceUpdateNotes"></p>
+        <div class="force-update__actions">
+          <button
+            type="button"
+            id="forceUpdateDownloadBtn"
+            class="force-update__btn"
+          >Download update</button>
+        </div>
+        <div id="forceUpdateProgress" class="updates-progress" hidden>
+          <div class="updates-progress__track">
+            <div id="forceUpdateProgressFill" class="updates-progress__fill"></div>
+          </div>
+          <span id="forceUpdateProgressLabel" class="updates-progress__label">0%</span>
+        </div>
+      </div>
+    </div>
+
     <script type="module" src="/src/renderer.js"></script>
   </body>
 </html>

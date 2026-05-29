@@ -4573,6 +4573,134 @@ a,
   border-color: rgba(248, 113, 113, 0.6);
 }
 
+/* ── Updates (Settings → General) ─────────────────────────────────── */
+
+.data-action__btn--primary {
+  border-color: rgba(96, 165, 250, 0.5);
+  background: rgba(96, 165, 250, 0.18);
+  color: #bfdbfe;
+}
+
+.data-action__btn--primary:hover {
+  background: rgba(96, 165, 250, 0.28);
+  border-color: rgba(96, 165, 250, 0.7);
+}
+
+.data-action--update {
+  border-color: rgba(96, 165, 250, 0.4);
+  background: rgba(20, 28, 45, 0.55);
+}
+
+.data-action--update[hidden] { display: none; }
+
+.updates-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.updates-progress[hidden] { display: none; }
+
+.updates-progress__track {
+  flex: 1 1 auto;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.updates-progress__fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: #60a5fa;
+  transition: width 160ms ease;
+}
+
+.updates-progress__label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  min-width: 34px;
+  text-align: right;
+}
+
+/* ── Force-update gate (full-screen, non-dismissible) ─────────────── */
+
+.force-update {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+  background: rgba(6, 6, 10, 0.82);
+  backdrop-filter: blur(4px);
+  -webkit-app-region: no-drag;
+}
+
+.force-update[hidden] { display: none; }
+
+.force-update__panel {
+  width: min(460px, 100%);
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-card);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+  padding: 24px 26px;
+  text-align: center;
+}
+
+.force-update__title {
+  margin: 0 0 10px;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.force-update__desc {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-med);
+}
+
+.force-update__notes {
+  margin: 0 0 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+}
+
+.force-update__notes:empty { display: none; }
+
+.force-update__actions {
+  display: flex;
+  justify-content: center;
+}
+
+.force-update__btn {
+  appearance: none;
+  border: 1px solid rgba(96, 165, 250, 0.6);
+  background: rgba(96, 165, 250, 0.2);
+  color: #bfdbfe;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 9px 20px;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.force-update__btn:hover {
+  background: rgba(96, 165, 250, 0.3);
+  border-color: rgba(96, 165, 250, 0.85);
+}
+
 /* Modal extras for the reset confirmation + import preview dialogs.
  * Both reuse the .modal__panel chrome (already defined further up in
  * this file). The additions below cover the per-dialog body bits:
