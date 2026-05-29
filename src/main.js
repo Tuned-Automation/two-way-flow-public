@@ -373,6 +373,11 @@ let liveSession = null;
 let coachSession = null;
 let deepgramSession = null;
 let mainWindowRef = null;
+// Overlay bounds captured the moment the Settings modal expands the
+// window, so closing Settings restores the exact pre-Settings size +
+// position. null when Settings is not currently expanding the window.
+// See the 'window:settings-open' IPC handler.
+let settingsPreExpandBounds = null;
 /**
  * Secondary BrowserWindow used by the Appearance tab's transparency
  * preview. Lazy-created the first time the user clicks "Open preview"
@@ -4177,6 +4182,47 @@ function registerIpcHandlers() {
 
   ipcMain.handle('window:quit', () => {
     app.quit();
+    return { ok: true };
+  });
+
+  /**
+   * window:settings-open — grow the overlay while the Settings modal is
+   * open, then restore it on close.
+   *
+   * The Settings modal is rendered INSIDE the overlay window, so it can
+   * never be larger than the overlay — and the overlay's default 520px
+   * height makes the dense Settings (especially the Rubrics editor)
+   * feel cramped. Rather than split Settings into its own window (a much
+   * larger refactor), we temporarily expand the overlay to a comfortable
+   * size centred on the active display while Settings is open, and snap
+   * back to the exact previous bounds when it closes.
+   *
+   * @param {boolean} open  true on modal open, false on modal close.
+   *
+   * Re-entrancy: we only snapshot bounds on the false→true transition
+   * (guarded by settingsPreExpandBounds === null) so a second open while
+   * already expanded can't capture the expanded bounds as the "restore"
+   * target. The target is clamped to the display's work area minus a
+   * margin so it always fits on screen.
+   */
+  ipcMain.handle('window:settings-open', (_event, open) => {
+    const w = mainWindowRef;
+    if (!w || w.isDestroyed()) return { ok: false };
+    if (open) {
+      if (!settingsPreExpandBounds) {
+        settingsPreExpandBounds = w.getBounds();
+      }
+      const { workArea } = screen.getDisplayMatching(w.getBounds());
+      const margin = 40;
+      const targetW = Math.min(1320, workArea.width - margin * 2);
+      const targetH = Math.min(960, workArea.height - margin * 2);
+      const x = Math.round(workArea.x + (workArea.width - targetW) / 2);
+      const y = Math.round(workArea.y + (workArea.height - targetH) / 2);
+      w.setBounds({ x, y, width: targetW, height: targetH }, true);
+    } else if (settingsPreExpandBounds) {
+      w.setBounds(settingsPreExpandBounds, true);
+      settingsPreExpandBounds = null;
+    }
     return { ok: true };
   });
 

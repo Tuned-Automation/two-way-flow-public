@@ -589,6 +589,12 @@ contextBridge.exposeInMainWorld('gemini', {
     minimize: () => ipcRenderer.invoke('window:minimize'),
     close: () => ipcRenderer.invoke('window:close'),
     quit: () => ipcRenderer.invoke('window:quit'),
+    // Grow the overlay while the Settings modal is open (true) and
+    // restore its previous bounds on close (false). The Settings modal
+    // lives inside the overlay window, so this is how it gets room
+    // bigger than the overlay's default size. Backed by
+    // 'window:settings-open' in src/main.js.
+    setSettingsOpen: (open) => ipcRenderer.invoke('window:settings-open', !!open),
   },
 
   /**
