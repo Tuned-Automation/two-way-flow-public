@@ -7949,9 +7949,19 @@ const rubricsTabState = {
 };
 
 const RUBRICS_GLYPH_PRESETS = [
+  // Original set
   '\u25B6', '?', '\u2261', '\u26A1\uFE0E', '$', '\u23F1\uFE0E',
   '\u2605', '\u25CE', '\u2694\uFE0E', '\u2699\uFE0E', '\u25C9', '\u2192',
   '\u25A3', '\u2728', '\u25C6', '\u25C8',
+  // Geometric shapes (filled / hollow)
+  '\u25CF', '\u25CB', '\u25A0', '\u25A1', '\u25B2', '\u25BC',
+  '\u25C7', '\u2756', '\u2726', '\u2736', '\u2295', '\u2297',
+  // Circled / target / process
+  '\u2299', '\u29BF', '\u2316', '\u21BB', '\u21C4', '\u2197',
+  // Business + signal glyphs (\uFE0E forces monochrome text rendering)
+  '\u2691\uFE0E', '\u2696\uFE0E', '\u2709\uFE0E', '\u260E\uFE0E', '\u2713', '\u2B22',
+  // Finance / misc
+  '%', '#', '\u221E', '\u2211', '\u20AC', '\u2317',
 ];
 const RUBRICS_DEFAULT_TINT = '#94a3b8';
 const RUBRICS_FLAG_SEVERITIES = ['red', 'green'];
