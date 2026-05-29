@@ -260,6 +260,7 @@ import {
 } from './settings.js';
 import { getProvider } from './providers/index.js';
 import { checkForUpdate, downloadUpdate, revealDownload } from './updater.js';
+import { backupUserData } from './backup.js';
 import * as rubricStore from './rubric-store.js';
 import { applyRubric } from './rubric.js';
 import { DEFAULT_RUBRIC } from './rubric-defaults.js';
@@ -4674,6 +4675,14 @@ app.whenReady().then(async () => {
     rubricStore.ensureSeeded();
   } catch (err) {
     console.warn('[main] rubricStore.ensureSeeded threw:', err?.message || err);
+  }
+  // Rolling, throttled backup of rubrics + settings (see src/backup.js).
+  // Runs after ensureSeeded so the snapshot includes the seeded built-ins;
+  // best-effort, never blocks boot.
+  try {
+    backupUserData();
+  } catch (err) {
+    console.warn('[main] backupUserData threw:', err?.message || err);
   }
   try {
     applyRubric(rubricStore.loadActiveRubric());

@@ -492,6 +492,34 @@ function listRubricFilesOnDisk() {
  * Skips files that fail schema validation but logs them so the user can
  * surface "1 rubric failed to load" in the Rubrics tab later if needed.
  */
+/**
+ * Upgrade a loaded rubric to the current SCHEMA_VERSION — the rubric
+ * counterpart to migrateSettings() in settings.js, so a future schema
+ * bump can never strand a user's rubrics. Returns the (possibly
+ * upgraded) rubric, or null if it can't be safely migrated.
+ *
+ * There are NO migration steps yet (v1 is the floor): today this passes
+ * a v1 rubric through unchanged and rejects junk / newer-than-known
+ * versions (a downgrade is never safe). WHEN YOU BUMP SCHEMA_VERSION,
+ * add sequential `if (v < N) working = upToN(working)` steps here — and
+ * persist the upgraded shape from loadRubric — and every existing user
+ * rubric is carried forward instead of being dropped on load.
+ */
+function migrateRubric(loaded) {
+  if (!loaded || typeof loaded !== 'object') return null;
+  const v = Number(loaded.schemaVersion);
+  if (v === SCHEMA_VERSION) return loaded;
+  if (!Number.isFinite(v) || v > SCHEMA_VERSION) {
+    // Junk, or written by a NEWER app than this one — don't guess.
+    return null;
+  }
+  // v < SCHEMA_VERSION — apply upgrade steps here as the schema evolves.
+  const working = loaded;
+  // (no migration steps yet)
+  working.schemaVersion = SCHEMA_VERSION;
+  return working;
+}
+
 export function listRubrics() {
   const index = loadIndex();
   const activeId = index?.activeId || null;
@@ -502,16 +530,17 @@ export function listRubrics() {
   for (const id of ids) {
     const parsed = readJsonFile(getRubricPath(id));
     if (!parsed) continue;
-    if (Number(parsed.schemaVersion) !== SCHEMA_VERSION) {
+    const migrated = migrateRubric(parsed);
+    if (!migrated) {
       console.warn(`[rubric-store] skipping ${id}: schemaVersion ${parsed.schemaVersion} unsupported`);
       continue;
     }
     out.push({
-      id: parsed.id || id,
-      name: parsed.name || id,
-      description: parsed.description || '',
-      isActive: (parsed.id || id) === activeId,
-      updatedAt: parsed.updatedAt || null,
+      id: migrated.id || id,
+      name: migrated.name || id,
+      description: migrated.description || '',
+      isActive: (migrated.id || id) === activeId,
+      updatedAt: migrated.updatedAt || null,
     });
   }
   return out;
@@ -527,11 +556,12 @@ export function loadRubric(id) {
   if (!isNonEmptyString(id)) return null;
   const parsed = readJsonFile(getRubricPath(id));
   if (!parsed) return null;
-  if (Number(parsed.schemaVersion) !== SCHEMA_VERSION) {
+  const migrated = migrateRubric(parsed);
+  if (!migrated) {
     console.warn(`[rubric-store] refusing to load ${id}: schemaVersion ${parsed.schemaVersion} unsupported`);
     return null;
   }
-  return parsed;
+  return migrated;
 }
 
 /**
