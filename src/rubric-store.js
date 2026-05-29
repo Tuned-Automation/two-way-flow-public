@@ -55,8 +55,22 @@ import {
 import path from 'node:path';
 
 import { DEFAULT_RUBRIC } from './rubric-defaults.js';
+import { SOFTWARE_WALKTHROUGH_RUBRIC } from './rubric-software-walkthrough.js';
 
 const SCHEMA_VERSION = 1;
+
+/**
+ * Built-in rubrics that ship with the app. The FIRST entry is the
+ * primary seed: `ensureSeeded()` writes it on first launch and points
+ * `index.activeId` at it. Every entry (including the first) is also run
+ * through `ensureBuiltins()` so additional built-ins are installed
+ * additively on every boot — see that function for the invariants.
+ *
+ * To add another built-in rubric: author a `<thing>-rubric.js` module
+ * exporting a DEFAULT_RUBRIC-shaped object, import it here, and append
+ * it to this array. Do NOT reorder — index[0] is the active default.
+ */
+const BUILTIN_RUBRICS = [DEFAULT_RUBRIC, SOFTWARE_WALKTHROUGH_RUBRIC];
 
 /** Reserved ids — synthetic pillars must never appear in a persisted rubric. */
 const RESERVED_PILLAR_IDS = new Set(['live_signals', 'logged_questions']);
@@ -357,7 +371,10 @@ export function ensureSeeded() {
     mkdirSync(dir, { recursive: true });
   }
 
-  // If the index exists and points at a rubric that exists, we're done.
+  // If the index exists and points at a rubric that exists, the primary
+  // seed is intact — but additional built-ins may still be missing
+  // (e.g. on an install that predates a newly-shipped built-in), so run
+  // the additive pass before returning.
   const existingIndex = readJsonFile(indexPath);
   if (
     existingIndex &&
@@ -365,6 +382,7 @@ export function ensureSeeded() {
     isNonEmptyString(existingIndex.activeId) &&
     existsSync(getRubricPath(existingIndex.activeId))
   ) {
+    ensureBuiltins();
     return { ok: true, seeded: false };
   }
 
@@ -391,7 +409,62 @@ export function ensureSeeded() {
     rubrics: rubricsList,
   });
   if (!writeIdx.ok) return { ok: false, reason: writeIdx.reason };
+
+  // Install any additional built-ins alongside the freshly-written
+  // primary seed. activeId stays on the primary seed.
+  ensureBuiltins();
   return { ok: true, seeded: true };
+}
+
+/**
+ * Additively install the built-in rubrics in `BUILTIN_RUBRICS`.
+ *
+ * Idempotent and safe to call on every boot. For each built-in:
+ *   - writes its `<id>.json` ONLY if the file is absent (so user edits
+ *     to a built-in survive — same source-of-truth rule as the primary
+ *     seed), and
+ *   - appends its id to `index.rubrics` if not already listed.
+ *
+ * Invariants this function MUST preserve:
+ *   - It NEVER changes `index.activeId` — the active rubric is the
+ *     user's (or the primary-seed default), not ours to move.
+ *   - It NEVER overwrites an existing rubric file, including the
+ *     `tuned_automation` primary seed.
+ *
+ * Best-effort: a failed write for one built-in is logged and skipped so
+ * a single bad file can never block boot.
+ */
+function ensureBuiltins() {
+  const index = loadIndex();
+  // The primary-seed path guarantees an index exists before this runs.
+  // If it somehow doesn't, bail rather than invent one without activeId.
+  if (!index) return;
+
+  const rubrics = Array.isArray(index.rubrics) ? [...index.rubrics] : [];
+  let changed = false;
+
+  for (const builtin of BUILTIN_RUBRICS) {
+    if (!builtin || !isNonEmptyString(builtin.id)) continue;
+    const filePath = getRubricPath(builtin.id);
+    if (!existsSync(filePath)) {
+      const now = new Date().toISOString();
+      const seed = {
+        ...builtin,
+        createdAt: builtin.createdAt || now,
+        updatedAt: now,
+      };
+      const write = writeJsonFile(filePath, seed);
+      if (!write.ok) continue;
+    }
+    if (!rubrics.includes(builtin.id)) {
+      rubrics.push(builtin.id);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    saveIndex({ ...index, rubrics });
+  }
 }
 
 /** Scan the rubrics directory and return rubric ids derived from
