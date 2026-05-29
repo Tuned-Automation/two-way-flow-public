@@ -1639,6 +1639,14 @@
                    and the renderer surfaces the
                    #rubricsLibraryHint message. -->
               <div class="settings-section rubrics-tab__library">
+                <button
+                  type="button"
+                  id="rubricsHelpToggle"
+                  class="rubrics-tab__help-toggle"
+                  aria-pressed="false"
+                  aria-label="Show walkthrough help"
+                  title="Walkthrough: what each section does"
+                >?</button>
                 <h4 class="settings-section__title">Rubric library</h4>
                 <p class="settings-section__subtitle">
                   Pick a rubric to edit, duplicate, or set as active.
@@ -1821,6 +1829,39 @@
                 </nav>
 
                 <div id="rubricsPanel" class="rubrics-tab__panel">
+                  <!-- Walkthrough helper. Hidden until the user toggles
+                       #rubricsHelpToggle. Renderer fills it from
+                       RUBRICS_SECTION_HELP for the active section (or a
+                       welcome overview), and the stepper walks through
+                       every section in order. aria-live announces the
+                       guidance when it changes; tabindex lets focus move
+                       in when the helper opens. -->
+                  <aside
+                    id="rubricsHelpCard"
+                    class="rubrics-tab__help-card"
+                    aria-live="polite"
+                    tabindex="-1"
+                    hidden
+                  >
+                    <div class="rubrics-tab__help-card-head">
+                      <span class="rubrics-tab__help-card-eyebrow">Walkthrough</span>
+                      <h4 id="rubricsHelpTitle" class="rubrics-tab__help-card-title"></h4>
+                    </div>
+                    <div id="rubricsHelpBody" class="rubrics-tab__help-card-body"></div>
+                    <div class="rubrics-tab__help-stepper">
+                      <button
+                        type="button"
+                        id="rubricsHelpBack"
+                        class="rubrics-tab__btn"
+                      >&larr; Back</button>
+                      <span id="rubricsHelpStep" class="rubrics-tab__help-step" aria-hidden="true"></span>
+                      <button
+                        type="button"
+                        id="rubricsHelpNext"
+                        class="rubrics-tab__btn rubrics-tab__btn--primary"
+                      >Next &rarr;</button>
+                    </div>
+                  </aside>
                   <section
                     class="rubrics-tab__panel-section"
                     data-panel="identity"

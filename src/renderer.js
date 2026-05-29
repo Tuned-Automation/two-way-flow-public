@@ -5703,6 +5703,11 @@ async function openSettingsModal(initialTabId) {
     // showModal() throws if the dialog is already open. Treat as no-op.
     console.warn('[settings] showModal failed:', err?.message || err);
   }
+  // Grow the overlay window so the modal has room beyond the overlay's
+  // compact default size. Main snapshots the current bounds and restores
+  // them on the dialog's 'close' event below. Idempotent in main, so a
+  // re-open while already expanded is harmless.
+  try { window.gemini?.window?.setSettingsOpen?.(true); } catch { /* bridge missing */ }
 }
 
 function closeSettingsModal() {
@@ -6032,6 +6037,10 @@ if (settingsModalCloseEl) {
 // don't reappear over a closed parent on next open.
 if (settingsModalEl) {
   settingsModalEl.addEventListener('close', () => {
+    // Restore the overlay to its pre-Settings size + position. Fires for
+    // every close path (× button, Esc, programmatic close), so this is
+    // the single reliable place to undo the open-time window expansion.
+    try { window.gemini?.window?.setSettingsOpen?.(false); } catch { /* bridge missing */ }
     for (const provider of PROVIDER_IDS) flushPendingKeySave(provider);
     flushAppearanceSave();
     if (settingsResetConfirmEl instanceof HTMLDialogElement && settingsResetConfirmEl.open) {
@@ -7864,6 +7873,29 @@ const rubricsPanelSectionEls = rubricsPanelEl
 // bounce the user back to Identity. Defaults to the section flagged
 // --active in index.html.
 let rubricsActiveSection = 'identity';
+
+// Walkthrough helper (the "?" toggle in the library bar). Shows a
+// contextual help card above the panel that explains the active section
+// in plain, sales-oriented language, with a Next/Back stepper that walks
+// through every section in order.
+const rubricsHelpToggleEl = document.getElementById('rubricsHelpToggle');
+const rubricsHelpCardEl = document.getElementById('rubricsHelpCard');
+const rubricsHelpTitleEl = document.getElementById('rubricsHelpTitle');
+const rubricsHelpBodyEl = document.getElementById('rubricsHelpBody');
+const rubricsHelpStepEl = document.getElementById('rubricsHelpStep');
+const rubricsHelpBackEl = document.getElementById('rubricsHelpBack');
+const rubricsHelpNextEl = document.getElementById('rubricsHelpNext');
+// On/off, persisted. Defaults ON for a first-ever open (light
+// onboarding) and remembers the user's choice after that.
+let rubricsWalkthroughOn = (() => {
+  try {
+    const v = localStorage.getItem('twf.rubricsWalkthrough');
+    return v === null ? true : v === '1';
+  } catch { return true; }
+})();
+// When true, the card shows the welcome overview instead of a specific
+// section. Set on open; cleared the moment the user navigates.
+let rubricsHelpShowWelcome = rubricsWalkthroughOn;
 // Section bodies — keyed by their data-section value. Each is a
 // <div data-section-content="…"> inside a .rubrics-tab__panel-section
 // wrapper. The renderer paints every section eagerly on load; the
@@ -7924,6 +7956,83 @@ const RUBRICS_GLYPH_PRESETS = [
 const RUBRICS_DEFAULT_TINT = '#94a3b8';
 const RUBRICS_FLAG_SEVERITIES = ['red', 'green'];
 const RUBRICS_FLAG_WHEN = ['early', 'mid', 'late'];
+
+/* Walkthrough copy — plain-English, sales-focused guidance for each
+ * editor section, surfaced by the "?" helper. RUBRICS_HELP_ORDER drives
+ * the Next/Back stepper. `body` paragraphs render as <p>; optional
+ * `todo` bullets render under a "Try this" label. Edit freely — this is
+ * the single source for the helper text. */
+const RUBRICS_HELP_ORDER = [
+  'identity', 'voice-tone', 'pillars', 'items', 'fields', 'flags', 'scoring', 'advanced-prompts',
+];
+const RUBRICS_SECTION_HELP = {
+  welcome: {
+    title: 'Your call playbook',
+    body: [
+      'This is the playbook the coach uses to score your calls and tell you what to ask next.',
+      'Use the arrows below to walk through each part \u2014 it takes about a minute.',
+    ],
+  },
+  identity: {
+    title: 'Identity',
+    body: ['Just names this playbook so you can spot it in the list and know what kind of call it\u2019s for.'],
+    todo: [
+      'Give it a clear name, like \u201CDiscovery call\u201D.',
+      'Add a one-line description so future-you remembers what it\u2019s for.',
+    ],
+  },
+  'voice-tone': {
+    title: 'Voice & tone',
+    body: ['Sets how the coach talks to you during a call \u2014 its style and how blunt its nudges are.'],
+    todo: [
+      'Tell it your style, e.g. \u201CPlain English, no jargon, get to the point.\u201D',
+      'Leave it blank to use the default coaching voice.',
+    ],
+  },
+  pillars: {
+    title: 'Pillars',
+    body: ['The big topics you get scored on \u2014 like Discovery, Pain, or Next steps. They show up in the live rail during a call.'],
+    todo: [
+      'Rename or reorder them to match how you run a call.',
+      'Pick a colour and icon so each is easy to spot in the rail.',
+    ],
+  },
+  items: {
+    title: 'Items',
+    body: ['The specific questions and moves the coach listens for inside each pillar \u2014 the actual things a great call covers.'],
+    todo: [
+      'Add the questions you want to be reminded to ask.',
+      'Turn on \u201CSuggestable\u201D for ones the coach can prompt you to ask live.',
+    ],
+  },
+  fields: {
+    title: 'Captured fields',
+    body: ['Facts the coach pulls out of the conversation and saves for you automatically \u2014 things like team size, budget, or the decision maker.'],
+    todo: [
+      'Add any detail you want captured from every call.',
+      'Group related facts so your notes stay tidy.',
+    ],
+  },
+  flags: {
+    title: 'Live flags',
+    body: ['Real-time signals during the call \u2014 red ones warn you (\u201Cyou\u2019re talking too much\u201D), green ones celebrate a win (\u201Cthey gave a budget\u201D).'],
+    todo: [
+      'Add the habits you want flagged in the moment.',
+      'Set whether each can fire early, mid, or late in the call.',
+    ],
+  },
+  scoring: {
+    title: 'Scoring',
+    body: ['Shows how your call turns into a score: each pillar is scored by how many of its items you covered. This view is read-only for now.'],
+  },
+  'advanced-prompts': {
+    title: 'Advanced \u2014 System prompts',
+    body: [
+      'The raw instructions that tell the AI how to behave. Powerful, but easy to break.',
+      'Only edit if you know what you\u2019re doing \u2014 and use \u201CReset to default\u201D to undo.',
+    ],
+  },
+};
 
 async function hydrateRubricsTab() {
   if (!window.rubrics?.list) return;
@@ -8239,6 +8348,63 @@ function selectRubricsSection(key) {
   // Reset the panel scroll to the top so each section starts at its
   // header rather than wherever the previous section was scrolled to.
   if (rubricsPanelEl) rubricsPanelEl.scrollTop = 0;
+  // Keep the walkthrough card in sync — both nav clicks and the stepper
+  // route through here, so this is the single place the helper updates.
+  renderRubricsHelpCard();
+}
+
+/* Render the walkthrough helper card for the current state: the welcome
+ * overview, or the active section's guidance with a position-aware
+ * Next/Back stepper. Hidden entirely when the walkthrough is toggled
+ * off. */
+function renderRubricsHelpCard() {
+  if (!rubricsHelpCardEl) return;
+  if (!rubricsWalkthroughOn) {
+    rubricsHelpCardEl.hidden = true;
+    return;
+  }
+  rubricsHelpCardEl.hidden = false;
+  const total = RUBRICS_HELP_ORDER.length;
+  const onWelcome = rubricsHelpShowWelcome;
+  const data = onWelcome
+    ? RUBRICS_SECTION_HELP.welcome
+    : (RUBRICS_SECTION_HELP[rubricsActiveSection] || RUBRICS_SECTION_HELP.welcome);
+
+  if (rubricsHelpTitleEl) rubricsHelpTitleEl.textContent = data.title || '';
+  if (rubricsHelpBodyEl) {
+    rubricsHelpBodyEl.innerHTML = '';
+    for (const para of data.body || []) {
+      const p = document.createElement('p');
+      p.textContent = para;
+      rubricsHelpBodyEl.appendChild(p);
+    }
+    if (Array.isArray(data.todo) && data.todo.length > 0) {
+      const label = document.createElement('p');
+      label.className = 'rubrics-tab__help-try';
+      label.textContent = 'Try this';
+      rubricsHelpBodyEl.appendChild(label);
+      const ul = document.createElement('ul');
+      ul.className = 'rubrics-tab__help-list';
+      for (const t of data.todo) {
+        const li = document.createElement('li');
+        li.textContent = t;
+        ul.appendChild(li);
+      }
+      rubricsHelpBodyEl.appendChild(ul);
+    }
+  }
+
+  const idx = onWelcome ? -1 : RUBRICS_HELP_ORDER.indexOf(rubricsActiveSection);
+  if (rubricsHelpStepEl) {
+    rubricsHelpStepEl.textContent = onWelcome ? 'Overview' : `${idx + 1} of ${total}`;
+  }
+  // Back is disabled only on the welcome overview (nothing precedes it).
+  if (rubricsHelpBackEl) rubricsHelpBackEl.disabled = onWelcome;
+  // Next jumps welcome -> first section, then advances; disabled on last.
+  if (rubricsHelpNextEl) {
+    rubricsHelpNextEl.disabled = !onWelcome && idx >= total - 1;
+    rubricsHelpNextEl.textContent = onWelcome ? 'Start \u2192' : 'Next \u2192';
+  }
 }
 
 /* Refresh the count badges on the Pillars / Items / Captured fields /
@@ -9809,7 +9975,58 @@ if (rubricSwitcherEl) {
 // Section-nav rail: each button swaps which panel section is visible.
 for (const item of rubricsNavItemEls) {
   item.addEventListener('click', () => {
+    // A direct nav click leaves the welcome overview behind.
+    rubricsHelpShowWelcome = false;
     selectRubricsSection(item.dataset.section);
+  });
+}
+
+// Walkthrough helper: "?" toggle + Next/Back stepper.
+if (rubricsHelpToggleEl) {
+  // Reflect the persisted on/off state on the button at boot.
+  rubricsHelpToggleEl.setAttribute('aria-pressed', String(rubricsWalkthroughOn));
+  rubricsHelpToggleEl.classList.toggle('rubrics-tab__help-toggle--on', rubricsWalkthroughOn);
+  rubricsHelpToggleEl.addEventListener('click', () => {
+    rubricsWalkthroughOn = !rubricsWalkthroughOn;
+    try {
+      localStorage.setItem('twf.rubricsWalkthrough', rubricsWalkthroughOn ? '1' : '0');
+    } catch { /* storage unavailable */ }
+    rubricsHelpToggleEl.setAttribute('aria-pressed', String(rubricsWalkthroughOn));
+    rubricsHelpToggleEl.classList.toggle('rubrics-tab__help-toggle--on', rubricsWalkthroughOn);
+    // Re-opening the helper starts at the welcome overview.
+    if (rubricsWalkthroughOn) rubricsHelpShowWelcome = true;
+    renderRubricsHelpCard();
+    if (rubricsWalkthroughOn) {
+      try { rubricsHelpCardEl?.focus(); } catch { /* not focusable */ }
+    }
+  });
+}
+
+if (rubricsHelpNextEl) {
+  rubricsHelpNextEl.addEventListener('click', () => {
+    if (rubricsHelpShowWelcome) {
+      rubricsHelpShowWelcome = false;
+      selectRubricsSection(RUBRICS_HELP_ORDER[0]);
+      return;
+    }
+    const i = RUBRICS_HELP_ORDER.indexOf(rubricsActiveSection);
+    if (i >= 0 && i < RUBRICS_HELP_ORDER.length - 1) {
+      selectRubricsSection(RUBRICS_HELP_ORDER[i + 1]);
+    }
+  });
+}
+
+if (rubricsHelpBackEl) {
+  rubricsHelpBackEl.addEventListener('click', () => {
+    if (rubricsHelpShowWelcome) return;
+    const i = RUBRICS_HELP_ORDER.indexOf(rubricsActiveSection);
+    if (i <= 0) {
+      // Back from the first section returns to the welcome overview.
+      rubricsHelpShowWelcome = true;
+      renderRubricsHelpCard();
+    } else {
+      selectRubricsSection(RUBRICS_HELP_ORDER[i - 1]);
+    }
   });
 }
 

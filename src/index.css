@@ -5021,10 +5021,156 @@ a,
   padding: 16px 22px;
   border-bottom: 1px solid var(--border-soft);
   background: rgba(255, 255, 255, 0.02);
+  position: relative;
 }
 
 .rubrics-tab__library > .settings-section__subtitle {
   margin: 0;
+  /* Leave room for the absolutely-positioned help toggle top-right. */
+  padding-right: 34px;
+}
+
+/* ── Walkthrough helper: "?" toggle + contextual card + stepper ───── */
+
+.rubrics-tab__help-toggle {
+  -webkit-app-region: no-drag;
+  position: absolute;
+  top: 14px;
+  right: 18px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--text-med);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-soft);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.rubrics-tab__help-toggle:hover {
+  color: var(--text-strong);
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.rubrics-tab__help-toggle:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 2px;
+}
+
+.rubrics-tab__help-toggle--on {
+  color: #93c5fd;
+  background: rgba(96, 165, 250, 0.18);
+  border-color: rgba(96, 165, 250, 0.5);
+}
+
+.rubrics-tab__help-card {
+  margin-bottom: 18px;
+  padding: 16px 18px;
+  border: 1px solid rgba(96, 165, 250, 0.4);
+  border-radius: 12px;
+  background: rgba(20, 28, 45, 0.5);
+  animation: rubrics-help-fade 200ms ease;
+}
+
+.rubrics-tab__help-card[hidden] {
+  display: none;
+}
+
+.rubrics-tab__help-card:focus {
+  outline: none;
+}
+
+@keyframes rubrics-help-fade {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+
+.rubrics-tab__help-card-head {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 8px;
+}
+
+.rubrics-tab__help-card-eyebrow {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: #93c5fd;
+}
+
+.rubrics-tab__help-card-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.rubrics-tab__help-card-body p {
+  margin: 0 0 8px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-med);
+}
+
+.rubrics-tab__help-card-body p:last-child {
+  margin-bottom: 0;
+}
+
+.rubrics-tab__help-card-body p.rubrics-tab__help-try {
+  margin: 12px 0 5px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.rubrics-tab__help-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rubrics-tab__help-list li {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-med);
+}
+
+.rubrics-tab__help-stepper {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.rubrics-tab__help-step {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rubrics-tab__help-card {
+    animation: none;
+  }
 }
 
 .rubrics-tab__library-row {
@@ -5259,6 +5405,10 @@ a,
   overflow: hidden;
   display: grid;
   grid-template-columns: 212px minmax(0, 1fr);
+  /* ~20px breathing room each side so the nav rail + panel sit more
+   * centered inside the wide modal (the library / save bars stay
+   * full-bleed as anchors). */
+  padding: 0 20px;
 }
 
 .rubrics-tab__editor[hidden] {
@@ -6189,6 +6339,7 @@ a,
   .rubrics-tab__editor {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
+    padding: 0 12px;
   }
 
   .rubrics-tab__nav {
