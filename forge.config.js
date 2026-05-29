@@ -214,8 +214,22 @@ module.exports = {
       config: {},
     },
     {
+      // Zip is what the in-app updater downloads + (Squirrel.Mac would
+      // consume, if we ever sign). Keep it as the canonical macOS
+      // auto-update artifact even though the DMG below is the nicer
+      // human download.
       name: '@electron-forge/maker-zip',
       platforms: ['darwin'],
+    },
+    {
+      // DMG = the drag-to-Applications installer users download from the
+      // public releases repo. macOS only.
+      name: '@electron-forge/maker-dmg',
+      platforms: ['darwin'],
+      config: {
+        name: `${VERSIONED_APP_NAME}`,
+        overwrite: true,
+      },
     },
     {
       name: '@electron-forge/maker-deb',
@@ -224,6 +238,24 @@ module.exports = {
     {
       name: '@electron-forge/maker-rpm',
       config: {},
+    },
+  ],
+  publishers: [
+    {
+      // Publishes build artifacts to the PUBLIC releases repo (NOT the
+      // private source repo). Needs GITHUB_TOKEN with repo scope on the
+      // releases repo in the environment at `npm run publish` time -
+      // never embedded in the app. The in-app updater reads updates.json
+      // from this same repo (see src/updater.js).
+      name: '@electron-forge/publisher-github',
+      config: {
+        repository: {
+          owner: 'Tuned-Automation',
+          name: 'two-way-flow-releases',
+        },
+        prerelease: false,
+        draft: true,
+      },
     },
   ],
   plugins: [
