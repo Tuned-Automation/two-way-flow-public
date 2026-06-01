@@ -1,7 +1,7 @@
 {
   "name": "2-way-flow",
   "productName": "Two Way Flow",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "description": "Two Way Flow — live sales-call coaching overlay",
   "main": ".vite/build/main.js",
   "private": true,
