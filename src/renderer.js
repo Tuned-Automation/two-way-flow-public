@@ -8140,7 +8140,12 @@ function populateRubricsSelect() {
     const opt = document.createElement('option');
     opt.value = r.id;
     const isActive = r.id === rubricsTabState.activeId;
-    opt.textContent = isActive ? `${r.name} (active)` : r.name;
+    // Internal/hidden rubrics (only present when unlocked) are tagged so
+    // it's obvious they aren't visible to normal users.
+    let label = r.name;
+    if (r.internal) label += ' — internal';
+    if (isActive) label += ' (active)';
+    opt.textContent = label;
     if (r.id === rubricsTabState.selectedId) opt.selected = true;
     rubricsLibrarySelectEl.appendChild(opt);
   }
@@ -10497,4 +10502,70 @@ hydrateRubricSwitcher();
       } catch { /* if settings can't load, don't block the app */ }
     })();
   }
+})();
+
+/* ── Internal-rubric unlock (Settings → General) ─────────────────────
+ *
+ * Owner-only reveal of the proprietary built-in rubrics. Entering the
+ * access code calls window.rubrics.unlock(); main flips a persisted flag
+ * and broadcasts rubrics:changed, so the library + switcher re-hydrate
+ * automatically (via onRubricsChanged) and the hidden rubrics appear
+ * (tagged "— internal" in the dropdown). Lock re-hides them. */
+(() => {
+  const input = document.getElementById('internalUnlockInput');
+  const unlockBtn = document.getElementById('internalUnlockBtn');
+  const lockBtn = document.getElementById('internalLockBtn');
+  const statusEl = document.getElementById('internalUnlockStatus');
+  if (!window.rubrics?.unlock || !(unlockBtn instanceof HTMLElement)) return;
+
+  function setState(unlocked, msg) {
+    if (unlockBtn) unlockBtn.hidden = unlocked;
+    if (lockBtn) lockBtn.hidden = !unlocked;
+    if (input instanceof HTMLInputElement) input.hidden = unlocked;
+    if (statusEl) {
+      statusEl.textContent = msg || (unlocked
+        ? 'Revealed. Internal rubrics now appear in the library above.'
+        : 'Hidden. Enter the access code to reveal them.');
+    }
+  }
+
+  async function refresh() {
+    try {
+      const res = await window.rubrics.isUnlocked();
+      setState(!!res?.unlocked);
+    } catch { /* leave default state */ }
+  }
+
+  unlockBtn.addEventListener('click', async () => {
+    const code = input instanceof HTMLInputElement ? input.value : '';
+    unlockBtn.disabled = true;
+    try {
+      const res = await window.rubrics.unlock(code);
+      if (res?.ok) {
+        if (input instanceof HTMLInputElement) input.value = '';
+        setState(true);
+      } else {
+        setState(false, 'Incorrect access code.');
+      }
+    } catch {
+      setState(false, 'Could not unlock — please try again.');
+    } finally {
+      unlockBtn.disabled = false;
+    }
+  });
+
+  if (lockBtn) {
+    lockBtn.addEventListener('click', async () => {
+      try { await window.rubrics.lock(); } catch { /* ignore */ }
+      setState(false);
+    });
+  }
+
+  if (input instanceof HTMLInputElement) {
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); unlockBtn.click(); }
+    });
+  }
+
+  refresh();
 })();

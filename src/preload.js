@@ -803,6 +803,13 @@ contextBridge.exposeInMainWorld('rubrics', {
   import: (json) => ipcRenderer.invoke('rubrics:import', { json }),
   validate: (rubric) => ipcRenderer.invoke('rubrics:validate', { rubric }),
   getDefaultPrompts: () => ipcRenderer.invoke('rubrics:get-default-prompts'),
+  // Owner-only reveal of the internal/hidden rubrics. unlock() takes the
+  // passphrase; on success main flips a persisted flag and broadcasts
+  // rubrics:changed (so the library re-hydrates). lock() re-hides them.
+  // isUnlocked() reports the current state.
+  unlock: (passphrase) => ipcRenderer.invoke('rubrics:unlock', { passphrase }),
+  lock: () => ipcRenderer.invoke('rubrics:lock'),
+  isUnlocked: () => ipcRenderer.invoke('rubrics:internal-status'),
   // SYNCHRONOUS — returns the full active rubric shape (or null) in a
   // single blocking round-trip. Exists solely so the renderer can
   // hydrate its rubric.js live bindings at the very top of its module

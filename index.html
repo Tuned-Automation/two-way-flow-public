@@ -2341,6 +2341,45 @@
                 </div>
               </div>
 
+              <!-- Internal access. Owner-only reveal of the proprietary
+                   built-in rubrics (hidden from the library by default).
+                   Enter the access code to unlock; Lock re-hides. Backed
+                   by window.rubrics.unlock/lock/isUnlocked. -->
+              <div class="settings-section">
+                <h4 class="settings-section__heading">Internal access</h4>
+                <div class="data-action">
+                  <div class="data-action__info">
+                    <strong class="data-action__title">Internal rubrics</strong>
+                    <span
+                      class="data-action__desc"
+                      id="internalUnlockStatus"
+                    >Hidden. Enter the access code to reveal them.</span>
+                  </div>
+                  <div class="data-action__controls">
+                    <input
+                      type="password"
+                      id="internalUnlockInput"
+                      class="settings-internal__input"
+                      placeholder="Access code"
+                      autocomplete="off"
+                      spellcheck="false"
+                      aria-label="Internal access code"
+                    />
+                    <button
+                      type="button"
+                      id="internalUnlockBtn"
+                      class="data-action__btn"
+                    >Unlock</button>
+                    <button
+                      type="button"
+                      id="internalLockBtn"
+                      class="data-action__btn"
+                      hidden
+                    >Lock</button>
+                  </div>
+                </div>
+              </div>
+
               <div class="settings-section">
                 <h4 class="settings-section__heading">Data</h4>
                 <p class="settings-section__subtitle">

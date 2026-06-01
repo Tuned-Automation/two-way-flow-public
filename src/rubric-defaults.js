@@ -468,6 +468,10 @@ export const DEFAULT_RUBRIC = {
   id: 'tuned_automation',
   name: 'Tuned Automation Discovery',
   description: 'Default discovery call rubric.',
+  // Internal/proprietary: hidden from the library unless unlocked.
+  // The authoritative hide list is INTERNAL_RUBRIC_IDS in rubric-store.js;
+  // this flag is documentation + a hook for any future generic filter.
+  hidden: true,
   createdAt: null,
   updatedAt: null,
   pillars: PILLARS,

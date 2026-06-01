@@ -56,6 +56,7 @@ import path from 'node:path';
 
 import { DEFAULT_RUBRIC } from './rubric-defaults.js';
 import { SOFTWARE_WALKTHROUGH_RUBRIC } from './rubric-software-walkthrough.js';
+import { OLC_TWF_RUBRIC } from './rubric-olc-twf.js';
 
 const SCHEMA_VERSION = 1;
 
@@ -69,8 +70,44 @@ const SCHEMA_VERSION = 1;
  * To add another built-in rubric: author a `<thing>-rubric.js` module
  * exporting a DEFAULT_RUBRIC-shaped object, import it here, and append
  * it to this array. Do NOT reorder — index[0] is the active default.
+ *
+ * index[0] is OLC_TWF_RUBRIC: the public-facing default for new installs.
+ * The two Tuned Automation rubrics that follow are internal/hidden (see
+ * INTERNAL_RUBRIC_IDS) — they still ship and seed, but are filtered out
+ * of the library unless the owner unlocks them.
  */
-const BUILTIN_RUBRICS = [DEFAULT_RUBRIC, SOFTWARE_WALKTHROUGH_RUBRIC];
+const BUILTIN_RUBRICS = [OLC_TWF_RUBRIC, DEFAULT_RUBRIC, SOFTWARE_WALKTHROUGH_RUBRIC];
+
+/**
+ * The primary seed = the public-facing default rubric for new installs.
+ * `ensureSeeded()` writes this on first launch and points
+ * `index.activeId` at it. It is BUILTIN_RUBRICS[0] (the OLC Two-Way Fit
+ * rubric) — NOT an internal/hidden rubric.
+ */
+const PRIMARY_SEED = BUILTIN_RUBRICS[0];
+
+/** Id of the public default rubric — used by main.js to re-point an
+ *  install whose active rubric is internal/hidden (and still locked). */
+export const PUBLIC_DEFAULT_RUBRIC_ID = PRIMARY_SEED.id;
+
+/**
+ * Internal (proprietary) rubrics hidden from the library for normal
+ * users. They stay on disk and remain fully loadable — they're only
+ * filtered out of `listRubrics()` (and refused by `setActiveRubric`)
+ * unless the owner unlocks them with the internal passphrase (see
+ * settings.js + the rubrics:unlock IPC in main.js). Hiding by id rather
+ * than a stored per-rubric flag means it applies on existing installs
+ * with ZERO rewrites to anyone's rubric files.
+ */
+const INTERNAL_RUBRIC_IDS = new Set([
+  'tuned_automation',
+  'software_walkthrough_discovery',
+]);
+
+/** True if `id` is an internal/hidden built-in. */
+export function isInternalRubric(id) {
+  return INTERNAL_RUBRIC_IDS.has(id);
+}
 
 /** Reserved ids — synthetic pillars must never appear in a persisted rubric. */
 const RESERVED_PILLAR_IDS = new Set(['live_signals', 'logged_questions']);
@@ -392,8 +429,8 @@ export function ensureSeeded() {
   // the seed file and the index.
   const now = new Date().toISOString();
   const seed = {
-    ...DEFAULT_RUBRIC,
-    createdAt: DEFAULT_RUBRIC.createdAt || now,
+    ...PRIMARY_SEED,
+    createdAt: PRIMARY_SEED.createdAt || now,
     updatedAt: now,
   };
   const writeRubric = writeJsonFile(getRubricPath(seed.id), seed);
@@ -520,12 +557,21 @@ function migrateRubric(loaded) {
   return working;
 }
 
-export function listRubrics() {
+/**
+ * List rubrics for the library. By default, internal/hidden rubrics
+ * (INTERNAL_RUBRIC_IDS) are filtered out so normal users can't see or
+ * select them — EXCEPT the currently-active rubric is always included
+ * (so the header switcher pill + active-state UI never break if an
+ * internal rubric happens to be active). Pass `{ includeHidden: true }`
+ * (only when the owner has unlocked them) to return everything; each
+ * entry carries an `internal` flag so the UI can tag it.
+ */
+export function listRubrics({ includeHidden = false } = {}) {
   const index = loadIndex();
   const activeId = index?.activeId || null;
   const ids = index?.rubrics?.length ? index.rubrics : listRubricFilesOnDisk();
 
-  /** @type {Array<{ id: string, name: string, description: string, isActive: boolean, updatedAt: string|null }>} */
+  /** @type {Array<{ id: string, name: string, description: string, isActive: boolean, internal: boolean, updatedAt: string|null }>} */
   const out = [];
   for (const id of ids) {
     const parsed = readJsonFile(getRubricPath(id));
@@ -535,11 +581,17 @@ export function listRubrics() {
       console.warn(`[rubric-store] skipping ${id}: schemaVersion ${parsed.schemaVersion} unsupported`);
       continue;
     }
+    const rid = migrated.id || id;
+    const internal = INTERNAL_RUBRIC_IDS.has(rid);
+    // Hide internal rubrics unless unlocked — but never hide the active
+    // one (keeps the switcher pill + active state working regardless).
+    if (internal && !includeHidden && rid !== activeId) continue;
     out.push({
-      id: migrated.id || id,
+      id: rid,
       name: migrated.name || id,
       description: migrated.description || '',
-      isActive: (migrated.id || id) === activeId,
+      isActive: rid === activeId,
+      internal,
       updatedAt: migrated.updatedAt || null,
     });
   }
@@ -579,13 +631,13 @@ export function loadActiveRubric() {
   }
   // Index missing or active rubric unreadable — re-seed and retry.
   ensureSeeded();
-  const reloaded = loadRubric(loadIndex()?.activeId || DEFAULT_RUBRIC.id);
+  const reloaded = loadRubric(loadIndex()?.activeId || PRIMARY_SEED.id);
   if (reloaded) return reloaded;
-  // Last-resort fallback: hand back the in-memory seed so the app can
-  // still boot. The on-disk store is broken; the user will see this in
-  // logs and via the Rubrics tab's "failed to load" surface.
-  console.warn('[rubric-store] falling back to in-memory DEFAULT_RUBRIC — disk store unrecoverable');
-  return DEFAULT_RUBRIC;
+  // Last-resort fallback: hand back the in-memory public default so the
+  // app can still boot. The on-disk store is broken; the user will see
+  // this in logs and via the Rubrics tab's "failed to load" surface.
+  console.warn('[rubric-store] falling back to in-memory PRIMARY_SEED — disk store unrecoverable');
+  return PRIMARY_SEED;
 }
 
 /**
@@ -596,11 +648,11 @@ export function loadActiveRubric() {
  */
 export function getActiveRubricMeta() {
   const index = loadIndex();
-  const activeId = index?.activeId || DEFAULT_RUBRIC.id;
+  const activeId = index?.activeId || PRIMARY_SEED.id;
   const list = listRubrics();
   const found = list.find((r) => r.id === activeId);
   if (found) return { id: found.id, name: found.name };
-  return { id: DEFAULT_RUBRIC.id, name: DEFAULT_RUBRIC.name };
+  return { id: PRIMARY_SEED.id, name: PRIMARY_SEED.name };
 }
 
 /* ────────────────────────────────────────────────────────────────────

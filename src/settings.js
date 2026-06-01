@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 /* ────────────────────────────────────────────────────────────────────
  * SETTINGS EXPANSION — PHASE ROADMAP
@@ -180,6 +181,12 @@ const SCHEMA_VERSION = 3;
 export const DEFAULT_SETTINGS = Object.freeze({
   schemaVersion: SCHEMA_VERSION,
   defaultProvider: 'gemini',
+  // Owner-only: when true, internal/hidden rubrics (the proprietary
+  // Tuned Automation built-ins) are revealed in the library. Flipped by
+  // entering the passphrase in Settings -> General. Defaults false so a
+  // fresh/normal install never shows them. New top-level key is
+  // defaults-filled for existing users by migrateSettings' deepMerge.
+  internalRubricsUnlocked: false,
   // Per-provider defaults track each vendor's current "balanced /
   // recommended" tier as of May 2026 — fast enough for the Coach's
   // tick cadence but smart enough to follow the rubric. The user can
@@ -892,6 +899,39 @@ export function getProviderStatus(provider) {
     return 'env';
   }
   return 'unconfigured';
+}
+
+/* ── Internal-rubric reveal (owner passphrase) ─────────────────────── *
+ *
+ * Gates whether the proprietary Tuned Automation rubrics show in the
+ * library. This is OBSCURITY, not real security — it's a local app, so
+ * the goal is only to stop other users from casually selecting those
+ * rubrics, not to defeat someone who unpacks the bundle.
+ *
+ * The passphrase lives here as a constant. To change it, edit
+ * INTERNAL_PASSPHRASE below. (A future hardening could store a SHA-256
+ * digest instead and compare hashes; the compare already runs through
+ * crypto.timingSafeEqual.) */
+const INTERNAL_PASSPHRASE = 'change-me';
+
+/** True if `input` matches the internal-reveal passphrase. */
+export function checkInternalPassphrase(input) {
+  if (typeof input !== 'string') return false;
+  const a = Buffer.from(input.trim(), 'utf8');
+  const b = Buffer.from(INTERNAL_PASSPHRASE, 'utf8');
+  // timingSafeEqual throws on length mismatch, so gate on length first.
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/** Whether internal/hidden rubrics are currently revealed. */
+export function getInternalRubricsUnlocked() {
+  return loadSettings().internalRubricsUnlocked === true;
+}
+
+/** Set the reveal flag (true = show internal rubrics). Returns the
+ *  full updated settings object (same shape as saveSettings). */
+export function setInternalRubricsUnlocked(value) {
+  return saveSettings({ internalRubricsUnlocked: !!value });
 }
 
 /** Returns the currently-selected default provider id. */

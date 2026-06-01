@@ -257,6 +257,9 @@ import {
   getCoach,
   getAudio,
   getFactsScanner,
+  getInternalRubricsUnlocked,
+  setInternalRubricsUnlocked,
+  checkInternalPassphrase,
 } from './settings.js';
 import { getProvider } from './providers/index.js';
 import { checkForUpdate, downloadUpdate, revealDownload, installUpdate } from './updater.js';
@@ -3578,7 +3581,22 @@ function registerIpcHandlers() {
     // (`lastAcceptedHeadline`) starts null at the right moment in
     // the session lifecycle.
     const factsScannerConfig = getFactsScanner();
-    if (factsScannerConfig.enabled) {
+    // The opportunity / cost-of-inaction "QuickFix" card is driven by the
+    // facts scanner (Stage-1 scan -> Stage-2 roller -> scoring:quick-fix).
+    // A rubric can opt out with `opportunityScan: false` when a dollar
+    // opportunity total makes no sense for that call type — e.g. the OLC
+    // Two-Way Fit rubric, where the money is revenue qualification + a
+    // fixed fee, captured as fields. When opted out we skip BOTH the
+    // scanner and the roller so the QuickFix card never appears.
+    const activeRubricForScan = (() => {
+      try {
+        return rubricStore.loadActiveRubric();
+      } catch {
+        return null;
+      }
+    })();
+    const opportunityScanEnabled = activeRubricForScan?.opportunityScan !== false;
+    if (factsScannerConfig.enabled && opportunityScanEnabled) {
       if (!quickFixRoller) {
         quickFixRoller = createQuickFixRoller({
           // Forward Stage-2 LLM token usage into the per-session
@@ -3659,6 +3677,8 @@ function registerIpcHandlers() {
         },
       });
       factsScanner.start();
+    } else if (!opportunityScanEnabled) {
+      console.log('[facts-scanner] disabled — active rubric opts out (opportunityScan:false)');
     } else {
       console.log('[facts-scanner] disabled via settings.factsScanner.enabled');
     }
@@ -4506,16 +4526,44 @@ function registerIpcHandlers() {
    * ──────────────────────────────────────────────────────────────── */
   ipcMain.handle('rubrics:list', () => {
     try {
+      // Internal/proprietary rubrics are filtered out unless the owner
+      // has unlocked them with the passphrase (Settings -> General).
+      const includeHidden = getInternalRubricsUnlocked();
       return {
         ok: true,
-        rubrics: rubricStore.listRubrics(),
+        rubrics: rubricStore.listRubrics({ includeHidden }),
         active: rubricStore.getActiveRubricMeta(),
+        internalUnlocked: includeHidden,
       };
     } catch (err) {
       console.warn('[rubrics:list]', err?.message || err);
       return { ok: false, reason: err?.message || 'list_failed' };
     }
   });
+
+  /* Owner-only unlock/lock for the internal (hidden) rubrics. The
+   * passphrase check + persisted flag live in settings.js. On change we
+   * broadcast rubrics:changed so the library + switcher re-hydrate. */
+  ipcMain.handle('rubrics:unlock', (_event, payload = {}) => {
+    const passphrase = typeof payload.passphrase === 'string' ? payload.passphrase : '';
+    if (!checkInternalPassphrase(passphrase)) {
+      return { ok: false, reason: 'bad_passphrase' };
+    }
+    setInternalRubricsUnlocked(true);
+    broadcastRubricsChanged({ reason: 'internal-unlock' });
+    return { ok: true, unlocked: true };
+  });
+
+  ipcMain.handle('rubrics:lock', () => {
+    setInternalRubricsUnlocked(false);
+    broadcastRubricsChanged({ reason: 'internal-lock' });
+    return { ok: true, unlocked: false };
+  });
+
+  ipcMain.handle('rubrics:internal-status', () => ({
+    ok: true,
+    unlocked: getInternalRubricsUnlocked(),
+  }));
 
   /* Synchronous boot bridge for the renderer realm.
    * ────────────────────────────────────────────────
@@ -4608,6 +4656,13 @@ function registerIpcHandlers() {
     // forbidden. The renderer surfaces this as "End the current call
     // before switching rubrics."
     if (liveSession || coachSession) return { ok: false, reason: 'call_in_progress' };
+
+    // Defense in depth: a locked client can't activate a hidden internal
+    // rubric. The renderer already filters them out of the list, but a
+    // crafted IPC call shouldn't be able to bypass that.
+    if (rubricStore.isInternalRubric(id) && !getInternalRubricsUnlocked()) {
+      return { ok: false, reason: 'hidden' };
+    }
 
     const result = rubricStore.setActiveRubric(id);
     if (!result.ok) return result;
@@ -4706,6 +4761,30 @@ app.whenReady().then(async () => {
     rubricStore.ensureSeeded();
   } catch (err) {
     console.warn('[main] rubricStore.ensureSeeded threw:', err?.message || err);
+  }
+  // Re-point off a hidden active rubric. ensureSeeded seeds the public
+  // default (OLC Two-Way Fit) for fresh installs, but an EXISTING install
+  // may still have an internal/hidden rubric (e.g. tuned_automation)
+  // active. Unless the owner has unlocked internal rubrics, move the
+  // active selection onto the public default so distributed users never
+  // boot into a hidden rubric. Owners who unlocked + chose an internal
+  // rubric keep their selection.
+  try {
+    const meta = rubricStore.getActiveRubricMeta();
+    if (
+      meta?.id &&
+      rubricStore.isInternalRubric(meta.id) &&
+      !getInternalRubricsUnlocked() &&
+      meta.id !== rubricStore.PUBLIC_DEFAULT_RUBRIC_ID
+    ) {
+      const res = rubricStore.setActiveRubric(rubricStore.PUBLIC_DEFAULT_RUBRIC_ID);
+      console.log(
+        `[main] active rubric '${meta.id}' is internal + locked — re-pointed to '${rubricStore.PUBLIC_DEFAULT_RUBRIC_ID}'`,
+        res?.ok ? '(ok)' : `(failed: ${res?.reason})`,
+      );
+    }
+  } catch (err) {
+    console.warn('[main] internal-active re-point threw:', err?.message || err);
   }
   // Rolling, throttled backup of rubrics + settings (see src/backup.js).
   // Runs after ensureSeeded so the snapshot includes the seeded built-ins;
