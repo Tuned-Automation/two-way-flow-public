@@ -4809,9 +4809,14 @@ app.whenReady().then(async () => {
   // (Without an app menu, accelerators don't get a hosting menu item and the
   // window can't be closed except via Activity Monitor — exactly what we
   // just hit.)
+  //
+  // The Edit menu is REQUIRED on macOS: Cmd+C/V/X/A are dispatched through the
+  // Edit menu's standard roles. Without it, paste is dead in every input field
+  // (e.g. the onboarding Gemini key field — users could type but not paste).
   if (process.platform === 'darwin') {
     Menu.setApplicationMenu(Menu.buildFromTemplate([
       { role: 'appMenu' },
+      { role: 'editMenu' },
       {
         label: 'Window',
         submenu: [
@@ -4823,6 +4828,23 @@ app.whenReady().then(async () => {
   } else {
     Menu.setApplicationMenu(null);
   }
+
+  // Right-click → Cut/Copy/Paste/Select All on every window. Belt-and-braces so
+  // users can paste via the context menu too (and so Windows/Linux, which run
+  // with no application menu, still get a working paste affordance).
+  app.on('web-contents-created', (_event, contents) => {
+    contents.on('context-menu', (_e, params) => {
+      const canEdit = params.isEditable;
+      const hasSelection = params.selectionText && params.selectionText.trim().length > 0;
+      if (!canEdit && !hasSelection) return;
+      const template = [];
+      if (canEdit) template.push({ role: 'cut', enabled: params.editFlags.canCut });
+      if (canEdit || hasSelection) template.push({ role: 'copy', enabled: params.editFlags.canCopy });
+      if (canEdit) template.push({ role: 'paste', enabled: params.editFlags.canPaste });
+      if (canEdit) template.push({ type: 'separator' }, { role: 'selectAll' });
+      Menu.buildFromTemplate(template).popup({ window: BrowserWindow.fromWebContents(contents) });
+    });
+  });
 
   // Belt-and-braces global shortcut for hiding the overlay even when it
   // doesn't have keyboard focus (frameless windows often don't).
