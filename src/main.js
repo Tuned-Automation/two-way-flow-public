@@ -259,7 +259,7 @@ import {
   getFactsScanner,
 } from './settings.js';
 import { getProvider } from './providers/index.js';
-import { checkForUpdate, downloadUpdate, revealDownload } from './updater.js';
+import { checkForUpdate, downloadUpdate, revealDownload, installUpdate } from './updater.js';
 import { backupUserData } from './backup.js';
 import * as rubricStore from './rubric-store.js';
 import { applyRubric } from './rubric.js';
@@ -4269,6 +4269,37 @@ function registerIpcHandlers() {
     } catch { /* sender gone */ }
   }));
   ipcMain.handle('updates:reveal', (_event, filePath) => revealDownload(filePath));
+
+  /* Auto-install a downloaded .dmg into /Applications and relaunch into the
+   * new version. Returns the installUpdate() result to the renderer first;
+   * on success it schedules the relaunch shortly after so the renderer can
+   * paint an "Installing… / Restarting…" status. On failure the result carries
+   * fallback:true and the renderer falls back to revealDownload() + manual
+   * drag — so a bad install never leaves the user worse off than before. */
+  ipcMain.handle('updates:install', async (_event, filePath) => {
+    const result = await installUpdate(filePath);
+    if (result?.ok) {
+      const appPath = result.installedAppPath;
+      const execPath = result.execPath;
+      setTimeout(() => {
+        try {
+          // Relaunch via LaunchServices (`open -n`) so the de-quarantined
+          // bundle starts cleanly without app-translocation.
+          if (appPath) {
+            app.relaunch({ execPath: '/usr/bin/open', args: ['-n', appPath] });
+          } else if (execPath) {
+            app.relaunch({ execPath });
+          } else {
+            app.relaunch();
+          }
+        } catch {
+          app.relaunch();
+        }
+        app.exit(0);
+      }, 1200);
+    }
+    return result;
+  });
 
   // Renderer asks the coach for a fresh suggestion (seller pressed Skip
   // on the active suggestion card, or pressed → at the live edge of

@@ -10268,9 +10268,25 @@ hydrateRubricSwitcher();
     try {
       const res = await updatesApi.download(pendingAsset);
       if (res?.ok) {
-        setStatus('Downloaded. Opening Finder — drag Two Way Flow into Applications, then reopen.');
-        await updatesApi.reveal(res.filePath);
-        if (triggerBtn) triggerBtn.textContent = 'Downloaded ✓';
+        // Try a true one-click install + relaunch. If the install can't run
+        // (e.g. /Applications not writable, or a non-dmg asset), fall back to
+        // revealing the download so the user can drag it in manually.
+        setStatus('Downloaded. Installing…');
+        if (triggerBtn) triggerBtn.textContent = 'Installing…';
+        let installed = false;
+        try {
+          const inst = await updatesApi.install?.(res.filePath);
+          if (inst?.ok) {
+            installed = true;
+            setStatus('Installed. Restarting Two Way Flow…');
+            if (triggerBtn) triggerBtn.textContent = 'Restarting…';
+          }
+        } catch { /* fall through to guided install */ }
+        if (!installed) {
+          setStatus('Downloaded. Opening Finder — drag Two Way Flow into Applications, then reopen.');
+          await updatesApi.reveal(res.filePath);
+          if (triggerBtn) triggerBtn.textContent = 'Downloaded ✓';
+        }
       } else if (res?.reason === 'integrity_mismatch') {
         setStatus('Download failed an integrity check and was discarded. Please try again.');
         if (triggerBtn) { triggerBtn.disabled = false; triggerBtn.textContent = 'Download update'; }

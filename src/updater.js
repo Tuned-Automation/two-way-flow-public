@@ -40,7 +40,16 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { app, shell } from 'electron';
+
+const execFileP = promisify(execFile);
+
+/** App bundles in /Applications whose name starts with this are treated as
+ *  prior installs of this product and cleaned up on a successful install. */
+const PRODUCT_BUNDLE_PREFIX = 'Two Way Flow';
 
 /** Raw URL of the manifest on the public releases repo's main branch.
  *  raw.githubusercontent.com serves the file directly with no auth and
@@ -207,7 +216,7 @@ export async function downloadUpdate(asset, onProgress) {
 }
 
 /** Reveal the downloaded file in Finder so the user can drag the new
- *  app to /Applications. */
+ *  app to /Applications. Used as the fallback when auto-install can't run. */
 export function revealDownload(filePath) {
   if (typeof filePath === 'string' && filePath) {
     try { shell.showItemInFolder(filePath); return { ok: true }; } catch (err) {
@@ -215,4 +224,101 @@ export function revealDownload(filePath) {
     }
   }
   return { ok: false, reason: 'no_path' };
+}
+
+/**
+ * Auto-install a downloaded .dmg into /Applications and report the bundle to
+ * relaunch. Mirrors the proven routine in scripts/install.sh (mount → copy →
+ * de-quarantine), but driven from inside the running app so the user gets a
+ * true one-click update instead of a manual drag.
+ *
+ * SAFETY: the existing install is moved aside (not deleted) before the new
+ * copy lands, and restored if anything fails — so a failed update never leaves
+ * the user without a working app. Any failure (e.g. /Applications not
+ * writable, or running on Windows/Linux) returns `{ ok:false, fallback:true }`
+ * so the caller can fall back to revealDownload() + manual drag.
+ *
+ * Resolves { ok:true, installedAppPath, execPath } on success, or
+ * { ok:false, fallback:true, reason } when the caller should fall back.
+ */
+export async function installUpdate(filePath) {
+  if (process.platform !== 'darwin') {
+    return { ok: false, fallback: true, reason: 'unsupported_platform' };
+  }
+  if (typeof filePath !== 'string' || !/\.dmg$/i.test(filePath)) {
+    return { ok: false, fallback: true, reason: 'not_a_dmg' };
+  }
+  const appsDir = '/Applications';
+  // Without write access we'd need admin — fall back to the guided drag.
+  try {
+    fs.accessSync(appsDir, fs.constants.W_OK);
+  } catch {
+    return { ok: false, fallback: true, reason: 'applications_not_writable' };
+  }
+
+  const mountPoint = fs.mkdtempSync(path.join(os.tmpdir(), 'twf-mnt-'));
+  let mounted = false;
+  let backupPath = null;
+  let destApp = null;
+  try {
+    await execFileP('hdiutil', ['attach', filePath, '-nobrowse', '-noautoopen', '-mountpoint', mountPoint]);
+    mounted = true;
+
+    const appName = fs.readdirSync(mountPoint).find((n) => /\.app$/i.test(n));
+    if (!appName) {
+      return { ok: false, fallback: true, reason: 'no_app_in_dmg' };
+    }
+    const srcApp = path.join(mountPoint, appName);
+    destApp = path.join(appsDir, appName);
+
+    // Move any existing copy aside first — renaming a running .app bundle is
+    // safe on macOS (the live process keeps running from the moved inode).
+    if (fs.existsSync(destApp)) {
+      backupPath = `${destApp}.old-${Date.now()}`;
+      fs.renameSync(destApp, backupPath);
+    }
+
+    // ditto preserves symlinks / resource forks / code-sign metadata better
+    // than a plain recursive copy.
+    await execFileP('ditto', [srcApp, destApp]);
+
+    // Strip the quarantine flag so the unsigned app reopens without Gatekeeper
+    // blocking it ("unidentified developer"). Best-effort.
+    try { await execFileP('xattr', ['-dr', 'com.apple.quarantine', destApp]); } catch { /* best effort */ }
+
+    // Clean up other old-versioned bundles sharing the product name so the
+    // user doesn't accumulate "Two Way Flow 1.5.0.app" etc.
+    try {
+      for (const n of fs.readdirSync(appsDir)) {
+        const full = path.join(appsDir, n);
+        if (/\.app$/i.test(n) && n.startsWith(PRODUCT_BUNDLE_PREFIX) && full !== destApp) {
+          fs.rmSync(full, { recursive: true, force: true });
+        }
+      }
+    } catch { /* best effort */ }
+
+    // Success — discard the moved-aside previous version.
+    if (backupPath) { try { fs.rmSync(backupPath, { recursive: true, force: true }); } catch { /* best effort */ } }
+
+    // Resolve the launch binary inside the new bundle for the relaunch.
+    let execPath = null;
+    try {
+      const macosDir = path.join(destApp, 'Contents', 'MacOS');
+      const bin = fs.readdirSync(macosDir).find((n) => !n.startsWith('.'));
+      if (bin) execPath = path.join(macosDir, bin);
+    } catch { /* non-fatal — caller can relaunch via the .app path */ }
+
+    return { ok: true, installedAppPath: destApp, execPath };
+  } catch (err) {
+    // Restore the previous version so the user is never left without an app.
+    if (backupPath && destApp && !fs.existsSync(destApp)) {
+      try { fs.renameSync(backupPath, destApp); } catch { /* best effort */ }
+    }
+    return { ok: false, fallback: true, reason: err?.message || 'install_failed' };
+  } finally {
+    if (mounted) {
+      try { await execFileP('hdiutil', ['detach', mountPoint, '-quiet']); } catch { /* best effort */ }
+    }
+    try { fs.rmSync(mountPoint, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 }

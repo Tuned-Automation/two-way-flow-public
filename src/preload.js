@@ -622,12 +622,16 @@ contextBridge.exposeInMainWorld('gemini', {
    *                             updateAvailable, mustUpdate, notes, asset }
    *   download(asset)      -> { ok, filePath, verified } | { ok:false, reason }
    *                           (reason 'integrity_mismatch' = SHA-256 failed)
+   *   install(filePath)    -> { ok, installedAppPath } (app relaunches shortly)
+   *                           | { ok:false, fallback:true, reason } (caller
+   *                           should fall back to reveal() + manual drag)
    *   reveal(filePath)     -> show the verified download in Finder
    *   onProgress(cb)       <- 'updates:progress' { receivedBytes, totalBytes, percent }
    */
   updates: {
     check: () => ipcRenderer.invoke('updates:check'),
     download: (asset) => ipcRenderer.invoke('updates:download', asset),
+    install: (filePath) => ipcRenderer.invoke('updates:install', filePath),
     reveal: (filePath) => ipcRenderer.invoke('updates:reveal', filePath),
     onProgress: subscribe('updates:progress'),
   },
