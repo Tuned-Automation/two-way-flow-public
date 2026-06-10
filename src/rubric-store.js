@@ -55,8 +55,6 @@ import {
 import path from 'node:path';
 
 import { DEFAULT_RUBRIC } from './rubric-defaults.js';
-import { SOFTWARE_WALKTHROUGH_RUBRIC } from './rubric-software-walkthrough.js';
-import { OLC_TWF_RUBRIC } from './rubric-olc-twf.js';
 
 const SCHEMA_VERSION = 1;
 
@@ -70,19 +68,13 @@ const SCHEMA_VERSION = 1;
  * To add another built-in rubric: author a `<thing>-rubric.js` module
  * exporting a DEFAULT_RUBRIC-shaped object, import it here, and append
  * it to this array. Do NOT reorder — index[0] is the active default.
- *
- * index[0] is OLC_TWF_RUBRIC: the public-facing default for new installs.
- * The two Tuned Automation rubrics that follow are internal/hidden (see
- * INTERNAL_RUBRIC_IDS) — they still ship and seed, but are filtered out
- * of the library unless the owner unlocks them.
  */
-const BUILTIN_RUBRICS = [OLC_TWF_RUBRIC, DEFAULT_RUBRIC, SOFTWARE_WALKTHROUGH_RUBRIC];
+const BUILTIN_RUBRICS = [DEFAULT_RUBRIC];
 
 /**
  * The primary seed = the public-facing default rubric for new installs.
  * `ensureSeeded()` writes this on first launch and points
- * `index.activeId` at it. It is BUILTIN_RUBRICS[0] (the OLC Two-Way Fit
- * rubric) — NOT an internal/hidden rubric.
+ * `index.activeId` at it (BUILTIN_RUBRICS[0]).
  */
 const PRIMARY_SEED = BUILTIN_RUBRICS[0];
 
@@ -99,10 +91,7 @@ export const PUBLIC_DEFAULT_RUBRIC_ID = PRIMARY_SEED.id;
  * than a stored per-rubric flag means it applies on existing installs
  * with ZERO rewrites to anyone's rubric files.
  */
-const INTERNAL_RUBRIC_IDS = new Set([
-  'tuned_automation',
-  'software_walkthrough_discovery',
-]);
+const INTERNAL_RUBRIC_IDS = new Set([]);
 
 /** True if `id` is an internal/hidden built-in. */
 export function isInternalRubric(id) {
